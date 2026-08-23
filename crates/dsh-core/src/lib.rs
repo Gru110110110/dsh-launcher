@@ -15,6 +15,7 @@ pub mod preferences;
 mod process_recovery;
 pub mod runtime;
 pub mod service;
+pub mod terminal;
 
 pub use error::{AppError, AppResult};
 pub use model::*;

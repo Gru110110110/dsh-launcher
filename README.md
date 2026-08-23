@@ -14,6 +14,7 @@ The application uses React for presentation, a narrow Tauri command/event adapte
 - Exact `@deepseek-ai/dsh` installation; the first npm registry remains the version authority, availability is confirmed from the same complete version index used by npm, installation uses that release's verified tarball instead of a potentially stale package lookup, and later installs keep the successful source for cache reuse
 - Transactional staging seeded from a valid installed Harness runtime when available and sufficient free space remains; the copied hidden lockfile is refreshed for npm reuse before executable smoke checks, atomic publication, startup recovery, and rollback, while seed-copy failures fall back to a clean candidate without changing the active runtime
 - Live Harness installation phases for dependency resolution, package fetching, runtime writes, validation, and activation; prolonged npm silence explains that dependency calculation may still be active instead of treating missing log output as proof of a stall
+- Stable terminal `dsh` command backed by the launcher's private runtime; the application appends its owned `bin` directory to the macOS login and interactive shell profiles or Windows user PATH after a successful Harness installation, without replacing an unrelated command entry
 - Browser selection, system tray lifecycle, English/Simplified Chinese, and light/dark/system themes
 - Separate Harness updates and cryptographically signed desktop updates; Harness updates can run in the foreground with visible progress or prepare a validated candidate in the background while the current service keeps running. A prepared update is activated after confirmation, or automatically on the next launch if the app exits first
 
@@ -46,6 +47,7 @@ The Rust application preserves the existing disk protocol:
 ├── runtime/{node,dsh,runtime.version,.deployment.lock}
 ├── cache/
 ├── dsh-home/
+├── bin/dsh[.cmd]
 ├── server.log
 ├── install.log
 ├── server.pid
@@ -55,6 +57,8 @@ The Rust application preserves the existing disk protocol:
 ├── .migration-complete-v1
 └── .migration-skip-v1
 ```
+
+After the first successful Harness installation, open a new terminal before running `dsh --version`. macOS login and interactive shell configuration is kept in clearly marked managed blocks, and Windows receives an environment-change notification. An explicit `DSH_DESKTOP_HOME` still creates the command wrapper inside that isolated home but deliberately skips automatic user PATH/profile changes, keeping development and test homes isolated.
 
 An explicit `DSH_HOME` disables all imports. Otherwise, the launcher only discovers compatible data in `DSH_DESKTOP_SOURCE_HOME` (default `~/.dsh`) and presents a choice before copying anything. Approval creates and verifies a private backup, performs a restore rehearsal, builds the complete result away from the active home, and publishes it with a crash-recoverable atomic transaction. Skipping is persisted and starts without importing into the existing isolated launcher home. Existing destination values and populated workspace ledgers always win.
 

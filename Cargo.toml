@@ -32,7 +32,7 @@ ts-rs = { version = "11.1", features = ["serde-compat"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"
-windows-sys = { version = "0.61", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 zip = { version = "5.1", default-features = false, features = ["deflate"] }
 
 [profile.release]

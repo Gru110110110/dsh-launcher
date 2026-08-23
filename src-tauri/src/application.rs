@@ -22,6 +22,7 @@ use dsh_core::{
         prepare_harness_update, recover_prepared_harness_update,
     },
     service::ServerManager,
+    terminal::ensure_terminal_command,
 };
 use fs2::{FileExt, lock_contended_error};
 use semver::Version;
@@ -443,7 +444,16 @@ impl AppState {
         }
         match deployed {
             Ok(version) => {
-                self.mutate(|snapshot| complete_harness_deployment(snapshot, version, force))
+                self.mutate(|snapshot| complete_harness_deployment(snapshot, version, force));
+                if let Err(error) = ensure_terminal_command(
+                    &self.paths,
+                    std::env::var_os("DSH_DESKTOP_HOME").is_none(),
+                ) {
+                    // Terminal integration is supplementary. A shell profile or
+                    // PATH conflict must never roll back a healthy runtime or
+                    // prevent the managed web service from starting.
+                    log::warn!("the terminal dsh command could not be installed: {error:?}");
+                }
             }
             Err(error) => {
                 if force {

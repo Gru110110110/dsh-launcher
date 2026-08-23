@@ -23,6 +23,8 @@ pub struct ApplicationPaths {
     pub language_file: PathBuf,
     pub preferences_file: PathBuf,
     pub dsh_home: PathBuf,
+    pub terminal_bin_dir: PathBuf,
+    pub terminal_dsh_bin: PathBuf,
     pub home_import_marker: PathBuf,
     pub workspace_import_marker: PathBuf,
     pub cc_switch_import_marker: PathBuf,
@@ -54,6 +56,7 @@ impl ApplicationPaths {
         #[cfg(not(windows))]
         let node_bin = node_dir.join("bin/node");
         let dsh_dir = runtime_dir.join("dsh");
+        let terminal_bin_dir = app_home.join("bin");
         Self {
             cache_dir: app_home.join("cache"),
             node_bin,
@@ -67,6 +70,11 @@ impl ApplicationPaths {
             language_file: app_home.join("language"),
             preferences_file: app_home.join("preferences.json"),
             dsh_home: app_home.join("dsh-home"),
+            #[cfg(windows)]
+            terminal_dsh_bin: terminal_bin_dir.join("dsh.cmd"),
+            #[cfg(not(windows))]
+            terminal_dsh_bin: terminal_bin_dir.join("dsh"),
+            terminal_bin_dir,
             home_import_marker: app_home.join(".source-home-import-v1"),
             workspace_import_marker: app_home.join(".source-workspace-import-v1"),
             cc_switch_import_marker: app_home.join(".cc-switch-import-v2"),
@@ -144,6 +152,12 @@ mod tests {
                 .ends_with("runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js")
         );
         assert!(paths.dsh_home.ends_with("dsh-home"));
+        assert!(paths.terminal_bin_dir.ends_with("bin"));
+        assert!(paths.terminal_dsh_bin.ends_with(if cfg!(windows) {
+            "bin/dsh.cmd"
+        } else {
+            "bin/dsh"
+        }));
         assert!(paths.launcher_lock.ends_with(".launcher.lock"));
         assert!(
             paths

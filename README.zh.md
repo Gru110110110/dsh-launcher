@@ -14,6 +14,7 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 - 精确安装 `@deepseek-ai/dsh`；由第一个 npm registry 确定版本，并以 npm 实际使用的完整版本索引确认可安装性，安装时直接使用该版本已验证的 tarball，避免再次读取陈旧的包版本索引，后续保持成功来源以复用缓存
 - 有有效旧版本且磁盘余量充足时复制到 staging 复用依赖，并刷新隐藏 lockfile 供 npm 采用，再执行可执行 smoke 校验、原子发布、启动恢复与失败回滚；复制失败会退回干净候选目录，且不修改当前运行版本
 - Harness 安装实时展示依赖解析、依赖包获取、运行环境写入、验证与启用阶段；npm 长时间无输出时明确说明它可能仍在计算依赖，不会把无日志的计算阶段误判为卡死
+- 稳定的终端 `dsh` 命令，由启动器私有运行环境提供；Harness 安装成功后，应用会把自有 `bin` 目录追加到 macOS 登录与交互式 Shell 配置或 Windows 用户 PATH，不会替换无关的同名命令入口
 - 浏览器选择、系统托盘生命周期、中英双语、浅色/深色/跟随系统主题
 - Harness 更新与带密码学签名的桌面应用更新相互独立；Harness 可选择前台更新并显示进度，也可在当前服务继续运行时于后台准备经过校验的候选版本。后台准备完成后由用户确认切换；若此时退出应用，下次启动会自动切换
 
@@ -46,6 +47,7 @@ Rust 应用保持原有磁盘协议：
 ├── runtime/{node,dsh,runtime.version,.deployment.lock}
 ├── cache/
 ├── dsh-home/
+├── bin/dsh[.cmd]
 ├── server.log
 ├── install.log
 ├── server.pid
@@ -55,6 +57,8 @@ Rust 应用保持原有磁盘协议：
 ├── .migration-complete-v1
 └── .migration-skip-v1
 ```
+
+Harness 首次安装成功后，请打开一个新终端再运行 `dsh --version`。macOS 的登录与交互式 Shell 配置放在带明确标记的托管区块内，Windows 会广播环境变量变更。显式设置 `DSH_DESKTOP_HOME` 时仍会在该隔离目录中创建命令包装器，但会主动跳过用户 PATH 或 Shell 配置修改，确保开发与测试目录保持隔离。
 
 显式 `DSH_HOME` 会关闭所有导入。否则启动器只会在 `DSH_DESKTOP_SOURCE_HOME`（默认 `~/.dsh`）中发现兼容数据，并在复制任何内容前要求用户选择。确认导入后会创建并校验私有备份、完成恢复演练、在活动目录之外构建完整结果，再通过可从崩溃恢复的原子事务发布；选择跳过会被持久化，并在不导入来源数据的情况下使用现有隔离启动器目录启动。已有目标值和已填充的 workspace ledger 始终优先。
 
