@@ -14,6 +14,7 @@ use dsh_core::{
     HarnessUpdateMode, HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep,
     MigrationState, ProgressState, ThemePreference,
     browser::BrowserCatalog,
+    marketplace::Marketplace,
     migration::MigrationService,
     preferences::Preferences,
     runtime::{
@@ -66,6 +67,7 @@ pub(crate) struct AppState {
     deployment: Mutex<Option<DeploymentController>>,
     background_update: Mutex<Option<DeploymentController>>,
     migration: MigrationService,
+    pub(crate) marketplace: Marketplace,
     desktop_update_busy: AtomicBool,
     harness_update_check_busy: AtomicBool,
     startup_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -100,6 +102,8 @@ impl AppState {
             }
         }
         let migration = MigrationService::from_environment(paths.clone())?;
+        let marketplace = Marketplace::new(paths.clone());
+        marketplace.initialize();
         Ok(Arc::new(Self {
             app,
             _instance_lock: instance_lock,
@@ -111,6 +115,7 @@ impl AppState {
             deployment: Mutex::new(None),
             background_update: Mutex::new(None),
             migration,
+            marketplace,
             desktop_update_busy: AtomicBool::new(false),
             harness_update_check_busy: AtomicBool::new(false),
             startup_thread: Mutex::new(None),
@@ -926,6 +931,21 @@ impl AppState {
         let url = external_link_url(target).ok_or_else(|| AppError::new("externalLinkInvalid"))?;
         self.browsers.open("system", url)
     }
+    /// Open an https URL from market data after validating its origin against
+    /// a fixed allowlist, so catalog content can never open arbitrary schemes.
+    pub(crate) fn open_https_url(&self, url: &str) -> AppResult<()> {
+        let allowed = [
+            "https://github.com/",
+            "https://www.npmjs.com/",
+            "https://npmjs.com/",
+            "https://dsh.market/",
+            "https://raw.githubusercontent.com/2BingLing/dsh-market/",
+        ];
+        if !allowed.iter().any(|prefix| url.starts_with(prefix)) {
+            return Err(AppError::new("externalLinkInvalid"));
+        }
+        self.browsers.open("system", url)
+    }
     pub(crate) fn web_url(&self) -> AppResult<String> {
         self.snapshot()
             .web_url
@@ -1628,6 +1648,18 @@ pub fn run() {
             commands::preferences_set_theme,
             commands::application_check_update,
             commands::application_install_update,
+            commands::market_get_catalog,
+            commands::market_refresh_catalog,
+            commands::market_refresh_if_stale,
+            commands::market_query,
+            commands::market_installed,
+            commands::market_compatibility,
+            commands::market_inspect,
+            commands::market_install,
+            commands::market_uninstall,
+            commands::market_pending_verification,
+            commands::market_clear_pending_verification,
+            commands::market_open_plugin_github,
         ])
         .build(tauri::generate_context!())
         .expect("error while building DSH Launcher")

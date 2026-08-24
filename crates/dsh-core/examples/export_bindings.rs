@@ -4,6 +4,11 @@ use dsh_core::{
     ActivityCode, ActivityState, AppError, BrowserChoice, DesktopUpdateState, HarnessUpdateMode,
     HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep, MigrationPlan,
     MigrationState, ProgressState, ThemePreference,
+    marketplace::{
+        CompatibilityInfo, CompatibilityStatus, InstalledPlugin, MarketCatalogState,
+        MarketOperationKind, MarketOperationResult, MarketPage, MarketQuery, MarketSort,
+        PendingVerification, PluginKind, PluginSource, PluginSummary, SourceBindingStatus,
+    },
 };
 use ts_rs::TS;
 
@@ -28,6 +33,20 @@ fn main() {
         MigrationPlan::decl(),
         MigrationState::decl(),
         LauncherSnapshot::decl(),
+        PluginKind::decl(),
+        PluginSource::decl(),
+        CompatibilityStatus::decl(),
+        SourceBindingStatus::decl(),
+        CompatibilityInfo::decl(),
+        InstalledPlugin::decl(),
+        PluginSummary::decl(),
+        MarketSort::decl(),
+        MarketQuery::decl(),
+        MarketPage::decl(),
+        MarketCatalogState::decl(),
+        MarketOperationKind::decl(),
+        MarketOperationResult::decl(),
+        PendingVerification::decl(),
     ];
     let mut output =
         String::from("// Generated from dsh-core Rust types. Do not edit by hand.\n\n");

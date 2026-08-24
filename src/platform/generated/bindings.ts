@@ -104,3 +104,113 @@ export type LauncherSnapshot = {
   migration: MigrationState;
   trayAvailable: boolean;
 };
+
+export type PluginKind = "cordisPlugin" | "skill";
+
+export type PluginSource = "skills" | "profile";
+
+export type CompatibilityStatus =
+  | "notChecked"
+  | "compatible"
+  | "incompatible"
+  | "unknown";
+
+export type SourceBindingStatus =
+  | "notChecked"
+  | "verified"
+  | "mismatch"
+  | "unknown";
+
+export type CompatibilityInfo = {
+  status: CompatibilityStatus;
+  detail: string | null;
+};
+
+export type InstalledPlugin = {
+  pluginId: string | null;
+  localName: string;
+  version: string | null;
+  source: PluginSource;
+  profile: string | null;
+};
+
+export type PluginSummary = {
+  id: string;
+  kind: PluginKind;
+  name: string;
+  owner: string;
+  repo: string;
+  fullName: string;
+  stars: number;
+  description: string;
+  descriptionZh: string;
+  tags: Array<string>;
+  homepage: string | null;
+  license: string | null;
+  curated: boolean;
+  pushedAt: string | null;
+  updatedAt: string | null;
+  needsConfig: boolean;
+  installMethod: string;
+  installTarget: string;
+  installVersion: string | null;
+  sourceBinding: SourceBindingStatus;
+  sourceBindingDetail: string | null;
+  scoreTotal: number | null;
+  scoreExplanation: string | null;
+  compatibility: CompatibilityStatus;
+  compatibilityDetail: string | null;
+  installed: InstalledPlugin | null;
+};
+
+export type MarketSort = "score" | "stars" | "recentlyUpdated" | "name";
+
+export type MarketQuery = {
+  search: string | null;
+  kind: PluginKind | null;
+  tag: string | null;
+  /**
+   * Install-state filter: `None` = all, `Some(true)` = installed only,
+   * `Some(false)` = not installed only.
+   */
+  installed: boolean | null;
+  sort: MarketSort;
+  page: number;
+  pageSize: number;
+  checkCompatibility: boolean;
+};
+
+export type MarketPage = {
+  items: Array<PluginSummary>;
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  generatedAt: string | null;
+};
+
+export type MarketCatalogState =
+  | { kind: "loading" }
+  | {
+      kind: "ready";
+      generatedAt: string | null;
+      pluginCount: number;
+      stale: boolean;
+    }
+  | { kind: "failed"; message: string | null };
+
+export type MarketOperationKind = "install" | "uninstall";
+
+export type MarketOperationResult = {
+  ok: boolean;
+  action: MarketOperationKind;
+  pluginId: string;
+  restartRequired: boolean;
+  error: LauncherError | null;
+};
+
+export type PendingVerification = {
+  pluginId: string;
+  name: string;
+  installedAtMs: number;
+};

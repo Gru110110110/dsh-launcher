@@ -1,6 +1,12 @@
 use std::sync::Arc;
 
-use dsh_core::{AppError, HarnessUpdateMode, Language, LauncherSnapshot, ThemePreference};
+use dsh_core::{
+    AppError, HarnessUpdateMode, Language, LauncherSnapshot, ThemePreference,
+    marketplace::{
+        CompatibilityInfo, InstalledPlugin, MarketCatalogState, MarketOperationResult, MarketPage,
+        MarketQuery, PendingVerification, PluginSummary,
+    },
+};
 use tauri::{AppHandle, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
@@ -128,4 +134,161 @@ pub async fn application_check_update(
 #[tauri::command]
 pub async fn application_install_update(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
     state.inner().install_desktop_update().await
+}
+
+// ---------------------------------------------------------------------------
+// Plugin marketplace
+// ---------------------------------------------------------------------------
+
+fn service_running(state: &AppState) -> bool {
+    state.snapshot().phase == dsh_core::LauncherPhase::Ready
+}
+
+#[tauri::command]
+pub fn market_get_catalog(state: State<'_, Arc<AppState>>) -> MarketCatalogState {
+    state.inner().marketplace.catalog_state()
+}
+
+#[tauri::command]
+pub async fn market_refresh_catalog(
+    state: State<'_, Arc<AppState>>,
+) -> Result<MarketCatalogState, AppError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.marketplace.refresh())
+        .await
+        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn market_refresh_if_stale(
+    state: State<'_, Arc<AppState>>,
+) -> Result<MarketCatalogState, AppError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.marketplace.refresh_if_stale())
+        .await
+        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn market_query(
+    query: MarketQuery,
+    state: State<'_, Arc<AppState>>,
+) -> Result<MarketPage, AppError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.marketplace.query(&query))
+        .await
+        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn market_installed(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<InstalledPlugin>, AppError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.marketplace.installed())
+        .await
+        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn market_compatibility(
+    plugin_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CompatibilityInfo, AppError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.marketplace.compatibility(&plugin_id))
+        .await
+        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn market_inspect(
+    plugin_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<PluginSummary, AppError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.marketplace.inspect(&plugin_id))
+        .await
+        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn market_install(
+    plugin_id: String,
+    force: bool,
+    expected_version: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<MarketOperationResult, AppError> {
+    let running = service_running(state.inner());
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .marketplace
+            .install(&plugin_id, force, expected_version.as_deref(), running)
+    })
+    .await
+    .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn market_uninstall(
+    plugin_id: String,
+    target: Option<InstalledPlugin>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<MarketOperationResult, AppError> {
+    let running = service_running(state.inner());
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .marketplace
+            .uninstall(&plugin_id, target.as_ref(), running)
+    })
+    .await
+    .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
+pub fn market_pending_verification(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<PendingVerification>, AppError> {
+    state.inner().marketplace.pending_verification()
+}
+
+#[tauri::command]
+pub fn market_clear_pending_verification(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    state.inner().marketplace.clear_pending_verification()
+}
+
+#[tauri::command]
+pub fn market_open_plugin_github(
+    plugin_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    if !valid_github_repo_id(&plugin_id) {
+        return Err(AppError::new("externalLinkInvalid"));
+    }
+    let url = format!("https://github.com/{plugin_id}");
+    state.inner().open_https_url(&url)
+}
+
+/// Catalog plugin ids are `owner/repo` GitHub references. Validate the shape
+/// instead of banning `..` wholesale (valid repo names like `repo..name`
+/// would be rejected otherwise). Scheme safety comes from the https allowlist
+/// in `open_https_url`.
+fn valid_github_repo_id(id: &str) -> bool {
+    let Some((owner, repo)) = id.split_once('/') else {
+        return false;
+    };
+    if repo.contains('/') {
+        return false;
+    }
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && !part.ends_with('.')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    valid_part(owner) && valid_part(repo)
 }
