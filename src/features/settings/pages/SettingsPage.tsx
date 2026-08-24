@@ -9,7 +9,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { launcherApi } from "@/platform/launcherApi";
-import { useLauncherSnapshot } from "@/platform/launcherStore";
+import { shallowEqual, useLauncherSelector } from "@/platform/launcherStore";
 import type { Language, ThemePreference } from "@/platform/generated/bindings";
 import { showTimedError } from "@/shared/errorToast";
 import githubIconUrl from "../../../../assets/external/github.svg";
@@ -50,10 +50,21 @@ function SegmentedControl<T extends string>({
 }
 
 export function SettingsPage() {
-  const snapshot = useLauncherSnapshot();
-  const { t } = useTranslation(undefined, { lng: snapshot.language });
-  const desktopUpdateDetail = getDesktopUpdateDetail(snapshot.desktopUpdate);
-  const desktopUpdateAction = getDesktopUpdateAction(snapshot.desktopUpdate);
+  const state = useLauncherSelector(
+    (snapshot) => ({
+      language: snapshot.language,
+      theme: snapshot.theme,
+      desktopVersion: snapshot.desktopVersion,
+    }),
+    shallowEqual,
+  );
+  const desktopUpdate = useLauncherSelector(
+    (snapshot) => snapshot.desktopUpdate,
+    shallowEqual,
+  );
+  const { t } = useTranslation(undefined, { lng: state.language });
+  const desktopUpdateDetail = getDesktopUpdateDetail(desktopUpdate);
+  const desktopUpdateAction = getDesktopUpdateAction(desktopUpdate);
   const run = (task: Promise<unknown>) => {
     void task.catch((error: unknown) => {
       showTimedError(error, (key, values) => t(key, values));
@@ -78,7 +89,7 @@ export function SettingsPage() {
             </div>
             <SegmentedControl<Language>
               label={t("settings.language")}
-              value={snapshot.language}
+              value={state.language}
               options={[
                 { value: "zh", label: "中文" },
                 { value: "en", label: "English" },
@@ -96,7 +107,7 @@ export function SettingsPage() {
             </div>
             <SegmentedControl<ThemePreference>
               label={t("settings.theme")}
-              value={snapshot.theme}
+              value={state.theme}
               options={[
                 { value: "light", label: t("theme.light") },
                 { value: "dark", label: t("theme.dark") },
@@ -121,7 +132,7 @@ export function SettingsPage() {
                 {t(desktopUpdateDetail.key, desktopUpdateDetail.values)}
               </span>
             </div>
-            <span className="version-text">v{snapshot.desktopVersion}</span>
+            <span className="version-text">v{state.desktopVersion}</span>
             <button
               className={`${
                 desktopUpdateAction.appearance === "primary"

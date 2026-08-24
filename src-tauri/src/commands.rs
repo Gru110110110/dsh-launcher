@@ -258,11 +258,6 @@ pub fn market_pending_verification(
 }
 
 #[tauri::command]
-pub fn market_operation_busy(state: State<'_, Arc<AppState>>) -> bool {
-    state.inner().marketplace.operation_busy()
-}
-
-#[tauri::command]
 pub async fn market_rollback_pending(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
     let state = Arc::clone(state.inner());
     flatten_blocking_result(

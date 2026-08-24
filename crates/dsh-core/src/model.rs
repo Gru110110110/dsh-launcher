@@ -187,6 +187,11 @@ pub enum HarnessUpdateMode {
 pub struct LauncherSnapshot {
     #[ts(type = "number")]
     pub revision: u64,
+    pub market_busy: bool,
+    #[ts(type = "number")]
+    pub market_revision: u64,
+    #[ts(type = "number")]
+    pub market_catalog_revision: u64,
     pub phase: LauncherPhase,
     pub step: LauncherStep,
     pub activity: Option<ActivityState>,
@@ -211,6 +216,9 @@ impl LauncherSnapshot {
     pub fn initial(desktop_version: impl Into<String>) -> Self {
         Self {
             revision: 0,
+            market_busy: false,
+            market_revision: 0,
+            market_catalog_revision: 0,
             phase: LauncherPhase::Preparing,
             step: LauncherStep::Prepare,
             activity: None,

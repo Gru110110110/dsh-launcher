@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { useLauncherSnapshot } from "@/platform/launcherStore";
+import { useLauncherSelector } from "@/platform/launcherStore";
 import type { PluginSummary } from "@/platform/generated/bindings";
 
 const BINDING_TRANSLATION_KEYS = {
@@ -24,8 +24,8 @@ export function ConfirmInstallDialog({
   onCancel: () => void;
   onConfirm: () => void;
 }) {
-  const snapshot = useLauncherSnapshot();
-  const { t } = useTranslation(undefined, { lng: snapshot.language });
+  const language = useLauncherSelector((snapshot) => snapshot.language);
+  const { t } = useTranslation(undefined, { lng: language });
   const cancelButton = useRef<HTMLButtonElement>(null);
   const submitted = useRef(false);
   const [submitting, setSubmitting] = useState(false);
@@ -71,9 +71,7 @@ export function ConfirmInstallDialog({
             {t("market.install.title", { plugin: plugin.name })}
           </h2>
         </header>
-        <p className="market-dialog-copy">
-          {t("market.install.detail")}
-        </p>
+        <p className="market-dialog-copy">{t("market.install.detail")}</p>
         <p className="market-dialog-copy">
           {t(
             plugin.kind === "skill"

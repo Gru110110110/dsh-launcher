@@ -5,6 +5,9 @@ import { getHarnessUpdateNotice, getServiceCopy } from "./presentation";
 function snapshot(overrides: Partial<LauncherSnapshot> = {}): LauncherSnapshot {
   return {
     revision: 1,
+    marketBusy: false,
+    marketRevision: 0,
+    marketCatalogRevision: 0,
     phase: "preparing",
     step: "prepare",
     activity: null,

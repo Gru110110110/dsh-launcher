@@ -14,6 +14,9 @@ const isTauri = "__TAURI_INTERNALS__" in window;
 if (import.meta.env.DEV && !isTauri) {
   const previewSnapshot: LauncherSnapshot = {
     revision: 1,
+    marketBusy: false,
+    marketRevision: 0,
+    marketCatalogRevision: 0,
     phase: "ready",
     step: "start",
     activity: null,

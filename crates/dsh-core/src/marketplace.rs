@@ -20,6 +20,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::Read,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -390,19 +391,58 @@ pub struct Marketplace {
     pnpm_bin: Mutex<Option<PathBuf>>,
     installed_cache: Mutex<Option<InstalledCache>>,
     operation_busy: Arc<AtomicBool>,
+    operation_transition: Arc<Mutex<()>>,
+    operation_listener: Arc<Mutex<Option<MarketOperationListener>>>,
+    catalog_listener: Mutex<Option<MarketCatalogListener>>,
     recovery_done: Mutex<bool>,
     loading: AtomicBool,
     last_error: Mutex<Option<String>>,
 }
 
-#[derive(Debug)]
 pub struct MarketOperationGuard {
     busy: Arc<AtomicBool>,
+    transition: Arc<Mutex<()>>,
+    listener: Option<MarketOperationListener>,
+}
+
+impl std::fmt::Debug for MarketOperationGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MarketOperationGuard")
+            .field("busy", &self.busy.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for MarketOperationGuard {
     fn drop(&mut self) {
+        let _transition = self
+            .transition
+            .lock()
+            .expect("operation transition poisoned");
         self.busy.store(false, Ordering::Release);
+        notify_operation_listener(&self.listener, false);
+    }
+}
+
+type MarketOperationListener = Arc<dyn Fn(bool) + Send + Sync>;
+type MarketCatalogListener = Arc<dyn Fn() + Send + Sync>;
+
+fn notify_operation_listener(listener: &Option<MarketOperationListener>, busy: bool) {
+    let Some(listener) = listener else {
+        return;
+    };
+    if catch_unwind(AssertUnwindSafe(|| listener(busy))).is_err() {
+        log::error!("marketplace operation listener panicked");
+    }
+}
+
+fn notify_catalog_listener(listener: &Option<MarketCatalogListener>) {
+    let Some(listener) = listener else {
+        return;
+    };
+    if catch_unwind(AssertUnwindSafe(|| listener())).is_err() {
+        log::error!("marketplace catalog listener panicked");
     }
 }
 
@@ -460,6 +500,9 @@ impl Marketplace {
             pnpm_bin: Mutex::new(None),
             installed_cache: Mutex::new(None),
             operation_busy: Arc::new(AtomicBool::new(false)),
+            operation_transition: Arc::new(Mutex::new(())),
+            operation_listener: Arc::new(Mutex::new(None)),
+            catalog_listener: Mutex::new(None),
             recovery_done: Mutex::new(false),
             loading: AtomicBool::new(false),
             last_error: Mutex::new(None),
@@ -498,12 +541,47 @@ impl Marketplace {
     /// second request is intentional: a hidden queue lets a stale UI submit
     /// operations against a profile state that no longer exists.
     pub fn begin_operation(&self) -> AppResult<MarketOperationGuard> {
+        let _transition = self
+            .operation_transition
+            .try_lock()
+            .map_err(|_| AppError::new("marketOperationBusy"))?;
         self.operation_busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| AppError::new("marketOperationBusy"))?;
+        let listener = self
+            .operation_listener
+            .lock()
+            .expect("operation listener poisoned")
+            .clone();
+        notify_operation_listener(&listener, true);
         Ok(MarketOperationGuard {
             busy: Arc::clone(&self.operation_busy),
+            transition: Arc::clone(&self.operation_transition),
+            listener,
         })
+    }
+
+    pub fn set_operation_listener(&self, listener: impl Fn(bool) + Send + Sync + 'static) {
+        *self
+            .operation_listener
+            .lock()
+            .expect("operation listener poisoned") = Some(Arc::new(listener));
+    }
+
+    pub fn set_catalog_listener(&self, listener: impl Fn() + Send + Sync + 'static) {
+        *self
+            .catalog_listener
+            .lock()
+            .expect("catalog listener poisoned") = Some(Arc::new(listener));
+    }
+
+    fn notify_catalog_changed(&self) {
+        let listener = self
+            .catalog_listener
+            .lock()
+            .expect("catalog listener poisoned")
+            .clone();
+        notify_catalog_listener(&listener);
     }
 
     pub fn operation_busy(&self) -> bool {
@@ -548,7 +626,7 @@ impl Marketplace {
         }
         let result = self.fetch_and_store();
         self.loading.store(false, Ordering::SeqCst);
-        match result {
+        let state = match result {
             Ok(()) => self.ok_catalog_state(false),
             Err(error) => {
                 *self.last_error.lock().expect("last error poisoned") = Some(
@@ -564,7 +642,9 @@ impl Marketplace {
                     Err(error)
                 }
             }
-        }
+        };
+        self.notify_catalog_changed();
+        state
     }
 
     /// Refresh only when the cached catalog is older than the TTL (or
@@ -4822,15 +4902,41 @@ mod tests {
     fn rapid_market_mutations_are_rejected_instead_of_queued() {
         let temp = tempfile::tempdir().expect("tempdir");
         let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&transitions);
+        marketplace.set_operation_listener(move |busy| {
+            observed.lock().expect("transitions").push(busy);
+        });
         let first = marketplace.begin_operation().expect("first operation");
+        assert!(marketplace.operation_busy());
         let busy = marketplace
             .begin_operation()
             .expect_err("a second operation must not queue");
         assert_eq!(busy.code, "marketOperationBusy");
         drop(first);
+        assert!(!marketplace.operation_busy());
         marketplace
             .begin_operation()
             .expect("gate released after operation");
+        assert_eq!(
+            *transitions.lock().expect("transitions"),
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn catalog_completion_notifies_the_registered_observer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        marketplace.set_catalog_listener(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+
+        marketplace.notify_catalog_changed();
+
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -2,7 +2,7 @@ import { Suspense, useEffect } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { features } from "@/features/registry";
-import { useLauncherSnapshot } from "@/platform/launcherStore";
+import { shallowEqual, useLauncherSelector } from "@/platform/launcherStore";
 import logoUrl from "../../assets/logo-blue.png";
 import { ThemeProvider } from "./ThemeProvider";
 
@@ -15,26 +15,31 @@ const navigation = features
   .sort((left, right) => left.order - right.order);
 
 function ShellContent() {
-  const snapshot = useLauncherSnapshot();
-  const { t, i18n } = useTranslation(undefined, { lng: snapshot.language });
+  const state = useLauncherSelector(
+    (snapshot) => ({
+      language: snapshot.language,
+      theme: snapshot.theme,
+      running: snapshot.phase === "ready",
+      desktopUpdateAvailable:
+        snapshot.desktopUpdate.kind === "available" ||
+        snapshot.desktopUpdate.kind === "preparing" ||
+        snapshot.desktopUpdate.kind === "downloading" ||
+        snapshot.desktopUpdate.kind === "installing" ||
+        (snapshot.desktopUpdate.kind === "failed" &&
+          snapshot.desktopUpdate.version !== null),
+    }),
+    shallowEqual,
+  );
+  const { t, i18n } = useTranslation(undefined, { lng: state.language });
 
   useEffect(() => {
-    if (i18n.language !== snapshot.language)
-      void i18n.changeLanguage(snapshot.language);
-    document.documentElement.lang = snapshot.language === "zh" ? "zh-CN" : "en";
-  }, [i18n, snapshot.language]);
-
-  const running = snapshot.phase === "ready";
-  const desktopUpdateAvailable =
-    snapshot.desktopUpdate.kind === "available" ||
-    snapshot.desktopUpdate.kind === "preparing" ||
-    snapshot.desktopUpdate.kind === "downloading" ||
-    snapshot.desktopUpdate.kind === "installing" ||
-    (snapshot.desktopUpdate.kind === "failed" &&
-      snapshot.desktopUpdate.version !== null);
+    if (i18n.language !== state.language)
+      void i18n.changeLanguage(state.language);
+    document.documentElement.lang = state.language === "zh" ? "zh-CN" : "en";
+  }, [i18n, state.language]);
 
   return (
-    <ThemeProvider theme={snapshot.theme}>
+    <ThemeProvider theme={state.theme}>
       <div className="app-shell">
         <aside className="sidebar">
           <div className="brand" aria-label={t("app.name")}>
@@ -57,7 +62,7 @@ function ShellContent() {
               >
                 <Icon size={17} strokeWidth={1.8} aria-hidden />
                 <span>{t(labelKey)}</span>
-                {featureId === "settings" && desktopUpdateAvailable && (
+                {featureId === "settings" && state.desktopUpdateAvailable && (
                   <span
                     className="nav-update-dot"
                     title={t("nav.desktopUpdateAvailable")}
@@ -69,9 +74,9 @@ function ShellContent() {
           </nav>
 
           <div className="sidebar-status" aria-live="polite">
-            <span className={`status-dot${running ? " running" : ""}`} />
+            <span className={`status-dot${state.running ? " running" : ""}`} />
             <span>
-              {running ? t("sidebar.running") : t("sidebar.notRunning")}
+              {state.running ? t("sidebar.running") : t("sidebar.notRunning")}
             </span>
           </div>
         </aside>

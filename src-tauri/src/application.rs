@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dsh_core::{
@@ -46,6 +46,46 @@ const DESKTOP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS: usize = 3;
 const DESKTOP_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(750);
 const HARNESS_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const PROGRESS_EVENT_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct ProgressEventThrottle {
+    last_emit: Option<Instant>,
+}
+
+impl ProgressEventThrottle {
+    fn reset(&mut self) {
+        self.last_emit = None;
+    }
+
+    fn should_emit(&mut self, done: u64, total: Option<u64>, now: Instant) -> bool {
+        let complete = total.is_some_and(|total| total > 0 && done >= total);
+        let due = self
+            .last_emit
+            .is_none_or(|last| now.saturating_duration_since(last) >= PROGRESS_EVENT_INTERVAL);
+        if complete || due {
+            self.last_emit = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Default)]
+struct DownloadProgressThrottle {
+    done: u64,
+    events: ProgressEventThrottle,
+}
+
+impl DownloadProgressThrottle {
+    fn record(&mut self, chunk: usize, total: Option<u64>, now: Instant) -> Option<u64> {
+        self.done = self.done.saturating_add(chunk as u64);
+        self.events
+            .should_emit(self.done, total, now)
+            .then_some(self.done)
+    }
+}
 
 fn external_link_url(target: &str) -> Option<&'static str> {
     match target {
@@ -104,7 +144,7 @@ impl AppState {
         let migration = MigrationService::from_environment(paths.clone())?;
         let marketplace = Marketplace::new(paths.clone());
         marketplace.initialize();
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             app,
             _instance_lock: instance_lock,
             server: Mutex::new(ServerManager::new(paths.clone())),
@@ -123,7 +163,20 @@ impl AppState {
             quitting: AtomicBool::new(false),
             exit_ready: AtomicBool::new(false),
             tray: Mutex::new(None),
-        }))
+        });
+        let weak_state = Arc::downgrade(&state);
+        state.marketplace.set_operation_listener(move |busy| {
+            if let Some(state) = weak_state.upgrade() {
+                state.market_operation_changed(busy);
+            }
+        });
+        let weak_state = Arc::downgrade(&state);
+        state.marketplace.set_catalog_listener(move || {
+            if let Some(state) = weak_state.upgrade() {
+                state.market_catalog_changed();
+            }
+        });
+        Ok(state)
     }
 
     pub(crate) fn snapshot(&self) -> LauncherSnapshot {
@@ -148,6 +201,16 @@ impl AppState {
         };
         let _ = self.app.emit("launcher://state", value);
         true
+    }
+
+    fn market_operation_changed(&self, busy: bool) {
+        let _ = self.mutate_if(|snapshot| update_market_operation_state(snapshot, busy));
+    }
+
+    fn market_catalog_changed(&self) {
+        self.mutate(|snapshot| {
+            snapshot.market_catalog_revision = snapshot.market_catalog_revision.saturating_add(1);
+        });
     }
 
     pub(crate) fn start(
@@ -450,26 +513,41 @@ impl AppState {
             return;
         }
         let weak = Arc::downgrade(self);
+        let progress_events = Mutex::new(ProgressEventThrottle::default());
         let notify = move |event| {
             let Some(state) = weak.upgrade() else {
                 return;
             };
             match event {
-                DeploymentEvent::Activity { code, values } => state.mutate(|snapshot| {
-                    snapshot.activity = Some(ActivityState {
-                        code,
-                        values,
-                        started_at_ms: now_ms(),
+                DeploymentEvent::Activity { code, values } => {
+                    progress_events
+                        .lock()
+                        .expect("progress events poisoned")
+                        .reset();
+                    state.mutate(|snapshot| {
+                        snapshot.activity = Some(ActivityState {
+                            code,
+                            values,
+                            started_at_ms: now_ms(),
+                        });
+                        snapshot.progress = ProgressState::Indeterminate;
                     });
-                    snapshot.progress = ProgressState::Indeterminate;
-                }),
-                DeploymentEvent::Progress { done, total } => state.mutate(|snapshot| {
-                    snapshot.progress = total
-                        .filter(|total| *total > 0)
-                        .map_or(ProgressState::Indeterminate, |total| {
-                            ProgressState::Determinate { done, total }
-                        })
-                }),
+                }
+                DeploymentEvent::Progress { done, total } => {
+                    let publish = progress_events
+                        .lock()
+                        .expect("progress events poisoned")
+                        .should_emit(done, total, Instant::now());
+                    if publish {
+                        state.mutate(|snapshot| {
+                            snapshot.progress = total
+                                .filter(|total| *total > 0)
+                                .map_or(ProgressState::Indeterminate, |total| {
+                                    ProgressState::Determinate { done, total }
+                                })
+                        });
+                    }
+                }
                 DeploymentEvent::ActivityUpdate { values } => state.mutate(|snapshot| {
                     if let Some(activity) = snapshot.activity.as_mut() {
                         activity.values = values;
@@ -1183,23 +1261,25 @@ impl AppState {
             });
             let progress_version = version.clone();
             let weak = Arc::downgrade(self);
+            let progress = Arc::new(Mutex::new(DownloadProgressThrottle::default()));
             let downloaded = tokio::time::timeout(
                 DESKTOP_UPDATE_DOWNLOAD_TIMEOUT,
                 update.download(
                     move |chunk, total| {
                         if let Some(state) = weak.upgrade() {
-                            state.mutate(|snapshot| {
-                                let done = match &snapshot.desktop_update {
-                                    DesktopUpdateState::Downloading { done, .. } => *done,
-                                    _ => 0,
-                                }
-                                .saturating_add(chunk as u64);
-                                snapshot.desktop_update = DesktopUpdateState::Downloading {
-                                    version: progress_version.clone(),
-                                    done,
-                                    total,
-                                };
-                            });
+                            let done = progress
+                                .lock()
+                                .expect("desktop update progress poisoned")
+                                .record(chunk, total, Instant::now());
+                            if let Some(done) = done {
+                                state.mutate(|snapshot| {
+                                    snapshot.desktop_update = DesktopUpdateState::Downloading {
+                                        version: progress_version.clone(),
+                                        done,
+                                        total,
+                                    };
+                                });
+                            }
                         }
                     },
                     || {},
@@ -1397,6 +1477,17 @@ impl AppState {
         }
         Ok(())
     }
+}
+
+fn update_market_operation_state(snapshot: &mut LauncherSnapshot, busy: bool) -> bool {
+    if snapshot.market_busy == busy {
+        return false;
+    }
+    snapshot.market_busy = busy;
+    if !busy {
+        snapshot.market_revision = snapshot.market_revision.saturating_add(1);
+    }
+    true
 }
 
 fn mark_harness_update_checking(
@@ -1742,7 +1833,6 @@ pub fn run() {
             commands::market_install,
             commands::market_uninstall,
             commands::market_pending_verification,
-            commands::market_operation_busy,
             commands::market_rollback_pending,
             commands::market_open_plugin_github,
         ])
@@ -1824,18 +1914,22 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::{
         DEEPSEEK_PLATFORM, DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS, DesktopUpdateCheckFailure,
-        DesktopUpdateDownloadFailure, GITHUB_REPOSITORY, HARNESS_GITHUB_REPOSITORY,
-        LifecycleDecision, WEBSITE, acquire_instance_lock, acquire_instance_lock_with_timeout,
+        DesktopUpdateDownloadFailure, DownloadProgressThrottle, GITHUB_REPOSITORY,
+        HARNESS_GITHUB_REPOSITORY, LifecycleDecision, PROGRESS_EVENT_INTERVAL,
+        ProgressEventThrottle, WEBSITE, acquire_instance_lock, acquire_instance_lock_with_timeout,
         classify_desktop_update_check_error, classify_desktop_update_download_error,
         complete_harness_deployment, desktop_update_check_error, desktop_update_download_error,
         desktop_update_start_state, external_link_url, harness_update_after_check,
         lifecycle_decision, mark_harness_update_checking, replace_harness_update_if_checking,
         retryable_download_http_status, should_retry_desktop_update_download,
-        should_rollback_marketplace_after_start_failure,
+        should_rollback_marketplace_after_start_failure, update_market_operation_state,
     };
     use dsh_core::{
         AppError, ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherSnapshot,
@@ -1845,6 +1939,50 @@ mod tests {
     #[test]
     fn product_website_uses_the_public_homepage() {
         assert_eq!(WEBSITE, "https://dsdesktop.com/");
+    }
+
+    #[test]
+    fn market_operation_state_publishes_busy_and_one_completion_revision() {
+        let mut snapshot = LauncherSnapshot::initial("0.3.4");
+        assert!(update_market_operation_state(&mut snapshot, true));
+        assert!(snapshot.market_busy);
+        assert_eq!(snapshot.market_revision, 0);
+        assert!(!update_market_operation_state(&mut snapshot, true));
+
+        assert!(update_market_operation_state(&mut snapshot, false));
+        assert!(!snapshot.market_busy);
+        assert_eq!(snapshot.market_revision, 1);
+        assert!(!update_market_operation_state(&mut snapshot, false));
+        assert_eq!(snapshot.market_revision, 1);
+    }
+
+    #[test]
+    fn progress_events_are_throttled_but_completion_is_immediate() {
+        let started = Instant::now();
+        let mut throttle = ProgressEventThrottle::default();
+        assert!(throttle.should_emit(10, Some(100), started));
+        assert!(!throttle.should_emit(20, Some(100), started + PROGRESS_EVENT_INTERVAL / 2));
+        assert!(throttle.should_emit(30, Some(100), started + PROGRESS_EVENT_INTERVAL));
+        assert!(throttle.should_emit(
+            100,
+            Some(100),
+            started + PROGRESS_EVENT_INTERVAL + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn coalesced_download_progress_never_loses_bytes() {
+        let started = Instant::now();
+        let mut progress = DownloadProgressThrottle::default();
+        assert_eq!(progress.record(10, Some(100), started), Some(10));
+        assert_eq!(
+            progress.record(20, Some(100), started + PROGRESS_EVENT_INTERVAL / 2),
+            None
+        );
+        assert_eq!(
+            progress.record(70, Some(100), started + PROGRESS_EVENT_INTERVAL / 2),
+            Some(100)
+        );
     }
 
     #[test]

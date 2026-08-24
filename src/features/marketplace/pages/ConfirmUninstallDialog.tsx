@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { useLauncherSnapshot } from "@/platform/launcherStore";
+import { useLauncherSelector } from "@/platform/launcherStore";
 import type {
   InstalledPlugin,
   PluginSummary,
@@ -20,8 +20,8 @@ export function ConfirmUninstallDialog({
   onCancel: () => void;
   onConfirm: () => void;
 }) {
-  const snapshot = useLauncherSnapshot();
-  const { t } = useTranslation(undefined, { lng: snapshot.language });
+  const language = useLauncherSelector((snapshot) => snapshot.language);
+  const { t } = useTranslation(undefined, { lng: language });
   const cancelButton = useRef<HTMLButtonElement>(null);
   const submitted = useRef(false);
   const [submitting, setSubmitting] = useState(false);

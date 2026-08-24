@@ -86,6 +86,9 @@ export type MigrationState =
 
 export type LauncherSnapshot = {
   revision: number;
+  marketBusy: boolean;
+  marketRevision: number;
+  marketCatalogRevision: number;
   phase: LauncherPhase;
   step: LauncherStep;
   activity: ActivityState | null;

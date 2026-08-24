@@ -9,6 +9,13 @@ import type {
 
 export const MARKET_PAGE_SIZE = 24;
 
+export function catalogGenerationChanged(
+  refreshStartedAt: string | null,
+  latest: string | null,
+): boolean {
+  return latest !== refreshStartedAt;
+}
+
 type MarketCatalogView = "loading" | "failed" | "content";
 
 export function marketCatalogView(
@@ -69,13 +76,6 @@ export function shouldClearPendingVerification(
     serviceStartedAtMs !== null &&
     serviceStartedAtMs > installedAtMs
   );
-}
-
-export function marketOperationSettled(
-  wasBusy: boolean,
-  isBusy: boolean,
-): boolean {
-  return wasBusy && !isBusy;
 }
 
 /// Display label for one pending batch entry. Entries whose identity was lost

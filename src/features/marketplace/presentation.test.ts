@@ -1,16 +1,35 @@
 import { describe, expect, it } from "vitest";
 import {
+  catalogGenerationChanged,
   compatibilityPresentation,
   formatScore,
   formatStars,
   installedFilterValue,
   isMarketCatalogUnavailable,
   marketCatalogView,
-  marketOperationSettled,
   paginationItems,
   pendingChangeLabels,
   shouldClearPendingVerification,
 } from "./presentation";
+
+describe("catalogGenerationChanged", () => {
+  it("keeps the refresh-start baseline when a revision event wins the race", () => {
+    const refreshStartedAt = "old-generation";
+    let observedGeneration = refreshStartedAt;
+
+    observedGeneration = "new-generation";
+
+    expect(catalogGenerationChanged(refreshStartedAt, observedGeneration)).toBe(
+      true,
+    );
+  });
+
+  it("does not report an unchanged generation", () => {
+    expect(catalogGenerationChanged("same-generation", "same-generation")).toBe(
+      false,
+    );
+  });
+});
 
 describe("marketCatalogView", () => {
   it("shows the initial loading layout until the first page is available", () => {
@@ -58,15 +77,6 @@ describe("shouldClearPendingVerification", () => {
   it("clears a marker only after a newer service start succeeds", () => {
     expect(shouldClearPendingVerification("starting", 300, 200)).toBe(false);
     expect(shouldClearPendingVerification("ready", 300, 200)).toBe(true);
-  });
-});
-
-describe("marketOperationSettled", () => {
-  it("refreshes only on a busy-to-idle transition", () => {
-    expect(marketOperationSettled(false, false)).toBe(false);
-    expect(marketOperationSettled(false, true)).toBe(false);
-    expect(marketOperationSettled(true, true)).toBe(false);
-    expect(marketOperationSettled(true, false)).toBe(true);
   });
 });
 

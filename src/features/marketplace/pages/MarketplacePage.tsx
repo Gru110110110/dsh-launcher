@@ -12,7 +12,7 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { marketApi } from "@/platform/marketApi";
 import { launcherApi } from "@/platform/launcherApi";
-import { useLauncherSnapshot } from "@/platform/launcherStore";
+import { shallowEqual, useLauncherSelector } from "@/platform/launcherStore";
 import type {
   MarketCatalogState,
   MarketPage,
@@ -29,13 +29,13 @@ import {
   KIND_OPTIONS,
   MARKET_PAGE_SIZE,
   SORT_OPTIONS,
+  catalogGenerationChanged,
   compatibilityPresentation,
   formatScore,
   formatStars,
   installedFilterValue,
   isMarketCatalogUnavailable,
   marketCatalogView,
-  marketOperationSettled,
   paginationItems,
   pendingChangeLabels,
   shouldClearPendingVerification,
@@ -59,9 +59,8 @@ function PluginCard({
   onInstall: (plugin: PluginSummary) => void;
   onUninstall: (plugin: PluginSummary) => void;
 }) {
-  const snapshot = useLauncherSnapshot();
-  const { t } = useTranslation(undefined, { lng: snapshot.language });
-  const language = snapshot.language;
+  const language = useLauncherSelector((snapshot) => snapshot.language);
+  const { t } = useTranslation(undefined, { lng: language });
   const compat = compatibilityPresentation(plugin.compatibility);
   const description =
     language === "zh" ? plugin.descriptionZh : plugin.description;
@@ -176,8 +175,18 @@ function PluginCard({
 }
 
 export function MarketplacePage() {
-  const snapshot = useLauncherSnapshot();
-  const { t } = useTranslation(undefined, { lng: snapshot.language });
+  const launcher = useLauncherSelector(
+    (snapshot) => ({
+      language: snapshot.language,
+      phase: snapshot.phase,
+      serviceStartedAtMs: snapshot.serviceStartedAtMs,
+      marketBusy: snapshot.marketBusy,
+      marketRevision: snapshot.marketRevision,
+      marketCatalogRevision: snapshot.marketCatalogRevision,
+    }),
+    shallowEqual,
+  );
+  const { t } = useTranslation(undefined, { lng: launcher.language });
 
   const [catalog, setCatalog] = useState<MarketCatalogState | null>(null);
   const [page, setPage] = useState<MarketPage | null>(null);
@@ -191,7 +200,6 @@ export function MarketplacePage() {
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
-  const [marketplaceBusy, setMarketplaceBusy] = useState(false);
   const [pending, setPending] = useState<PendingVerification | null>(null);
   const [conflict, setConflict] = useState<{
     plugin: PluginSummary;
@@ -206,11 +214,40 @@ export function MarketplacePage() {
   const refreshAttempt = useRef(0);
   const refreshRetryTimer = useRef<number | null>(null);
   const catalogStamp = useRef<string | null>(null);
+  const observedMarketRevision = useRef(launcher.marketRevision);
+  const observedCatalogRevision = useRef(launcher.marketCatalogRevision);
+  const catalogToken = useRef(0);
+  const pendingToken = useRef(0);
+  const pageMounted = useRef(true);
 
   const translate = useCallback<Translate>(
     (key, values) => t(key, values),
     [t],
   );
+
+  useEffect(() => {
+    pageMounted.current = true;
+    return () => {
+      pageMounted.current = false;
+    };
+  }, []);
+
+  const runPendingQuery = useCallback(() => {
+    if (!pageMounted.current) return;
+    const token = ++pendingToken.current;
+    void marketApi
+      .pendingVerification()
+      .then((marker) => {
+        if (pageMounted.current && token === pendingToken.current) {
+          setPending(marker);
+        }
+      })
+      .catch((error: unknown) => {
+        if (pageMounted.current && token === pendingToken.current) {
+          showTimedError(error, translate);
+        }
+      });
+  }, [translate]);
 
   // The data query owns the page content and the loading flag; it must win
   // immediately. The compatibility pass runs independently in the background
@@ -274,62 +311,38 @@ export function MarketplacePage() {
       });
   }, []);
 
-  // Load the catalog on mount and query the first page. When a refresh is
-  // already in flight (the backend reports "loading"), poll until it settles
-  // instead of leaving the page stuck on the downloading state forever.
+  // Load the current catalog state on mount. An in-flight refresh settles via
+  // the durable catalog revision in the launcher snapshot, so no polling is
+  // needed when this page mounts in the middle of a download.
   useEffect(() => {
     let cancelled = false;
-    let pollTimer: number | null = null;
+    const token = ++catalogToken.current;
 
     const settle = (state: MarketCatalogState) => {
-      // Only an explicit failure triggers a full download; a running refresh
-      // renders its own loading state, so poll until it finishes by itself.
       if (state.kind === "failed") {
         refresh();
         return;
       }
       if (state.kind === "ready") {
-        refreshStale();
-        return;
+        refreshStale(state.generatedAt);
       }
-      pollTimer = window.setTimeout(() => {
-        marketApi
-          .catalogState()
-          .then((latest) => {
-            if (cancelled) return;
-            setCatalog(latest);
-            settle(latest);
-          })
-          .catch((error: unknown) => {
-            if (cancelled) return;
-            showTimedError(error, translate);
-          });
-      }, 1500);
     };
 
     marketApi
       .catalogState()
       .then((state) => {
-        if (cancelled) return;
+        if (cancelled || token !== catalogToken.current) return;
         setCatalog(state);
         settle(state);
       })
       .catch((error: unknown) => {
-        if (cancelled) return;
+        if (cancelled || token !== catalogToken.current) return;
         setCatalog({ kind: "failed", message: null });
         showTimedError(error, translate);
       });
-    marketApi
-      .pendingVerification()
-      .then((marker) => {
-        if (!cancelled) setPending(marker);
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) showTimedError(error, translate);
-      });
+    runPendingQuery();
     return () => {
       cancelled = true;
-      if (pollTimer !== null) window.clearTimeout(pollTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -351,14 +364,14 @@ export function MarketplacePage() {
     if (!pending) return;
     if (
       shouldClearPendingVerification(
-        snapshot.phase,
-        snapshot.serviceStartedAtMs,
+        launcher.phase,
+        launcher.serviceStartedAtMs,
         pending.installedAtMs,
       )
     ) {
       setPending(null);
     }
-  }, [snapshot.phase, snapshot.serviceStartedAtMs, pending, translate]);
+  }, [launcher.phase, launcher.serviceStartedAtMs, pending, translate]);
 
   // Track the displayed catalog generation so background refreshes can tell
   // whether the data actually changed.
@@ -392,52 +405,56 @@ export function MarketplacePage() {
     [appliedSearch, kind, installedFilter, sort],
   );
 
-  // The backend owns the mutation gate, so route changes cannot erase its
-  // busy state. When an operation that began on another page settles, reload
-  // both the visible cards and the rollback marker instead of relying on a
-  // callback owned by an unmounted MarketplacePage instance.
+  // The backend publishes a durable completion revision through the launcher
+  // snapshot. A page mounted after completion gets fresh data from its initial
+  // query, while a mounted page refreshes as soon as the revision changes.
   useEffect(() => {
-    let cancelled = false;
-    let inFlight = false;
-    let wasBusy = false;
-    const poll = () => {
-      if (inFlight) return;
-      inFlight = true;
-      void marketApi
-        .operationBusy()
-        .then((value) => {
-          if (cancelled) return;
-          setMarketplaceBusy(value);
-          if (marketOperationSettled(wasBusy, value)) {
-            const query = buildQuery(pageNumber);
-            runQuery(query);
-            runCompatPass(query);
-            void marketApi
-              .pendingVerification()
-              .then((marker) => {
-                if (!cancelled) setPending(marker);
-              })
-              .catch((error: unknown) => {
-                if (!cancelled) showTimedError(error, translate);
-              });
-          }
-          wasBusy = value;
-        })
-        .catch(() => {
-          // The backend gate remains authoritative. Keep the last observed
-          // state and retry on the next poll without adding a repetitive toast.
-        })
-        .finally(() => {
-          inFlight = false;
-        });
-    };
-    poll();
-    const timer = window.setInterval(poll, 500);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [pageNumber, buildQuery, runQuery, runCompatPass, translate]);
+    if (launcher.marketRevision === observedMarketRevision.current) return;
+    observedMarketRevision.current = launcher.marketRevision;
+    const query = buildQuery(pageNumber);
+    runQuery(query);
+    runCompatPass(query);
+    runPendingQuery();
+  }, [
+    launcher.marketRevision,
+    pageNumber,
+    buildQuery,
+    runQuery,
+    runCompatPass,
+    runPendingQuery,
+  ]);
+
+  useEffect(() => {
+    if (launcher.marketCatalogRevision === observedCatalogRevision.current) {
+      return;
+    }
+    observedCatalogRevision.current = launcher.marketCatalogRevision;
+    const token = ++catalogToken.current;
+    void marketApi
+      .catalogState()
+      .then((state) => {
+        if (token !== catalogToken.current || !pageMounted.current) return;
+        setCatalog(state);
+        if (state.kind === "ready") {
+          catalogStamp.current = state.generatedAt;
+          const query = buildQuery(pageNumber);
+          runQuery(query);
+          runCompatPass(query);
+        }
+      })
+      .catch((error: unknown) => {
+        if (token === catalogToken.current && pageMounted.current) {
+          showTimedError(error, translate);
+        }
+      });
+  }, [
+    launcher.marketCatalogRevision,
+    pageNumber,
+    buildQuery,
+    runQuery,
+    runCompatPass,
+    translate,
+  ]);
 
   useEffect(() => {
     setLoading(true);
@@ -459,7 +476,9 @@ export function MarketplacePage() {
 
   // Silent TTL refresh: downloads only when the cached catalog is older than
   // 24h (or missing), never blocks browsing, and stays quiet on failure.
-  function refreshStale() {
+  function refreshStale(refreshStartedAt: string | null) {
+    // Keep this operation's baseline immutable. The catalog-revision effect
+    // may update catalogStamp before the refresh promise resolves.
     marketApi
       .refreshCatalogIfStale()
       .then((state) => {
@@ -469,7 +488,10 @@ export function MarketplacePage() {
           setCatalog(state);
           return;
         }
-        const changed = state.generatedAt !== catalogStamp.current;
+        const changed = catalogGenerationChanged(
+          refreshStartedAt,
+          state.generatedAt,
+        );
         catalogStamp.current = state.generatedAt;
         if (changed || state.stale) {
           setCatalog(state);
@@ -553,12 +575,7 @@ export function MarketplacePage() {
         if (result.restartRequired) {
           // Keep the verification marker visible in-session: if the harness
           // fails after the restart, the pending banner must appear.
-          void marketApi
-            .pendingVerification()
-            .then(setPending)
-            .catch((error: unknown) => {
-              showTimedError(error, translate);
-            });
+          runPendingQuery();
           toast.success(
             t("market.toast.installedRestartRequired", {
               plugin: plugin.name,
@@ -611,12 +628,7 @@ export function MarketplacePage() {
           id: `market-uninstalled-${pluginId}`,
         });
         if (result.restartRequired) {
-          void marketApi
-            .pendingVerification()
-            .then(setPending)
-            .catch((error: unknown) => {
-              showTimedError(error, translate);
-            });
+          runPendingQuery();
           toast(t("market.restartRequired.detail"), {
             id: `market-restart-${pluginId}`,
             duration: 12_000,
@@ -668,14 +680,14 @@ export function MarketplacePage() {
   return (
     <section
       className="content-page market-page"
-      aria-busy={marketplaceBusy || busyPlugin !== null}
+      aria-busy={launcher.marketBusy || busyPlugin !== null}
     >
       <header className="page-header">
         <h1>{t("market.title")}</h1>
         <p>{t("market.subtitle")}</p>
       </header>
 
-      {pending && snapshot.phase === "failed" && (
+      {pending && launcher.phase === "failed" && (
         <div className="market-pending panel" role="alert">
           <TriangleAlert size={16} aria-hidden />
           <span>
@@ -691,7 +703,7 @@ export function MarketplacePage() {
           <button
             className="outline-button danger"
             type="button"
-            disabled={busyPlugin !== null || marketplaceBusy}
+            disabled={busyPlugin !== null || launcher.marketBusy}
             onClick={() => {
               setBusyPlugin(pending.pluginId);
               void marketApi
@@ -827,7 +839,7 @@ export function MarketplacePage() {
               plugin={plugin}
               key={plugin.id}
               busy={busyPlugin === plugin.id}
-              disabled={busyPlugin !== null || marketplaceBusy}
+              disabled={busyPlugin !== null || launcher.marketBusy}
               onInstall={(target) => {
                 prepareInstall(target);
               }}
@@ -929,7 +941,7 @@ export function MarketplacePage() {
         <ConfirmInstallDialog
           plugin={conflict.plugin}
           detail={conflict.detail}
-          disabled={marketplaceBusy || busyPlugin !== null}
+          disabled={launcher.marketBusy || busyPlugin !== null}
           onCancel={() => {
             setConflict(null);
           }}
@@ -944,7 +956,7 @@ export function MarketplacePage() {
         <ConfirmUninstallDialog
           plugin={uninstallConfirm.plugin}
           target={uninstallConfirm.target}
-          disabled={marketplaceBusy || busyPlugin !== null}
+          disabled={launcher.marketBusy || busyPlugin !== null}
           onCancel={() => {
             setUninstallConfirm(null);
           }}

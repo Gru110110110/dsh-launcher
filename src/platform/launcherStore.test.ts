@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { LauncherSnapshot } from "./generated/bindings";
-import { __launcherStoreTest } from "./launcherStore";
+import { __launcherStoreTest, shallowEqual } from "./launcherStore";
 
 function snapshot(
   revision: number,
@@ -8,6 +8,9 @@ function snapshot(
 ): LauncherSnapshot {
   return {
     revision,
+    marketBusy: false,
+    marketRevision: 0,
+    marketCatalogRevision: 0,
     phase,
     step: "prepare",
     activity: null,
@@ -43,5 +46,22 @@ describe("launcher state stream", () => {
     __launcherStoreTest.accept(snapshot(1, "preparing"));
     __launcherStoreTest.accept(snapshot(2, "starting"));
     expect(__launcherStoreTest.current()?.phase).toBe("starting");
+  });
+});
+
+describe("launcher selectors", () => {
+  it("keeps shallow field selections stable across full snapshot objects", () => {
+    expect(
+      shallowEqual(
+        { language: "zh", marketBusy: false },
+        { language: "zh", marketBusy: false },
+      ),
+    ).toBe(true);
+    expect(
+      shallowEqual(
+        { language: "zh", marketBusy: false },
+        { language: "zh", marketBusy: true },
+      ),
+    ).toBe(false);
   });
 });
