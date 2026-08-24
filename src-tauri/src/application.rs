@@ -175,6 +175,7 @@ impl AppState {
     }
 
     pub(crate) fn stop_service(&self) -> AppResult<()> {
+        let _market_guard = self.marketplace.begin_operation()?;
         if !self.mutate_if(|snapshot| {
             if snapshot.phase != LauncherPhase::Ready {
                 return false;
@@ -203,6 +204,7 @@ impl AppState {
     }
 
     pub(crate) fn restart_service(&self) -> AppResult<()> {
+        let _market_guard = self.marketplace.begin_operation()?;
         if !self.mutate_if(|snapshot| {
             if snapshot.phase != LauncherPhase::Ready {
                 return false;
@@ -219,12 +221,20 @@ impl AppState {
         }) {
             return Err(AppError::new("serviceNotReady"));
         }
+        let had_pending_market_change = self.marketplace.has_pending_rollback();
         let restarted = {
             let mut server = self.server.lock().expect("server poisoned");
-            server.stop().and_then(|()| server.start())
+            if let Err(error) = server.stop() {
+                self.fail(error.clone());
+                return Err(error);
+            }
+            server.start()
         };
         match restarted {
             Ok(url) => {
+                if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
+                    log::warn!("could not clear verified marketplace rollback state: {error}");
+                }
                 self.mutate(|snapshot| {
                     snapshot.phase = LauncherPhase::Ready;
                     snapshot.web_url = Some(url);
@@ -233,6 +243,38 @@ impl AppState {
                     snapshot.error = None;
                 });
                 Ok(())
+            }
+            Err(error)
+                if had_pending_market_change
+                    && should_rollback_marketplace_after_start_failure(&error, false) =>
+            {
+                let plugins = self.marketplace.pending_change_summary();
+                log::error!(
+                    "Harness did not publish an address with an unverified marketplace batch; rolling back: {error}"
+                );
+                if let Err(rollback_error) = self.marketplace.rollback_pending_while_guarded() {
+                    self.fail(rollback_error.clone());
+                    return Err(rollback_error);
+                }
+                match self.server.lock().expect("server poisoned").start() {
+                    Ok(url) => {
+                        let failure = AppError::new("marketVerificationFailed")
+                            .value("plugins", plugins)
+                            .detail(error.safe_detail.unwrap_or(error.code));
+                        self.mutate(|snapshot| {
+                            snapshot.phase = LauncherPhase::Ready;
+                            snapshot.web_url = Some(url);
+                            snapshot.service_started_at_ms = Some(now_ms());
+                            snapshot.activity = None;
+                            snapshot.error = Some(failure.clone());
+                        });
+                        Err(failure)
+                    }
+                    Err(restore_error) => {
+                        self.fail(restore_error.clone());
+                        Err(restore_error)
+                    }
+                }
             }
             Err(error) => {
                 self.fail(error.clone());
@@ -252,6 +294,7 @@ impl AppState {
         if self.quitting.load(Ordering::SeqCst) {
             return Err(AppError::new("deploymentCancelled"));
         }
+        let market_guard = self.marketplace.begin_operation()?;
         let mut slot = self.startup_thread.lock().expect("startup thread poisoned");
         if slot.as_ref().is_some_and(|thread| !thread.is_finished()) {
             return Err(AppError::new("launcherBusy"));
@@ -280,6 +323,7 @@ impl AppState {
         let worker = thread::Builder::new()
             .name("launcher-startup".into())
             .spawn(move || {
+                let _market_guard = market_guard;
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
                     state.run_startup(
                         force,
@@ -501,6 +545,9 @@ impl AppState {
         }
         match started {
             Ok(url) => {
+                if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
+                    log::warn!("could not clear verified marketplace rollback state: {error}");
+                }
                 self.mutate(|snapshot| {
                     snapshot.phase = LauncherPhase::Ready;
                     snapshot.web_url = Some(url);
@@ -512,6 +559,43 @@ impl AppState {
                 tauri::async_runtime::spawn(async move {
                     let _ = state.check_harness_update().await;
                 });
+            }
+            Err(error)
+                if self.marketplace.has_pending_rollback()
+                    && should_rollback_marketplace_after_start_failure(
+                        &error,
+                        force || activate_prepared,
+                    ) =>
+            {
+                let plugins = self.marketplace.pending_change_summary();
+                log::error!(
+                    "Harness did not publish an address with an unverified marketplace batch; rolling back: {error}"
+                );
+                if let Err(rollback_error) = self.marketplace.rollback_pending_while_guarded() {
+                    self.fail_unless_quitting(rollback_error);
+                    return;
+                }
+                match self
+                    .server
+                    .lock()
+                    .expect("server poisoned")
+                    .start_cancellable(|| {
+                        controller.is_cancelled() || self.quitting.load(Ordering::SeqCst)
+                    }) {
+                    Ok(url) => {
+                        let failure = AppError::new("marketVerificationFailed")
+                            .value("plugins", plugins)
+                            .detail(error.safe_detail.unwrap_or(error.code));
+                        self.mutate(|snapshot| {
+                            snapshot.phase = LauncherPhase::Ready;
+                            snapshot.web_url = Some(url);
+                            snapshot.service_started_at_ms = Some(now_ms());
+                            snapshot.activity = None;
+                            snapshot.error = Some(failure);
+                        });
+                    }
+                    Err(restore_error) => self.fail_unless_quitting(restore_error),
+                }
             }
             Err(error) => self.fail_unless_quitting(error),
         }
@@ -1658,7 +1742,8 @@ pub fn run() {
             commands::market_install,
             commands::market_uninstall,
             commands::market_pending_verification,
-            commands::market_clear_pending_verification,
+            commands::market_operation_busy,
+            commands::market_rollback_pending,
             commands::market_open_plugin_github,
         ])
         .build(tauri::generate_context!())
@@ -1717,6 +1802,19 @@ fn handle_cli_probe() -> bool {
     false
 }
 
+/// A marketplace rollback is justified only when the managed process ran but
+/// never published its Web UI address. Infrastructure failures (port
+/// allocation, guard spawn/ownership, output capture, shutdown) leave the
+/// unverified batch intact for diagnosis instead of blaming and deleting an
+/// unrelated plugin change. Runtime replacement is also excluded because the
+/// new runtime itself is an independent cause.
+fn should_rollback_marketplace_after_start_failure(
+    error: &AppError,
+    runtime_replaced: bool,
+) -> bool {
+    !runtime_replaced && error.code == "serviceNoAddress"
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1737,6 +1835,7 @@ mod tests {
         desktop_update_start_state, external_link_url, harness_update_after_check,
         lifecycle_decision, mark_harness_update_checking, replace_harness_update_if_checking,
         retryable_download_http_status, should_retry_desktop_update_download,
+        should_rollback_marketplace_after_start_failure,
     };
     use dsh_core::{
         AppError, ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherSnapshot,
@@ -1757,6 +1856,30 @@ mod tests {
         );
         assert_eq!(external_link_url("deepseek"), Some(DEEPSEEK_PLATFORM));
         assert_eq!(external_link_url("unknown"), None);
+    }
+
+    #[test]
+    fn marketplace_rollback_is_limited_to_unverified_service_boot_failures() {
+        assert!(should_rollback_marketplace_after_start_failure(
+            &AppError::new("serviceNoAddress"),
+            false
+        ));
+        for unrelated in [
+            "freePortFailed",
+            "serviceStartFailed",
+            "serviceGuardFailed",
+            "serviceOutputUnreadable",
+            "serviceShutdownIncomplete",
+        ] {
+            assert!(!should_rollback_marketplace_after_start_failure(
+                &AppError::new(unrelated),
+                false
+            ));
+        }
+        assert!(!should_rollback_marketplace_after_start_failure(
+            &AppError::new("serviceNoAddress"),
+            true
+        ));
     }
 
     #[test]

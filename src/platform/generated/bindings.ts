@@ -209,8 +209,26 @@ export type MarketOperationResult = {
   error: LauncherError | null;
 };
 
+export type PendingMarketChange = {
+  pluginId: string;
+  name: string;
+  action: MarketOperationKind;
+  profile: string | null;
+};
+
 export type PendingVerification = {
+  /**
+   * The most recent change is retained in the legacy fields so pending
+   * markers written by older launchers remain readable after an update.
+   */
   pluginId: string;
   name: string;
   installedAtMs: number;
+  changes: Array<PendingMarketChange>;
+  /**
+   * The original journal was unreadable and was quarantined. The profile
+   * names in `changes` remain sufficient for a safe rollback, but the
+   * individual plugin identities are no longer trustworthy.
+   */
+  journalRecovered: boolean;
 };

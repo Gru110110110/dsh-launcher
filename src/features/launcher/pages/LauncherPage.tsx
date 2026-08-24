@@ -19,6 +19,7 @@ import { toast } from "sonner";
 import deepseekIconUrl from "../../../../assets/external/deepseek.png";
 import githubIconUrl from "../../../../assets/external/github.svg";
 import { launcherApi } from "@/platform/launcherApi";
+import { marketApi } from "@/platform/marketApi";
 import { useLauncherSnapshot } from "@/platform/launcherStore";
 import { showMigrationWarning, showTimedError } from "@/shared/errorToast";
 import { presentError } from "@/shared/presentError";
@@ -46,6 +47,7 @@ export function LauncherPage() {
   const promptedDownload = useRef<string | null>(null);
   const updateRequestPendingRef = useRef(false);
   const [updateRequestPending, setUpdateRequestPending] = useState(false);
+  const [marketplaceBusy, setMarketplaceBusy] = useState(false);
   const harnessUpdateBlocked =
     (!running && !stopped) ||
     snapshot.desktopUpdate.kind === "checking" ||
@@ -91,6 +93,27 @@ export function LauncherPage() {
       t(key, values),
     );
   }, [snapshot.migration, t]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshBusyState = () => {
+      void marketApi
+        .operationBusy()
+        .then((value) => {
+          if (!cancelled) setMarketplaceBusy(value);
+        })
+        .catch(() => {
+          // The backend gate remains authoritative if this advisory poll
+          // fails; avoid turning a transient IPC error into a page toast.
+        });
+    };
+    refreshBusyState();
+    const timer = window.setInterval(refreshBusyState, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     if (migrationWarning) showMigrationWarning(migrationWarning);
@@ -449,6 +472,10 @@ export function LauncherPage() {
                 <>
                   <button
                     className="outline-button danger"
+                    disabled={marketplaceBusy}
+                    title={
+                      marketplaceBusy ? t("market.operationBusy") : undefined
+                    }
                     onClick={() => {
                       run(launcherApi.stop());
                     }}
@@ -458,6 +485,10 @@ export function LauncherPage() {
                   </button>
                   <button
                     className="outline-button"
+                    disabled={marketplaceBusy}
+                    title={
+                      marketplaceBusy ? t("market.operationBusy") : undefined
+                    }
                     onClick={() => {
                       run(launcherApi.restart());
                     }}

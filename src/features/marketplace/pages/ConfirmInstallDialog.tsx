@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useLauncherSnapshot } from "@/platform/launcherStore";
@@ -14,19 +14,28 @@ const BINDING_TRANSLATION_KEYS = {
 export function ConfirmInstallDialog({
   plugin,
   detail,
-  risky,
+  disabled = false,
   onCancel,
   onConfirm,
 }: {
   plugin: PluginSummary;
   detail?: string;
-  risky: boolean;
+  disabled?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
   const snapshot = useLauncherSnapshot();
   const { t } = useTranslation(undefined, { lng: snapshot.language });
   const cancelButton = useRef<HTMLButtonElement>(null);
+  const submitted = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  const confirmOnce = () => {
+    if (disabled || submitted.current) return;
+    submitted.current = true;
+    setSubmitting(true);
+    onConfirm();
+  };
 
   useEffect(() => {
     cancelButton.current?.focus();
@@ -59,13 +68,11 @@ export function ConfirmInstallDialog({
         <header className="market-dialog-header">
           <TriangleAlert size={20} aria-hidden />
           <h2 id="market-dialog-title">
-            {t(risky ? "market.confirm.title" : "market.install.title", {
-              plugin: plugin.name,
-            })}
+            {t("market.install.title", { plugin: plugin.name })}
           </h2>
         </header>
         <p className="market-dialog-copy">
-          {t(risky ? "market.confirm.detail" : "market.install.detail")}
+          {t("market.install.detail")}
         </p>
         <p className="market-dialog-copy">
           {t(
@@ -105,11 +112,10 @@ export function ConfirmInstallDialog({
           <button
             className="primary-button danger-button"
             type="button"
-            onClick={onConfirm}
+            disabled={disabled || submitting}
+            onClick={confirmOnce}
           >
-            {t(
-              risky ? "market.confirm.installAnyway" : "market.install.confirm",
-            )}
+            {t("market.install.confirm")}
           </button>
         </footer>
       </div>

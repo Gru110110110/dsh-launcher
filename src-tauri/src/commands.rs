@@ -25,17 +25,17 @@ pub fn launcher_retry(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
 #[tauri::command]
 pub async fn launcher_stop(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.stop_service())
-        .await
-        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.stop_service()).await,
+    )
 }
 
 #[tauri::command]
 pub async fn launcher_restart(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.restart_service())
-        .await
-        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.restart_service()).await,
+    )
 }
 
 #[tauri::command]
@@ -154,9 +154,9 @@ pub async fn market_refresh_catalog(
     state: State<'_, Arc<AppState>>,
 ) -> Result<MarketCatalogState, AppError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.marketplace.refresh())
-        .await
-        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.marketplace.refresh()).await,
+    )
 }
 
 #[tauri::command]
@@ -164,9 +164,9 @@ pub async fn market_refresh_if_stale(
     state: State<'_, Arc<AppState>>,
 ) -> Result<MarketCatalogState, AppError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.marketplace.refresh_if_stale())
-        .await
-        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.marketplace.refresh_if_stale()).await,
+    )
 }
 
 #[tauri::command]
@@ -175,9 +175,9 @@ pub async fn market_query(
     state: State<'_, Arc<AppState>>,
 ) -> Result<MarketPage, AppError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.marketplace.query(&query))
-        .await
-        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.marketplace.query(&query)).await,
+    )
 }
 
 #[tauri::command]
@@ -185,9 +185,9 @@ pub async fn market_installed(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<InstalledPlugin>, AppError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.marketplace.installed())
-        .await
-        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.marketplace.installed()).await,
+    )
 }
 
 #[tauri::command]
@@ -196,9 +196,10 @@ pub async fn market_compatibility(
     state: State<'_, Arc<AppState>>,
 ) -> Result<CompatibilityInfo, AppError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.marketplace.compatibility(&plugin_id))
-        .await
-        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.marketplace.compatibility(&plugin_id))
+            .await,
+    )
 }
 
 #[tauri::command]
@@ -207,9 +208,9 @@ pub async fn market_inspect(
     state: State<'_, Arc<AppState>>,
 ) -> Result<PluginSummary, AppError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.marketplace.inspect(&plugin_id))
-        .await
-        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.marketplace.inspect(&plugin_id)).await,
+    )
 }
 
 #[tauri::command]
@@ -221,13 +222,14 @@ pub async fn market_install(
 ) -> Result<MarketOperationResult, AppError> {
     let running = service_running(state.inner());
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        state
-            .marketplace
-            .install(&plugin_id, force, expected_version.as_deref(), running)
-    })
-    .await
-    .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || {
+            state
+                .marketplace
+                .install(&plugin_id, force, expected_version.as_deref(), running)
+        })
+        .await,
+    )
 }
 
 #[tauri::command]
@@ -238,13 +240,14 @@ pub async fn market_uninstall(
 ) -> Result<MarketOperationResult, AppError> {
     let running = service_running(state.inner());
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        state
-            .marketplace
-            .uninstall(&plugin_id, target.as_ref(), running)
-    })
-    .await
-    .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || {
+            state
+                .marketplace
+                .uninstall(&plugin_id, target.as_ref(), running)
+        })
+        .await,
+    )
 }
 
 #[tauri::command]
@@ -255,8 +258,26 @@ pub fn market_pending_verification(
 }
 
 #[tauri::command]
-pub fn market_clear_pending_verification(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
-    state.inner().marketplace.clear_pending_verification()
+pub fn market_operation_busy(state: State<'_, Arc<AppState>>) -> bool {
+    state.inner().marketplace.operation_busy()
+}
+
+#[tauri::command]
+pub async fn market_rollback_pending(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.marketplace.rollback_pending()).await,
+    )
+}
+
+/// Flatten the task transport result without changing an application error.
+/// Only a failed/panicked blocking task is adapted to `serviceControlFailed`;
+/// `Ok(Err(AppError))` keeps its original localizable code and values.
+fn flatten_blocking_result<T, E>(result: Result<Result<T, AppError>, E>) -> Result<T, AppError>
+where
+    E: std::fmt::Display,
+{
+    result.map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
 }
 
 #[tauri::command]
@@ -291,4 +312,29 @@ fn valid_github_repo_id(id: &str) -> bool {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
     valid_part(owner) && valid_part(repo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flatten_blocking_result;
+    use dsh_core::AppError;
+
+    #[test]
+    fn blocking_adapter_preserves_inner_application_error_codes() {
+        let inner = AppError::new("marketProfileInvalid")
+            .value("plugin", "example")
+            .detail("candidate rejected");
+        let result: Result<Result<(), AppError>, &str> = Ok(Err(inner.clone()));
+
+        assert_eq!(flatten_blocking_result(result), Err(inner));
+    }
+
+    #[test]
+    fn blocking_adapter_wraps_only_task_transport_failures() {
+        let result: Result<Result<(), AppError>, &str> = Err("worker panicked");
+        let error = flatten_blocking_result(result).expect_err("transport failure");
+
+        assert_eq!(error.code, "serviceControlFailed");
+        assert_eq!(error.safe_detail.as_deref(), Some("worker panicked"));
+    }
 }

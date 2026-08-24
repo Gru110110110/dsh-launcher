@@ -1,11 +1,23 @@
 import type {
   CompatibilityStatus,
   LauncherPhase,
+  MarketCatalogState,
   MarketSort,
+  PendingVerification,
   PluginKind,
 } from "@/platform/generated/bindings";
 
 export const MARKET_PAGE_SIZE = 24;
+
+type MarketCatalogView = "loading" | "failed" | "content";
+
+export function marketCatalogView(
+  catalogKind: MarketCatalogState["kind"] | null,
+  hasData: boolean,
+): MarketCatalogView {
+  if (hasData) return "content";
+  return catalogKind === "failed" ? "failed" : "loading";
+}
 
 type PaginationItem = number | "start-ellipsis" | "end-ellipsis";
 
@@ -56,6 +68,23 @@ export function shouldClearPendingVerification(
     phase === "ready" &&
     serviceStartedAtMs !== null &&
     serviceStartedAtMs > installedAtMs
+  );
+}
+
+export function marketOperationSettled(
+  wasBusy: boolean,
+  isBusy: boolean,
+): boolean {
+  return wasBusy && !isBusy;
+}
+
+/// Display label for one pending batch entry. Entries whose identity was lost
+/// with a damaged journal fall back to the profile name; entries written
+/// after the recovery keep their plugin name, so a mixed batch labels each
+/// entry with the best identity it actually has.
+export function pendingChangeLabels(pending: PendingVerification): string[] {
+  return pending.changes.map((change) =>
+    change.pluginId === "" ? (change.profile ?? change.name) : change.name,
   );
 }
 
@@ -125,26 +154,7 @@ export function installedFilterValue(filter: InstalledFilter): boolean | null {
   return filter === "installed";
 }
 
-export function isMarketConflictError(
-  error: unknown,
-): error is { code: string } {
-  if (typeof error !== "object" || error === null) return false;
-  const code = (error as { code?: unknown }).code;
-  return (
-    code === "marketIncompatible" ||
-    code === "marketCompatUnknown" ||
-    code === "marketSourceMismatch" ||
-    code === "marketSourceUnknown"
-  );
-}
-
 export function isMarketCatalogUnavailable(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   return (error as { code?: unknown }).code === "marketCatalogUnavailable";
-}
-
-export function marketConflictDetail(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const detail = (error as { safeDetail?: unknown }).safeDetail;
-  return typeof detail === "string" && detail.length > 0 ? detail : undefined;
 }

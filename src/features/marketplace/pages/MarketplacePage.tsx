@@ -34,9 +34,10 @@ import {
   formatStars,
   installedFilterValue,
   isMarketCatalogUnavailable,
-  isMarketConflictError,
-  marketConflictDetail,
+  marketCatalogView,
+  marketOperationSettled,
   paginationItems,
+  pendingChangeLabels,
   shouldClearPendingVerification,
   type InstalledFilter,
 } from "../presentation";
@@ -48,11 +49,13 @@ const SEARCH_DEBOUNCE_MS = 300;
 function PluginCard({
   plugin,
   busy,
+  disabled,
   onInstall,
   onUninstall,
 }: {
   plugin: PluginSummary;
   busy: boolean;
+  disabled: boolean;
   onInstall: (plugin: PluginSummary) => void;
   onUninstall: (plugin: PluginSummary) => void;
 }) {
@@ -132,7 +135,7 @@ function PluginCard({
             type="button"
             aria-label={t("market.card.openGithub")}
             title={t("market.card.openGithub")}
-            disabled={busy}
+            disabled={disabled}
             onClick={() => {
               void marketApi.openGithub(plugin.id).catch((error: unknown) => {
                 showTimedError(error, (key, values) => t(key, values));
@@ -145,7 +148,7 @@ function PluginCard({
             <button
               className="outline-button danger market-plugin-action-button"
               type="button"
-              disabled={busy}
+              disabled={disabled}
               onClick={() => {
                 onUninstall(plugin);
               }}
@@ -157,7 +160,7 @@ function PluginCard({
             <button
               className="primary-button market-plugin-action-button"
               type="button"
-              disabled={busy}
+              disabled={disabled}
               onClick={() => {
                 onInstall(plugin);
               }}
@@ -188,11 +191,11 @@ export function MarketplacePage() {
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
+  const [marketplaceBusy, setMarketplaceBusy] = useState(false);
   const [pending, setPending] = useState<PendingVerification | null>(null);
   const [conflict, setConflict] = useState<{
     plugin: PluginSummary;
     detail?: string;
-    force: boolean;
   } | null>(null);
   const [uninstallConfirm, setUninstallConfirm] = useState<{
     plugin: PluginSummary;
@@ -212,29 +215,32 @@ export function MarketplacePage() {
   // The data query owns the page content and the loading flag; it must win
   // immediately. The compatibility pass runs independently in the background
   // and only patches badge fields when it settles.
-  const runQuery = (query: MarketQuery) => {
-    const token = ++dataToken.current;
-    marketApi
-      .query(query)
-      .then((result) => {
-        if (token !== dataToken.current) return;
-        setPage(result);
-        if (result.page !== query.page) {
-          setPageNumber(result.page);
-        }
-        setLoading(false);
-      })
-      .catch((error: unknown) => {
-        if (token !== dataToken.current) return;
-        setLoading(false);
-        // Before the first catalog download finishes the query is expected
-        // to fail with "not ready"; the refresh flow re-queries afterwards.
-        if (isMarketCatalogUnavailable(error)) return;
-        showTimedError(error, translate);
-      });
-  };
+  const runQuery = useCallback(
+    (query: MarketQuery) => {
+      const token = ++dataToken.current;
+      marketApi
+        .query(query)
+        .then((result) => {
+          if (token !== dataToken.current) return;
+          setPage(result);
+          if (result.page !== query.page) {
+            setPageNumber(result.page);
+          }
+          setLoading(false);
+        })
+        .catch((error: unknown) => {
+          if (token !== dataToken.current) return;
+          setLoading(false);
+          // Before the first catalog download finishes the query is expected
+          // to fail with "not ready"; the refresh flow re-queries afterwards.
+          if (isMarketCatalogUnavailable(error)) return;
+          showTimedError(error, translate);
+        });
+    },
+    [translate],
+  );
 
-  const runCompatPass = (query: MarketQuery) => {
+  const runCompatPass = useCallback((query: MarketQuery) => {
     const token = ++compatToken.current;
     marketApi
       .query({ ...query, checkCompatibility: true })
@@ -266,7 +272,7 @@ export function MarketplacePage() {
         // Badges stay "not checked"; the install flow still enforces
         // compatibility, so a silent background failure is safe.
       });
-  };
+  }, []);
 
   // Load the catalog on mount and query the first page. When a refresh is
   // already in flight (the backend reports "loading"), poll until it settles
@@ -351,9 +357,6 @@ export function MarketplacePage() {
       )
     ) {
       setPending(null);
-      void marketApi.clearPendingVerification().catch((error: unknown) => {
-        showTimedError(error, translate);
-      });
     }
   }, [snapshot.phase, snapshot.serviceStartedAtMs, pending, translate]);
 
@@ -375,16 +378,66 @@ export function MarketplacePage() {
     };
   }, [searchInput]);
 
-  const buildQuery = (pageNum: number): MarketQuery => ({
-    search: appliedSearch === "" ? null : appliedSearch,
-    kind: kind === "" ? null : kind,
-    tag: null,
-    installed: installedFilterValue(installedFilter),
-    sort,
-    page: pageNum,
-    pageSize: MARKET_PAGE_SIZE,
-    checkCompatibility: false,
-  });
+  const buildQuery = useCallback(
+    (pageNum: number): MarketQuery => ({
+      search: appliedSearch === "" ? null : appliedSearch,
+      kind: kind === "" ? null : kind,
+      tag: null,
+      installed: installedFilterValue(installedFilter),
+      sort,
+      page: pageNum,
+      pageSize: MARKET_PAGE_SIZE,
+      checkCompatibility: false,
+    }),
+    [appliedSearch, kind, installedFilter, sort],
+  );
+
+  // The backend owns the mutation gate, so route changes cannot erase its
+  // busy state. When an operation that began on another page settles, reload
+  // both the visible cards and the rollback marker instead of relying on a
+  // callback owned by an unmounted MarketplacePage instance.
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    let wasBusy = false;
+    const poll = () => {
+      if (inFlight) return;
+      inFlight = true;
+      void marketApi
+        .operationBusy()
+        .then((value) => {
+          if (cancelled) return;
+          setMarketplaceBusy(value);
+          if (marketOperationSettled(wasBusy, value)) {
+            const query = buildQuery(pageNumber);
+            runQuery(query);
+            runCompatPass(query);
+            void marketApi
+              .pendingVerification()
+              .then((marker) => {
+                if (!cancelled) setPending(marker);
+              })
+              .catch((error: unknown) => {
+                if (!cancelled) showTimedError(error, translate);
+              });
+          }
+          wasBusy = value;
+        })
+        .catch(() => {
+          // The backend gate remains authoritative. Keep the last observed
+          // state and retry on the next poll without adding a repetitive toast.
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    poll();
+    const timer = window.setInterval(poll, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [pageNumber, buildQuery, runQuery, runCompatPass, translate]);
 
   useEffect(() => {
     setLoading(true);
@@ -393,8 +446,16 @@ export function MarketplacePage() {
     // A background pass fills the compatibility badges for this page only;
     // results are cached Rust-side so later pages resolve instantly.
     runCompatPass(query);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appliedSearch, kind, installedFilter, sort, pageNumber]);
+  }, [
+    appliedSearch,
+    kind,
+    installedFilter,
+    sort,
+    pageNumber,
+    buildQuery,
+    runQuery,
+    runCompatPass,
+  ]);
 
   // Silent TTL refresh: downloads only when the cached catalog is older than
   // 24h (or missing), never blocks browsing, and stays quiet on failure.
@@ -465,20 +526,12 @@ export function MarketplacePage() {
       });
   }
 
-  function confirmConflictInstall(plugin: PluginSummary, error: unknown) {
-    setConflict({
-      plugin,
-      detail: marketConflictDetail(error),
-      force: true,
-    });
-  }
-
   function prepareInstall(plugin: PluginSummary) {
     setBusyPlugin(plugin.id);
     marketApi
       .inspect(plugin.id)
       .then((inspected) => {
-        setConflict({ plugin: inspected, force: false });
+        setConflict({ plugin: inspected });
       })
       .catch((error: unknown) => {
         showTimedError(error, translate);
@@ -488,27 +541,24 @@ export function MarketplacePage() {
       });
   }
 
-  function install(plugin: PluginSummary, force = false) {
+  function install(plugin: PluginSummary) {
     setBusyPlugin(plugin.id);
     marketApi
-      .install(plugin.id, force, plugin.installVersion)
+      .install(plugin.id, false, plugin.installVersion)
       .then((result) => {
         if (!result.ok) {
-          if (result.error !== null && isMarketConflictError(result.error)) {
-            confirmConflictInstall(plugin, result.error);
-            return;
-          }
           showTimedError(result.error, translate);
           return;
         }
         if (result.restartRequired) {
           // Keep the verification marker visible in-session: if the harness
           // fails after the restart, the pending banner must appear.
-          setPending({
-            pluginId: plugin.id,
-            name: plugin.name,
-            installedAtMs: Date.now(),
-          });
+          void marketApi
+            .pendingVerification()
+            .then(setPending)
+            .catch((error: unknown) => {
+              showTimedError(error, translate);
+            });
           toast.success(
             t("market.toast.installedRestartRequired", {
               plugin: plugin.name,
@@ -535,21 +585,12 @@ export function MarketplacePage() {
             ),
             { id: `market-installed-${plugin.id}` },
           );
-          // No restart needed: drop any stale on-disk marker immediately so
-          // it cannot resurface as a bogus banner on the next launch.
-          void marketApi.clearPendingVerification().catch(() => {});
         }
         // Re-query to refresh installed badges.
         const query = buildQuery(pageNumber);
         runQuery(query);
       })
       .catch((error: unknown) => {
-        // Compatibility gates reject through the IPC error path, not as a
-        // result payload: surface the same confirm dialog here.
-        if (isMarketConflictError(error)) {
-          confirmConflictInstall(plugin, error);
-          return;
-        }
         showTimedError(error, translate);
       })
       .finally(() => {
@@ -569,13 +610,13 @@ export function MarketplacePage() {
         toast.success(t("market.toast.uninstalled"), {
           id: `market-uninstalled-${pluginId}`,
         });
-        // Removing the plugin under verification clears its marker, so the
-        // banner disappears and cannot resurface on the next launch.
-        if (pending !== null && pending.pluginId === pluginId) {
-          setPending(null);
-          void marketApi.clearPendingVerification().catch(() => {});
-        }
         if (result.restartRequired) {
+          void marketApi
+            .pendingVerification()
+            .then(setPending)
+            .catch((error: unknown) => {
+              showTimedError(error, translate);
+            });
           toast(t("market.restartRequired.detail"), {
             id: `market-restart-${pluginId}`,
             duration: 12_000,
@@ -603,7 +644,8 @@ export function MarketplacePage() {
   const items = page?.items ?? [];
   const totalPages = page?.totalPages ?? 1;
   const catalogReady = catalog?.kind === "ready";
-  const catalogFailed = catalog?.kind === "failed";
+  const hasData = page !== null;
+  const catalogView = marketCatalogView(catalog?.kind ?? null, hasData);
   const visiblePages = paginationItems(pageNumber, totalPages);
 
   function goToPage(target: number) {
@@ -624,7 +666,10 @@ export function MarketplacePage() {
   }
 
   return (
-    <section className="content-page market-page">
+    <section
+      className="content-page market-page"
+      aria-busy={marketplaceBusy || busyPlugin !== null}
+    >
       <header className="page-header">
         <h1>{t("market.title")}</h1>
         <p>{t("market.subtitle")}</p>
@@ -634,18 +679,36 @@ export function MarketplacePage() {
         <div className="market-pending panel" role="alert">
           <TriangleAlert size={16} aria-hidden />
           <span>
-            {t("market.pending.detail", {
-              plugin: pending.name,
-            })}
+            {t(
+              pending.journalRecovered
+                ? "market.pending.recoveredDetail"
+                : "market.pending.detail",
+              {
+                plugin: pendingChangeLabels(pending).join(", "),
+              },
+            )}
           </span>
           <button
             className="outline-button danger"
             type="button"
+            disabled={busyPlugin !== null || marketplaceBusy}
             onClick={() => {
-              uninstallPlugin(pending.pluginId, null);
+              setBusyPlugin(pending.pluginId);
+              void marketApi
+                .rollbackPending()
+                .then(() => {
+                  setPending(null);
+                  return launcherApi.retry();
+                })
+                .catch((error: unknown) => {
+                  showTimedError(error, translate);
+                })
+                .finally(() => {
+                  setBusyPlugin(null);
+                });
             }}
           >
-            {t("market.pending.uninstall")}
+            {t("market.pending.rollback")}
           </button>
         </div>
       )}
@@ -719,7 +782,7 @@ export function MarketplacePage() {
         </button>
       </div>
 
-      {catalog !== null && catalog.kind === "ready" && (
+      {catalog !== null && catalog.kind === "ready" && hasData && (
         <p className="market-catalog-line">
           {t("market.catalog.ready", {
             count: catalog.pluginCount,
@@ -730,14 +793,14 @@ export function MarketplacePage() {
         </p>
       )}
 
-      {catalog !== null && catalog.kind === "loading" && (
+      {catalogView === "loading" && (
         <div className="market-empty panel" aria-live="polite">
           <LoaderCircle size={18} className="spin" aria-hidden />
-          <p>{t("market.catalog.downloading")}</p>
+          <p>{t("market.catalog.loading")}</p>
         </div>
       )}
 
-      {catalogFailed && (
+      {catalogView === "failed" && (
         <div className="market-empty panel">
           <p>{t("market.catalog.failed")}</p>
           <button
@@ -751,41 +814,37 @@ export function MarketplacePage() {
         </div>
       )}
 
-      {catalogReady && !loading && items.length === 0 && (
+      {catalogView === "content" && !loading && items.length === 0 && (
         <div className="market-empty panel">
           <p>{t("market.empty")}</p>
         </div>
       )}
 
-      {loading && items.length === 0 && (
-        <div className="market-empty panel">
-          <LoaderCircle size={18} className="spin" aria-hidden />
-          <p>{t("market.catalog.loading")}</p>
+      {catalogView === "content" && (
+        <div className={`market-grid${loading ? " market-grid-loading" : ""}`}>
+          {items.map((plugin) => (
+            <PluginCard
+              plugin={plugin}
+              key={plugin.id}
+              busy={busyPlugin === plugin.id}
+              disabled={busyPlugin !== null || marketplaceBusy}
+              onInstall={(target) => {
+                prepareInstall(target);
+              }}
+              onUninstall={(target) => {
+                if (target.installed !== null) {
+                  setUninstallConfirm({
+                    plugin: target,
+                    target: target.installed,
+                  });
+                }
+              }}
+            />
+          ))}
         </div>
       )}
 
-      <div className={`market-grid${loading ? " market-grid-loading" : ""}`}>
-        {items.map((plugin) => (
-          <PluginCard
-            plugin={plugin}
-            key={plugin.id}
-            busy={busyPlugin === plugin.id}
-            onInstall={(target) => {
-              prepareInstall(target);
-            }}
-            onUninstall={(target) => {
-              if (target.installed !== null) {
-                setUninstallConfirm({
-                  plugin: target,
-                  target: target.installed,
-                });
-              }
-            }}
-          />
-        ))}
-      </div>
-
-      {catalogReady && totalPages > 1 && (
+      {catalogReady && hasData && totalPages > 1 && (
         <nav className="market-pagination" aria-label={t("market.pagination")}>
           <button
             className="market-pagination-nav outline-button"
@@ -870,14 +929,14 @@ export function MarketplacePage() {
         <ConfirmInstallDialog
           plugin={conflict.plugin}
           detail={conflict.detail}
-          risky={conflict.force}
+          disabled={marketplaceBusy || busyPlugin !== null}
           onCancel={() => {
             setConflict(null);
           }}
           onConfirm={() => {
             const plugin = conflict.plugin;
             setConflict(null);
-            install(plugin, conflict.force);
+            install(plugin);
           }}
         />
       )}
@@ -885,6 +944,7 @@ export function MarketplacePage() {
         <ConfirmUninstallDialog
           plugin={uninstallConfirm.plugin}
           target={uninstallConfirm.target}
+          disabled={marketplaceBusy || busyPlugin !== null}
           onCancel={() => {
             setUninstallConfirm(null);
           }}

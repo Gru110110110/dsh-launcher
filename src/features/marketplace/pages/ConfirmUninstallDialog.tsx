@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useLauncherSnapshot } from "@/platform/launcherStore";
@@ -10,17 +10,27 @@ import type {
 export function ConfirmUninstallDialog({
   plugin,
   target,
+  disabled = false,
   onCancel,
   onConfirm,
 }: {
   plugin: PluginSummary;
   target: InstalledPlugin;
+  disabled?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
   const snapshot = useLauncherSnapshot();
   const { t } = useTranslation(undefined, { lng: snapshot.language });
   const cancelButton = useRef<HTMLButtonElement>(null);
+  const submitted = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const confirmOnce = () => {
+    if (disabled || submitted.current) return;
+    submitted.current = true;
+    setSubmitting(true);
+    onConfirm();
+  };
   const location =
     target.source === "profile"
       ? t("market.uninstall.locationProfile", {
@@ -64,6 +74,9 @@ export function ConfirmUninstallDialog({
         </header>
         <p className="market-dialog-copy">{t("market.uninstall.detail")}</p>
         <p className="market-dialog-detail">{location}</p>
+        <p className="market-dialog-detail">
+          {t("market.uninstall.target", { target: target.localName })}
+        </p>
         <footer className="market-dialog-actions">
           <button
             ref={cancelButton}
@@ -76,7 +89,8 @@ export function ConfirmUninstallDialog({
           <button
             className="primary-button danger-button"
             type="button"
-            onClick={onConfirm}
+            disabled={disabled || submitting}
+            onClick={confirmOnce}
           >
             {t("market.card.uninstall")}
           </button>

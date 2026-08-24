@@ -5,11 +5,29 @@ import {
   formatStars,
   installedFilterValue,
   isMarketCatalogUnavailable,
-  isMarketConflictError,
-  marketConflictDetail,
+  marketCatalogView,
+  marketOperationSettled,
   paginationItems,
+  pendingChangeLabels,
   shouldClearPendingVerification,
 } from "./presentation";
+
+describe("marketCatalogView", () => {
+  it("shows the initial loading layout until the first page is available", () => {
+    expect(marketCatalogView(null, false)).toBe("loading");
+    expect(marketCatalogView("loading", false)).toBe("loading");
+    expect(marketCatalogView("ready", false)).toBe("loading");
+  });
+
+  it("shows the failure layout only when there is no cached page", () => {
+    expect(marketCatalogView("failed", false)).toBe("failed");
+    expect(marketCatalogView("failed", true)).toBe("content");
+  });
+
+  it("keeps cached content visible while a refresh is loading", () => {
+    expect(marketCatalogView("loading", true)).toBe("content");
+  });
+});
 
 describe("compatibilityPresentation", () => {
   it("maps every status to a label and tone", () => {
@@ -43,6 +61,61 @@ describe("shouldClearPendingVerification", () => {
   });
 });
 
+describe("marketOperationSettled", () => {
+  it("refreshes only on a busy-to-idle transition", () => {
+    expect(marketOperationSettled(false, false)).toBe(false);
+    expect(marketOperationSettled(false, true)).toBe(false);
+    expect(marketOperationSettled(true, true)).toBe(false);
+    expect(marketOperationSettled(true, false)).toBe(true);
+  });
+});
+
+describe("pendingChangeLabels", () => {
+  const pending = (
+    changes: Array<{
+      pluginId: string;
+      name: string;
+      profile: string | null;
+    }>,
+  ) => ({
+    pluginId: changes[changes.length - 1]?.pluginId ?? "",
+    name: changes[changes.length - 1]?.name ?? "",
+    installedAtMs: 1,
+    changes: changes.map((change) => ({
+      ...change,
+      action: "install" as const,
+    })),
+    journalRecovered: false,
+  });
+
+  it("uses the plugin name when the identity is known", () => {
+    expect(
+      pendingChangeLabels(
+        pending([{ pluginId: "x/alpha", name: "alpha", profile: "web" }]),
+      ),
+    ).toEqual(["alpha"]);
+  });
+
+  it("falls back to the profile name for recovered entries", () => {
+    expect(
+      pendingChangeLabels(
+        pending([{ pluginId: "", name: "web", profile: "web" }]),
+      ),
+    ).toEqual(["web"]);
+  });
+
+  it("labels recovered and newly added entries independently", () => {
+    expect(
+      pendingChangeLabels(
+        pending([
+          { pluginId: "", name: "web", profile: "web" },
+          { pluginId: "x/beta", name: "beta", profile: "web" },
+        ]),
+      ),
+    ).toEqual(["web", "beta"]);
+  });
+});
+
 describe("formatters", () => {
   it("formats stars compactly", () => {
     expect(formatStars(42)).toBe("42");
@@ -54,34 +127,6 @@ describe("formatters", () => {
   it("formats scores", () => {
     expect(formatScore(null)).toBe("–");
     expect(formatScore(87.4)).toBe("87");
-  });
-});
-
-describe("isMarketConflictError", () => {
-  it("recognizes the codes that require user confirmation", () => {
-    expect(isMarketConflictError({ code: "marketIncompatible" })).toBe(true);
-    expect(isMarketConflictError({ code: "marketCompatUnknown" })).toBe(true);
-    expect(isMarketConflictError({ code: "marketSourceMismatch" })).toBe(true);
-    expect(isMarketConflictError({ code: "marketSourceUnknown" })).toBe(true);
-    expect(isMarketConflictError({ code: "marketInstallFailed" })).toBe(false);
-    expect(isMarketConflictError("boom")).toBe(false);
-    expect(isMarketConflictError(null)).toBe(false);
-  });
-});
-
-describe("marketConflictDetail", () => {
-  it("extracts the safe detail string when present", () => {
-    expect(
-      marketConflictDetail({
-        code: "marketIncompatible",
-        safeDetail: "requires cordis ^4.0.0, installed 4.0.1",
-      }),
-    ).toBe("requires cordis ^4.0.0, installed 4.0.1");
-    expect(marketConflictDetail({ code: "marketCompatUnknown" })).toBe(
-      undefined,
-    );
-    expect(marketConflictDetail({ safeDetail: 42 })).toBe(undefined);
-    expect(marketConflictDetail(null)).toBe(undefined);
   });
 });
 

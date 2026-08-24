@@ -36,7 +36,8 @@ export const marketApi = {
     command<MarketOperationResult>("market_uninstall", { pluginId, target }),
   pendingVerification: () =>
     command<PendingVerification | null>("market_pending_verification"),
-  clearPendingVerification: () => action("market_clear_pending_verification"),
+  operationBusy: () => command<boolean>("market_operation_busy"),
+  rollbackPending: () => action("market_rollback_pending"),
   openGithub: (pluginId: string) =>
     action("market_open_plugin_github", { pluginId }),
 };
@@ -258,6 +259,7 @@ if (!isTauri) {
       600,
     );
   marketApi.pendingVerification = () => delay<PendingVerification | null>(null);
-  marketApi.clearPendingVerification = () => Promise.resolve();
+  marketApi.operationBusy = () => Promise.resolve(false);
+  marketApi.rollbackPending = () => Promise.resolve();
   marketApi.openGithub = () => Promise.resolve();
 }

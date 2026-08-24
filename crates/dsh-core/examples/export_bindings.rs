@@ -7,7 +7,8 @@ use dsh_core::{
     marketplace::{
         CompatibilityInfo, CompatibilityStatus, InstalledPlugin, MarketCatalogState,
         MarketOperationKind, MarketOperationResult, MarketPage, MarketQuery, MarketSort,
-        PendingVerification, PluginKind, PluginSource, PluginSummary, SourceBindingStatus,
+        PendingMarketChange, PendingVerification, PluginKind, PluginSource, PluginSummary,
+        SourceBindingStatus,
     },
 };
 use ts_rs::TS;
@@ -46,6 +47,7 @@ fn main() {
         MarketCatalogState::decl(),
         MarketOperationKind::decl(),
         MarketOperationResult::decl(),
+        PendingMarketChange::decl(),
         PendingVerification::decl(),
     ];
     let mut output =

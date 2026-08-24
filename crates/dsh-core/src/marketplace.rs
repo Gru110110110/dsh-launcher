@@ -8,13 +8,13 @@
 //! homes.
 //!
 //! Stability posture (the Harness CLI changes fast):
-//! - Plugin management runs through the Harness CLI that the launcher itself
-//!   pinned and installed (`paths.dsh_bin`), never a user-installed `dsh`.
-//! - The CLI is probed before use; when its `plugin` subcommand is missing we
-//!   fall back to running the pinned `pnpm` directly in the profile directory
-//!   and reconciling `dsh.profile.bundles` ourselves.
-//! - Every mutating operation snapshots the profile manifest first and
-//!   restores it when the command fails.
+//! - The launcher validates its pinned Harness runtime, then runs its own
+//!   pinned pnpm against a staged copy of the selected profile. It never uses
+//!   a user-installed `dsh` or pnpm.
+//! - Bundle reconciliation mirrors the published Harness profile contract,
+//!   while candidate validation preserves installation-owned layers.
+//! - Every mutation is published with directory renames and retained as one
+//!   rollback batch until a subsequent Harness start verifies it.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -55,7 +55,6 @@ const MARKET_CATALOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const CATALOG_MAX_BYTES: usize = 96 * 1024 * 1024;
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(10);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const OUTPUT_CAP: usize = 256 * 1024;
 const TARBALL_MAX_BYTES: usize = 128 * 1024 * 1024;
 const TARBALL_MAX_FILES: usize = 50_000;
@@ -68,6 +67,7 @@ const COMPAT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const COMPAT_UNKNOWN_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// Uninstalled skills stay recoverable in the trash for 30 days.
 const TRASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const CORRUPT_PENDING_RETENTION: usize = 5;
 /// How long to wait for the output reader after the child has exited; a
 /// backgrounded grandchild that keeps the pipes open can delay EOF
 /// indefinitely, so this bounds the wait and returns whatever arrived.
@@ -353,11 +353,30 @@ pub struct MarketOperationResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingMarketChange {
+    pub plugin_id: String,
+    pub name: String,
+    pub action: MarketOperationKind,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingVerification {
+    /// The most recent change is retained in the legacy fields so pending
+    /// markers written by older launchers remain readable after an update.
     pub plugin_id: String,
     pub name: String,
     #[ts(type = "number")]
     pub installed_at_ms: u64,
+    #[serde(default)]
+    pub changes: Vec<PendingMarketChange>,
+    /// The original journal was unreadable and was quarantined. The profile
+    /// names in `changes` remain sufficient for a safe rollback, but the
+    /// individual plugin identities are no longer trustworthy.
+    #[serde(default)]
+    pub journal_recovered: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,9 +389,21 @@ pub struct Marketplace {
     compat_cache: Mutex<HashMap<String, CachedCompatibility>>,
     pnpm_bin: Mutex<Option<PathBuf>>,
     installed_cache: Mutex<Option<InstalledCache>>,
-    operation_busy: Mutex<()>,
+    operation_busy: Arc<AtomicBool>,
+    recovery_done: Mutex<bool>,
     loading: AtomicBool,
     last_error: Mutex<Option<String>>,
+}
+
+#[derive(Debug)]
+pub struct MarketOperationGuard {
+    busy: Arc<AtomicBool>,
+}
+
+impl Drop for MarketOperationGuard {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,7 +459,8 @@ impl Marketplace {
             compat_cache: Mutex::new(HashMap::new()),
             pnpm_bin: Mutex::new(None),
             installed_cache: Mutex::new(None),
-            operation_busy: Mutex::new(()),
+            operation_busy: Arc::new(AtomicBool::new(false)),
+            recovery_done: Mutex::new(false),
             loading: AtomicBool::new(false),
             last_error: Mutex::new(None),
         }
@@ -436,6 +468,17 @@ impl Marketplace {
 
     /// Best-effort warm start from the on-disk cache.
     pub fn initialize(&self) {
+        {
+            let mut recovered = self.recovery_done.lock().expect("recovery poisoned");
+            if !*recovered {
+                match self.recover_marketplace_state() {
+                    Ok(()) => *recovered = true,
+                    Err(error) => {
+                        log::warn!("marketplace transaction recovery failed: {error}");
+                    }
+                }
+            }
+        }
         if self.catalog.lock().expect("catalog poisoned").is_none()
             && let Ok(catalog) = self.load_cached_catalog()
         {
@@ -449,6 +492,22 @@ impl Marketplace {
         {
             *compat = entries;
         }
+    }
+
+    /// Acquire the single mutation/restart gate without queueing. Rejecting a
+    /// second request is intentional: a hidden queue lets a stale UI submit
+    /// operations against a profile state that no longer exists.
+    pub fn begin_operation(&self) -> AppResult<MarketOperationGuard> {
+        self.operation_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AppError::new("marketOperationBusy"))?;
+        Ok(MarketOperationGuard {
+            busy: Arc::clone(&self.operation_busy),
+        })
+    }
+
+    pub fn operation_busy(&self) -> bool {
+        self.operation_busy.load(Ordering::Acquire)
     }
 
     pub fn catalog_state(&self) -> MarketCatalogState {
@@ -673,12 +732,12 @@ impl Marketplace {
     pub fn install(
         &self,
         plugin_id: &str,
-        force: bool,
+        _force: bool,
         expected_version: Option<&str>,
         service_running: bool,
     ) -> AppResult<MarketOperationResult> {
         self.initialize();
-        let _guard = self.operation_busy.lock().expect("operation poisoned");
+        let _guard = self.begin_operation()?;
         let catalog = self
             .catalog
             .lock()
@@ -694,7 +753,7 @@ impl Marketplace {
         let kind = PluginKind::parse(&plugin.kind);
         match kind {
             PluginKind::CordisPlugin => {
-                self.install_cordis(&plugin, force, expected_version, service_running)
+                self.install_cordis(&plugin, _force, expected_version, service_running)
             }
             PluginKind::Skill => self.install_skill(&plugin, expected_version),
         }
@@ -707,7 +766,7 @@ impl Marketplace {
         service_running: bool,
     ) -> AppResult<MarketOperationResult> {
         self.initialize();
-        let _guard = self.operation_busy.lock().expect("operation poisoned");
+        let _guard = self.begin_operation()?;
         let catalog = self
             .catalog
             .lock()
@@ -715,7 +774,7 @@ impl Marketplace {
             .clone()
             .ok_or_else(|| AppError::new("marketCatalogUnavailable"))?;
         let installed = self.scan_installed(Some(&catalog));
-        let mut matched: Vec<InstalledPlugin> = installed
+        let matched: Vec<InstalledPlugin> = installed
             .into_iter()
             .filter(|entry| {
                 entry.plugin_id.as_deref() == Some(plugin_id)
@@ -725,28 +784,13 @@ impl Marketplace {
         if matched.is_empty() {
             return Err(AppError::new("marketNotInstalled").value("plugin", plugin_id));
         }
-        let selected = if let Some(target) = target {
-            matched
-                .into_iter()
-                .find(|entry| same_install_location(entry, target))
-                .ok_or_else(|| AppError::new("marketNotInstalled").value("plugin", plugin_id))?
-        } else {
-            // Recovery from a pending-start failure has no card payload. The
-            // marketplace installs Cordis plugins into `web`, so prefer that
-            // exact location and still remove only one copy.
-            matched.sort_by_key(|entry| {
-                if entry.source == PluginSource::Profile
-                    && entry.profile.as_deref() == Some(DEFAULT_PROFILE)
-                {
-                    0
-                } else {
-                    1
-                }
-            });
-            matched.remove(0)
-        };
+        let target = target.ok_or_else(|| AppError::new("marketUninstallTargetRequired"))?;
+        let selected = matched
+            .into_iter()
+            .find(|entry| same_install_location(entry, target))
+            .ok_or_else(|| AppError::new("marketNotInstalled").value("plugin", plugin_id))?;
         self.purge_old_trash();
-        let removed_profile = match selected.source {
+        let changed_profile = match selected.source {
             PluginSource::Skills => {
                 let source_dir = self.skills_dir().join(&selected.local_name);
                 if !source_dir.exists() {
@@ -761,15 +805,20 @@ impl Marketplace {
                 if let Ok(file) = fs::File::open(&backup) {
                     let _ = file.set_modified(std::time::SystemTime::now());
                 }
-                false
+                None
             }
             PluginSource::Profile => {
                 let profile = selected
                     .profile
                     .clone()
                     .unwrap_or_else(|| DEFAULT_PROFILE.into());
-                self.remove_profile_package(&profile, &selected.local_name)?;
-                true
+                self.remove_profile_package(
+                    &profile,
+                    &selected.local_name,
+                    plugin_id,
+                    &selected.local_name,
+                )?;
+                Some(profile)
             }
         };
         self.invalidate_installed_cache();
@@ -777,7 +826,7 @@ impl Marketplace {
             ok: true,
             action: MarketOperationKind::Uninstall,
             plugin_id: plugin_id.into(),
-            restart_required: service_running && removed_profile,
+            restart_required: service_running && changed_profile.is_some(),
             error: None,
         })
     }
@@ -788,15 +837,105 @@ impl Marketplace {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        Ok(Some(serde_json::from_slice(&bytes)?))
+        let mut pending: PendingVerification = serde_json::from_slice(&bytes)?;
+        if pending.changes.is_empty() && !pending.journal_recovered {
+            pending.changes.push(PendingMarketChange {
+                plugin_id: pending.plugin_id.clone(),
+                name: pending.name.clone(),
+                action: MarketOperationKind::Install,
+                profile: Some(DEFAULT_PROFILE.into()),
+            });
+        }
+        Ok(Some(pending))
+    }
+
+    pub fn has_pending_rollback(&self) -> bool {
+        self.pending_file().exists()
+    }
+
+    pub fn pending_change_summary(&self) -> String {
+        let Ok(Some(pending)) = self.pending_verification() else {
+            return String::new();
+        };
+        let mut names = pending
+            .changes
+            .iter()
+            .map(|change| {
+                if change.plugin_id.is_empty() {
+                    change.profile.as_deref().unwrap_or(&change.name)
+                } else {
+                    change.name.as_str()
+                }
+            })
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        names.join(", ")
     }
 
     pub fn clear_pending_verification(&self) -> AppResult<()> {
-        match fs::remove_file(self.pending_file()) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        let _guard = self.begin_operation()?;
+        self.clear_pending_verification_while_guarded()
+    }
+
+    pub fn clear_pending_verification_while_guarded(&self) -> AppResult<()> {
+        let pending = self.pending_file();
+        if !pending.exists() {
+            return self.finish_verified_cleanups();
         }
+        fs::create_dir_all(self.catalog_dir())
+            .map_err(|error| AppError::io("createDirectory", &error))?;
+        let verified = self
+            .catalog_dir()
+            .join(format!("pending.verified-{}.json", process_timestamp()));
+        fs::rename(&pending, &verified)
+            .map_err(|error| AppError::io("marketRollbackFailed", &error))?;
+        // The atomic rename above commits the batch. From this point onward a
+        // stale last-good directory is cleanup state, never rollback state.
+        self.discard_last_good_profiles()?;
+        remove_file_if_exists(&verified)
+    }
+
+    /// Restore every profile changed since the last successful Harness start.
+    /// The rejected profile is retained for diagnosis instead of being
+    /// deleted, because it may contain user-authored configuration.
+    pub fn rollback_pending(&self) -> AppResult<()> {
+        let _guard = self.begin_operation()?;
+        self.rollback_pending_while_guarded()
+    }
+
+    pub fn rollback_pending_while_guarded(&self) -> AppResult<()> {
+        let profiles = self.pending_profiles()?;
+        for profile in profiles {
+            self.rollback_profile(&profile)?;
+        }
+        remove_file_if_exists(&self.pending_file())?;
+        self.invalidate_installed_cache();
+        Ok(())
+    }
+
+    fn rollback_profile(&self, profile: &str) -> AppResult<()> {
+        let target = self.profile_dir(profile);
+        let last_good = self.last_good_profile(profile);
+        if !last_good.exists() {
+            return Ok(());
+        }
+        let rejected = self.profile_dir(&format!(
+            ".{profile}.market-rejected-{}",
+            process_timestamp()
+        ));
+        if target.exists() {
+            fs::rename(&target, &rejected)
+                .map_err(|error| AppError::io("marketRollbackFailed", &error))?;
+        }
+        if let Err(error) = fs::rename(&last_good, &target) {
+            if rejected.exists() {
+                let _ = fs::rename(&rejected, &target);
+            }
+            return Err(AppError::io("marketRollbackFailed", &error));
+        }
+        Ok(())
     }
 
     // -- internal helpers ---------------------------------------------------
@@ -819,6 +958,10 @@ impl Marketplace {
 
     fn pending_file(&self) -> PathBuf {
         self.catalog_dir().join("pending.json")
+    }
+
+    fn last_good_profile(&self, profile: &str) -> PathBuf {
+        self.profile_dir(&format!(".{profile}.market-last-good"))
     }
 
     fn trash_dir(&self) -> PathBuf {
@@ -1067,7 +1210,7 @@ impl Marketplace {
     fn install_cordis(
         &self,
         plugin: &MarketPlugin,
-        force: bool,
+        _force: bool,
         expected_version: Option<&str>,
         service_running: bool,
     ) -> AppResult<MarketOperationResult> {
@@ -1080,31 +1223,29 @@ impl Marketplace {
             expected_version,
             verified.package_version.as_deref(),
         )?;
-        if !force {
-            match verified.source_binding {
-                SourceBindingStatus::Mismatch => {
-                    return Err(AppError::new("marketSourceMismatch")
-                        .value("plugin", &plugin.name)
-                        .detail(verified.source_binding_detail.clone().unwrap_or_default()));
-                }
-                SourceBindingStatus::Unknown | SourceBindingStatus::NotChecked => {
-                    return Err(AppError::new("marketSourceUnknown")
-                        .value("plugin", &plugin.name)
-                        .detail(verified.source_binding_detail.clone().unwrap_or_default()));
-                }
-                SourceBindingStatus::Verified => {}
+        match verified.source_binding {
+            SourceBindingStatus::Mismatch => {
+                return Err(AppError::new("marketSourceMismatch")
+                    .value("plugin", &plugin.name)
+                    .detail(verified.source_binding_detail.clone().unwrap_or_default()));
             }
-            match verified.info.status {
-                CompatibilityStatus::Incompatible => {
-                    return Err(AppError::new("marketIncompatible")
-                        .value("plugin", &plugin.name)
-                        .detail(verified.info.detail.clone().unwrap_or_default()));
-                }
-                CompatibilityStatus::Unknown => {
-                    return Err(AppError::new("marketCompatUnknown").value("plugin", &plugin.name));
-                }
-                _ => {}
+            SourceBindingStatus::Unknown | SourceBindingStatus::NotChecked => {
+                return Err(AppError::new("marketSourceUnknown")
+                    .value("plugin", &plugin.name)
+                    .detail(verified.source_binding_detail.clone().unwrap_or_default()));
             }
+            SourceBindingStatus::Verified => {}
+        }
+        match verified.info.status {
+            CompatibilityStatus::Incompatible => {
+                return Err(AppError::new("marketIncompatible")
+                    .value("plugin", &plugin.name)
+                    .detail(verified.info.detail.clone().unwrap_or_default()));
+            }
+            CompatibilityStatus::Unknown | CompatibilityStatus::NotChecked => {
+                return Err(AppError::new("marketCompatUnknown").value("plugin", &plugin.name));
+            }
+            CompatibilityStatus::Compatible => {}
         }
         let pkg = install_package_name(plugin).ok_or_else(|| {
             AppError::new("marketInstallFailed")
@@ -1117,18 +1258,21 @@ impl Marketplace {
             .map(|version| format!("{pkg}@{version}"))
             .unwrap_or_else(|| pkg.clone());
         self.require_runtime()?;
-        if let Err(error) = self.mutate_profile_package(DEFAULT_PROFILE, "add", &install_spec) {
+        let pending_change = PendingMarketChange {
+            plugin_id: plugin.id.clone(),
+            name: plugin.name.clone(),
+            action: MarketOperationKind::Install,
+            profile: Some(DEFAULT_PROFILE.into()),
+        };
+        if let Err(error) =
+            self.mutate_profile_package(DEFAULT_PROFILE, "add", &install_spec, &pending_change)
+        {
             let detail = error
                 .safe_detail
                 .clone()
                 .unwrap_or_else(|| error.code.clone());
             self.log_operation("install", &install_spec, false, &detail);
-            return Err(AppError::new("marketInstallFailed")
-                .value("plugin", &plugin.name)
-                .detail(detail));
-        }
-        if service_running && let Err(error) = self.write_pending(plugin) {
-            log::warn!("could not persist marketplace verification marker: {error}");
+            return Err(error.value("plugin", &plugin.name));
         }
         self.invalidate_installed_cache();
         self.log_operation("install", &install_spec, true, "ok");
@@ -1214,15 +1358,34 @@ impl Marketplace {
         })
     }
 
-    fn remove_profile_package(&self, profile: &str, pkg: &str) -> AppResult<()> {
+    fn remove_profile_package(
+        &self,
+        profile: &str,
+        pkg: &str,
+        plugin_id: &str,
+        plugin_name: &str,
+    ) -> AppResult<()> {
         self.require_runtime()?;
-        if let Err(error) = self.mutate_profile_package(profile, "remove", pkg) {
+        let pending_change = PendingMarketChange {
+            plugin_id: plugin_id.into(),
+            name: plugin_name.into(),
+            action: MarketOperationKind::Uninstall,
+            profile: Some(profile.into()),
+        };
+        if let Err(mut error) = self.mutate_profile_package(profile, "remove", pkg, &pending_change)
+        {
             let detail = error
                 .safe_detail
                 .clone()
                 .unwrap_or_else(|| error.code.clone());
             self.log_operation("remove", pkg, false, &detail);
-            return Err(AppError::new("marketUninstallFailed").detail(detail));
+            // Preserve every actionable validation code. Only relabel the
+            // generic shared mutation failure so an uninstall I/O/pnpm error
+            // is not presented as an installation failure.
+            if error.code == "marketInstallFailed" {
+                error.code = "marketUninstallFailed".into();
+            }
+            return Err(error.value("plugin", plugin_name));
         }
         self.log_operation("remove", pkg, true, "ok");
         Ok(())
@@ -1231,12 +1394,22 @@ impl Marketplace {
     /// Prepare a complete candidate profile, mutate and validate it there,
     /// then publish it with directory renames. The active profile remains
     /// byte-for-byte untouched on command or reconciliation failure.
-    fn mutate_profile_package(&self, profile: &str, verb: &str, pkg: &str) -> AppResult<()> {
+    fn mutate_profile_package(
+        &self,
+        profile: &str,
+        verb: &str,
+        pkg: &str,
+        pending_change: &PendingMarketChange,
+    ) -> AppResult<()> {
         if !valid_profile_dir_name(profile) {
             return Err(AppError::new("marketInstallFailed").detail("invalid profile name"));
         }
+        // A previously verified batch may have left only cleanup work after
+        // an I/O failure. Finish that work before reusing last-good paths for
+        // a new transaction, or fail without touching the active profile.
+        self.finish_verified_cleanups()?;
         self.recover_profile_transaction(profile)?;
-        let pnpm_prepend = self.ensure_pnpm()?;
+        self.ensure_pnpm()?;
         let profiles_dir = self.profiles_dir();
         fs::create_dir_all(&profiles_dir)
             .map_err(|error| AppError::io("createDirectory", &error))?;
@@ -1246,45 +1419,87 @@ impl Marketplace {
         let source = self.profile_dir(profile);
         let candidate = self.profile_dir(&candidate_name);
         let backup = self.profile_dir(&backup_name);
+        let last_good = self.last_good_profile(profile);
 
-        if source.is_dir() {
-            copy_profile_candidate(&source, &candidate)?;
-        } else {
-            fs::create_dir_all(&candidate)
-                .map_err(|error| AppError::io("createDirectory", &error))?;
-            crate::paths::atomic_write(
-                &candidate.join("package.json"),
-                br#"{"private":true,"dependencies":{},"dsh":{"profile":{"bundles":[]}}}"#,
-            )?;
+        if !source.is_dir() {
+            return Err(AppError::new("marketProfileMissing").value("profile", profile));
         }
+        if self.pending_verification_for_mutation()?.is_none() && last_good.exists() {
+            fs::remove_dir_all(&last_good)
+                .map_err(|error| AppError::io("marketRollbackFailed", &error))?;
+        }
+        let baseline = read_manifest(&source.join("package.json"))?;
+        if profile == DEFAULT_PROFILE && !has_installation_owned_foundation(&baseline) {
+            return Err(AppError::new("marketProfileInvalid")
+                .detail("web profile has no installation-owned foundation bundle"));
+        }
+        let target = normalize_package_spec(pkg).ok_or_else(|| {
+            AppError::new("marketProfileInvalid")
+                .detail("operation target is not a registry package")
+        })?;
+        if verb == "remove" && !baseline.dependencies.contains_key(&target) {
+            return Err(AppError::new("marketNotDirectDependency")
+                .value("plugin", target)
+                .value("profile", profile));
+        }
+        if verb == "add" && baseline.dependencies.contains_key(&target) {
+            return Err(AppError::new("marketAlreadyInstalled").value("plugin", target));
+        }
+        let source_revision = profile_control_digest(&source)?;
+        if verb == "remove" {
+            validate_reverse_package_dependencies(&source, &baseline, pkg)?;
+        }
+        copy_profile_candidate(&source, &candidate)?;
 
-        let outcome = if self.probe_plugin_cli(&pnpm_prepend) {
-            run_dsh_plugin(&self.paths, &pnpm_prepend, &candidate_name, verb, pkg)
-        } else {
+        // Always use the pinned pnpm directly with lifecycle scripts disabled.
+        // The Harness CLI forwards to pnpm without this safety boundary.
+        let outcome =
             self.run_pnpm_fallback(&candidate_name, verb, pkg)
                 .and_then(|()| match verb {
                     "add" => self.reconcile_bundles_after_install(&candidate_name),
-                    "remove" => self.reconcile_bundles_after_remove(&candidate_name),
+                    "remove" => self.reconcile_bundles_after_remove(&candidate_name, pkg),
                     _ => Err(AppError::new("marketInstallFailed").detail("unsupported operation")),
-                })
-        };
+                });
         if let Err(error) = outcome {
             let _ = fs::remove_dir_all(&candidate);
             return Err(error);
         }
-        if let Err(error) = read_manifest(&candidate.join("package.json")) {
+        if let Err(error) = validate_candidate_profile(&baseline, &candidate, verb, pkg) {
+            let _ = fs::remove_dir_all(&candidate);
+            return Err(error);
+        }
+        if profile_control_digest(&source)? != source_revision {
+            let _ = fs::remove_dir_all(&candidate);
+            return Err(AppError::new("marketProfileChanged").value("profile", profile));
+        }
+
+        // Persist the rollback journal before the first publication rename.
+        // After a power loss, startup can therefore distinguish a candidate
+        // profile from a previously verified one and restore the batch base.
+        let previous_pending = fs::read(self.pending_file()).ok();
+        if let Err(error) = self.write_pending_change(
+            &pending_change.plugin_id,
+            &pending_change.name,
+            pending_change.action,
+            profile,
+        ) {
             let _ = fs::remove_dir_all(&candidate);
             return Err(error);
         }
 
-        if source.exists() {
-            fs::rename(&source, &backup)
-                .map_err(|error| AppError::io("marketInstallFailed", &error))?;
+        let publication_backup = if last_good.exists() {
+            &backup
+        } else {
+            &last_good
+        };
+        if let Err(error) = fs::rename(&source, publication_backup) {
+            let _ = restore_pending_snapshot(&self.pending_file(), previous_pending.as_deref());
+            let _ = fs::remove_dir_all(&candidate);
+            return Err(AppError::io("marketInstallFailed", &error));
         }
         if let Err(error) = fs::rename(&candidate, &source) {
-            if backup.exists() {
-                let _ = fs::rename(&backup, &source);
-            }
+            let _ = fs::rename(publication_backup, &source);
+            let _ = restore_pending_snapshot(&self.pending_file(), previous_pending.as_deref());
             let _ = fs::remove_dir_all(&candidate);
             return Err(AppError::io("marketInstallFailed", &error));
         }
@@ -1314,41 +1529,47 @@ impl Marketplace {
             }
         }
         backups.sort();
+        candidates.sort();
+        let target_was_missing = !target.exists();
+        let had_ephemeral_backup = !backups.is_empty();
+        let had_candidate = !candidates.is_empty();
+        let mut restored_unpublished_change = false;
         if !target.exists()
             && let Some(backup) = backups.pop()
         {
             fs::rename(backup, &target)
                 .map_err(|error| AppError::io("marketInstallFailed", &error))?;
+            restored_unpublished_change = true;
+        } else if !target.exists() && self.last_good_profile(profile).exists() {
+            fs::rename(self.last_good_profile(profile), &target)
+                .map_err(|error| AppError::io("marketInstallFailed", &error))?;
+            restored_unpublished_change = true;
         }
         for path in backups.into_iter().chain(candidates) {
             if let Err(error) = fs::remove_dir_all(&path) {
                 log::warn!("could not clean marketplace transaction directory: {error}");
             }
         }
-        Ok(())
-    }
-
-    /// Probe whether the pinned Harness CLI exposes the `plugin` subcommand.
-    /// The Harness CLI forwards to `pnpm` from PATH, so the probe runs with
-    /// the same environment the real install will use: a provisioned pnpm
-    /// must make the probe succeed instead of pushing every install into the
-    /// fallback path.
-    fn probe_plugin_cli(&self, pnpm_prepend: &[PathBuf]) -> bool {
-        let mut command = Command::new(&self.paths.node_bin);
-        command
-            .arg(&self.paths.dsh_bin)
-            .args(["plugin", "--help"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        market_command_env(&mut command, &self.paths, pnpm_prepend);
-        match run_child(command, PROBE_TIMEOUT) {
-            Ok((success, _)) => success,
-            Err(error) => {
-                log::warn!("market CLI probe failed: {error}");
-                false
+        // If the journal was durable but the candidate was not published,
+        // remove exactly that final change. Earlier changes in the same batch
+        // remain pending and must still be verified or rolled back.
+        let abandoned_before_first_rename =
+            !target_was_missing && had_candidate && !had_ephemeral_backup;
+        if restored_unpublished_change || abandoned_before_first_rename {
+            log::warn!(
+                "recovered an unpublished marketplace change for profile {profile}; removing the final change from the pending batch"
+            );
+            if let Err(error) = self.drop_last_pending_change(profile) {
+                // An unreadable journal is quarantined by the immediately
+                // following recovery stage. Keep the restored profile and its
+                // last-good baseline intact so that stage can preserve broad
+                // rollback coverage instead of failing startup recovery here.
+                log::warn!(
+                    "could not trim the unpublished marketplace journal tail for profile {profile}: {error}"
+                );
             }
         }
+        Ok(())
     }
 
     /// Make the launcher's pinned pnpm available and return the directories
@@ -1416,9 +1637,8 @@ impl Marketplace {
         fs::create_dir_all(&profile_dir)
             .map_err(|error| AppError::io("createDirectory", &error))?;
         let mut command = Command::new(&executable);
+        command.arg(verb).arg(pkg).args(pnpm_mutation_flags(verb));
         command
-            .arg(verb)
-            .arg(pkg)
             .current_dir(&profile_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1456,16 +1676,21 @@ impl Marketplace {
         Ok(())
     }
 
-    /// Reconcile `dsh.profile.bundles` after removing a dependency: entries
-    /// that are no longer installed leave the stack.
-    fn reconcile_bundles_after_remove(&self, profile: &str) -> AppResult<()> {
+    /// Reconcile `dsh.profile.bundles` after removing a dependency. Only the
+    /// package explicitly removed by this operation may leave the stack:
+    /// profile templates include installation-owned bundles such as
+    /// `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` which resolve
+    /// from the pinned Harness runtime and intentionally are not profile
+    /// dependencies. Filtering the whole stack against `dependencies` would
+    /// erase those foundation layers and make the service unbootable.
+    fn reconcile_bundles_after_remove(&self, profile: &str, removed_pkg: &str) -> AppResult<()> {
         let manifest_path = self.profile_dir(profile).join("package.json");
         let mut manifest = read_manifest(&manifest_path)?;
-        let dependencies = &manifest.dependencies;
+        if manifest.dependencies.contains_key(removed_pkg) {
+            return Ok(());
+        }
         let before = manifest.bundles.len();
-        manifest
-            .bundles
-            .retain(|bundle| dependencies.contains_key(bundle));
+        manifest.bundles.retain(|bundle| bundle != removed_pkg);
         if manifest.bundles.len() != before {
             write_manifest(&manifest_path, &manifest)?;
         }
@@ -1487,7 +1712,7 @@ impl Marketplace {
                     .by_name
                     .get(&base_name.to_lowercase())
                     .or_else(|| index.by_name.get(&local_name.to_lowercase()))
-                    .cloned();
+                    .and_then(Clone::clone);
                 found.push(InstalledPlugin {
                     plugin_id,
                     local_name,
@@ -1519,7 +1744,10 @@ impl Marketplace {
                     }
                 }
                 for dep in names {
-                    let plugin_id = index.by_package.get(&dep.to_lowercase()).cloned();
+                    let plugin_id = index
+                        .by_package
+                        .get(&dep.to_lowercase())
+                        .and_then(Clone::clone);
                     if plugin_id.is_none() {
                         continue;
                     }
@@ -1587,16 +1815,261 @@ impl Marketplace {
         }
     }
 
-    fn write_pending(&self, plugin: &MarketPlugin) -> AppResult<()> {
-        let marker = PendingVerification {
-            plugin_id: plugin.id.clone(),
-            name: plugin.name.clone(),
+    fn write_pending_change(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        action: MarketOperationKind,
+        profile: &str,
+    ) -> AppResult<()> {
+        let existing = self.pending_verification_for_mutation()?;
+        let mut marker = existing.unwrap_or(PendingVerification {
+            plugin_id: plugin_id.into(),
+            name: name.into(),
             installed_at_ms: now_ms(),
-        };
+            changes: Vec::new(),
+            journal_recovered: false,
+        });
+        marker.plugin_id = plugin_id.into();
+        marker.name = name.into();
+        marker.installed_at_ms = now_ms();
+        marker.changes.push(PendingMarketChange {
+            plugin_id: plugin_id.into(),
+            name: name.into(),
+            action,
+            profile: Some(profile.into()),
+        });
         fs::create_dir_all(self.catalog_dir())
             .map_err(|error| AppError::io("createDirectory", &error))?;
         let bytes = serde_json::to_vec(&marker)?;
         crate::paths::atomic_write(&self.pending_file(), &bytes)?;
+        Ok(())
+    }
+
+    fn pending_verification_for_mutation(&self) -> AppResult<Option<PendingVerification>> {
+        match self.pending_verification() {
+            Ok(pending) => Ok(pending),
+            Err(error) => {
+                log::warn!("pending marketplace journal is unreadable before mutation: {error}");
+                self.recover_corrupt_pending_journal()?;
+                self.pending_verification()
+            }
+        }
+    }
+
+    fn drop_last_pending_change(&self, profile: &str) -> AppResult<()> {
+        let Some(mut pending) = self.pending_verification()? else {
+            return Ok(());
+        };
+        let Some(index) = pending
+            .changes
+            .iter()
+            .rposition(|change| change.profile.as_deref() == Some(profile))
+        else {
+            return Ok(());
+        };
+        pending.changes.remove(index);
+        if pending.changes.is_empty() {
+            return remove_file_if_exists(&self.pending_file());
+        }
+        if let Some(last) = pending.changes.last() {
+            pending.plugin_id.clone_from(&last.plugin_id);
+            pending.name.clone_from(&last.name);
+        }
+        crate::paths::atomic_write(&self.pending_file(), &serde_json::to_vec(&pending)?)
+    }
+
+    fn recover_corrupt_pending_journal(&self) -> AppResult<()> {
+        let pending_path = self.pending_file();
+        let bytes = match fs::read(&pending_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if serde_json::from_slice::<PendingVerification>(&bytes).is_ok() {
+            return Ok(());
+        }
+        fs::create_dir_all(self.catalog_dir())
+            .map_err(|error| AppError::io("createDirectory", &error))?;
+        let quarantined = self
+            .catalog_dir()
+            .join(format!("pending.corrupt-{}.json", process_timestamp()));
+        fs::rename(&pending_path, &quarantined)
+            .map_err(|error| AppError::io("marketRollbackFailed", &error))?;
+
+        let mut profiles = self.last_good_profiles();
+        profiles.sort();
+        profiles.dedup();
+        if !profiles.is_empty() {
+            let recovered = PendingVerification {
+                plugin_id: String::new(),
+                name: String::new(),
+                installed_at_ms: now_ms(),
+                changes: profiles
+                    .into_iter()
+                    .map(|profile| PendingMarketChange {
+                        plugin_id: String::new(),
+                        name: profile.clone(),
+                        action: MarketOperationKind::Install,
+                        profile: Some(profile),
+                    })
+                    .collect(),
+                journal_recovered: true,
+            };
+            if let Err(error) =
+                crate::paths::atomic_write(&pending_path, &serde_json::to_vec(&recovered)?)
+            {
+                let _ = fs::rename(&quarantined, &pending_path);
+                return Err(error);
+            }
+        }
+        log::warn!(
+            "quarantined unreadable marketplace journal at {}",
+            quarantined.display()
+        );
+        self.prune_corrupt_pending_journals();
+        Ok(())
+    }
+
+    fn prune_corrupt_pending_journals(&self) {
+        let Ok(entries) = fs::read_dir(self.catalog_dir()) else {
+            return;
+        };
+        let mut journals = entries
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("pending.corrupt-") && name.ends_with(".json")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        journals.sort();
+        let remove_count = journals.len().saturating_sub(CORRUPT_PENDING_RETENTION);
+        for journal in journals.into_iter().take(remove_count) {
+            if let Err(error) = fs::remove_file(&journal) {
+                log::warn!(
+                    "could not prune old corrupt marketplace journal {}: {error}",
+                    journal.display()
+                );
+            }
+        }
+    }
+
+    fn pending_profiles(&self) -> AppResult<Vec<String>> {
+        let mut profiles = match self.pending_verification() {
+            Ok(Some(pending)) => pending
+                .changes
+                .into_iter()
+                .filter_map(|change| change.profile)
+                .collect::<Vec<_>>(),
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                log::warn!(
+                    "pending marketplace journal is unreadable; recovering backups: {error}"
+                );
+                Vec::new()
+            }
+        };
+        if let Ok(entries) = fs::read_dir(self.profiles_dir()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(profile) = name
+                    .strip_prefix('.')
+                    .and_then(|name| name.strip_suffix(".market-last-good"))
+                else {
+                    continue;
+                };
+                if valid_profile_dir_name(profile) {
+                    profiles.push(profile.into());
+                }
+            }
+        }
+        profiles.sort();
+        profiles.dedup();
+        Ok(profiles)
+    }
+
+    fn discard_last_good_profiles(&self) -> AppResult<()> {
+        let Ok(entries) = fs::read_dir(self.profiles_dir()) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') && name.ends_with(".market-last-good") {
+                fs::remove_dir_all(entry.path())
+                    .map_err(|error| AppError::io("marketRollbackFailed", &error))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn last_good_profiles(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(self.profiles_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.strip_prefix('.')
+                    .and_then(|name| name.strip_suffix(".market-last-good"))
+                    .filter(|profile| valid_profile_dir_name(profile))
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn finish_verified_cleanups(&self) -> AppResult<()> {
+        let Ok(entries) = fs::read_dir(self.catalog_dir()) else {
+            return Ok(());
+        };
+        let verified = entries
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("pending.verified-") && name.ends_with(".json")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        if verified.is_empty() {
+            return Ok(());
+        }
+        self.discard_last_good_profiles()?;
+        for marker in verified {
+            remove_file_if_exists(&marker)?;
+        }
+        Ok(())
+    }
+
+    fn recover_marketplace_state(&self) -> AppResult<()> {
+        self.recover_all_profile_transactions()?;
+        self.recover_corrupt_pending_journal()?;
+        self.finish_verified_cleanups()?;
+        self.prune_corrupt_pending_journals();
+        Ok(())
+    }
+
+    fn recover_all_profile_transactions(&self) -> AppResult<()> {
+        let Ok(entries) = fs::read_dir(self.profiles_dir()) else {
+            return Ok(());
+        };
+        let mut profiles = HashSet::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix('.') else {
+                continue;
+            };
+            if let Some((profile, _)) = rest.split_once(".market-backup-") {
+                profiles.insert(profile.to_owned());
+            } else if let Some((profile, _)) = rest.split_once(".market-candidate-") {
+                profiles.insert(profile.to_owned());
+            }
+        }
+        for profile in profiles {
+            if valid_profile_dir_name(&profile) {
+                self.recover_profile_transaction(&profile)?;
+            }
+        }
         Ok(())
     }
 
@@ -1625,8 +2098,8 @@ impl Marketplace {
 
 #[derive(Debug, Default)]
 struct PluginIndex {
-    by_name: HashMap<String, String>,
-    by_package: HashMap<String, String>,
+    by_name: HashMap<String, Option<String>>,
+    by_package: HashMap<String, Option<String>>,
 }
 
 impl PluginIndex {
@@ -1636,20 +2109,37 @@ impl PluginIndex {
             return index;
         };
         for plugin in &catalog.plugins {
-            index
-                .by_name
-                .insert(plugin.name.to_lowercase(), plugin.id.clone());
-            index
-                .by_name
-                .insert(plugin.full_name.to_lowercase(), plugin.id.clone());
+            insert_unique_binding(&mut index.by_name, plugin.name.to_lowercase(), &plugin.id);
+            insert_unique_binding(
+                &mut index.by_name,
+                plugin.full_name.to_lowercase(),
+                &plugin.id,
+            );
             if let Some(package_name) = install_package_name(plugin) {
-                index
-                    .by_package
-                    .insert(package_name.to_lowercase(), plugin.id.clone());
+                insert_unique_binding(
+                    &mut index.by_package,
+                    package_name.to_lowercase(),
+                    &plugin.id,
+                );
             }
         }
         index
     }
+}
+
+fn insert_unique_binding(
+    bindings: &mut HashMap<String, Option<String>>,
+    key: String,
+    plugin_id: &str,
+) {
+    bindings
+        .entry(key)
+        .and_modify(|existing| {
+            if existing.as_deref() != Some(plugin_id) {
+                *existing = None;
+            }
+        })
+        .or_insert_with(|| Some(plugin_id.into()));
 }
 
 #[derive(Debug, Default)]
@@ -1741,6 +2231,10 @@ fn install_package_name(plugin: &MarketPlugin) -> Option<String> {
     // generator scrapes these from README install sections, which name the
     // real registry package — e.g. `dsh-better-sidebar@latest` for a plugin
     // whose catalog name is `DSH-better-sidebar` and whose homepage is empty.
+    // A single command may install a host bundle before the actual plugin,
+    // e.g. `add @deepseek-ai/dsh-web-app paper-review`. In that shape the
+    // final package is the repository's plugin; choosing the first package
+    // would bind every such catalog entry to the shared host dependency.
     if let Some(install) = &plugin.install {
         for command in &install.commands {
             if let Some(spec) = add_spec_from_command(command) {
@@ -1832,11 +2326,16 @@ fn valid_github_repo_id(id: &str) -> bool {
     valid_part(owner) && valid_part(repo)
 }
 
-/// Extract the `add` argument from one catalog install command when it is a
+/// Extract the plugin package from one catalog install command when it is a
 /// plausible npm registry spec. Handles `dsh plugin [--profile <name>] add
-/// <spec>` and `pnpm add <spec>` shapes, skips option values, and rejects the
-/// local-path, git and shell placeholders that catalog scrapers often pick up
-/// (`<本目录>`, `$(pwd)`, `github:owner/repo`, `.\path`, ...).
+/// <spec>...` and `pnpm add <spec>...` shapes, skips option values, and
+/// rejects the local-path, git and shell placeholders that catalog scrapers
+/// often pick up (`<本目录>`, `$(pwd)`, `github:owner/repo`, `.\path`, ...).
+///
+/// Commands that bootstrap a new profile commonly list a shared host bundle
+/// first and the plugin itself last. Returning the final valid package keeps
+/// installed-state detection and uninstallation bound to the card the user
+/// selected instead of to that shared prerequisite.
 fn add_spec_from_command(command: &str) -> Option<String> {
     let mut tokens = command.split_whitespace();
     for token in tokens.by_ref() {
@@ -1844,7 +2343,14 @@ fn add_spec_from_command(command: &str) -> Option<String> {
             continue;
         }
         let mut skip_option_value = false;
+        let mut package = None;
         for token in &mut tokens {
+            // Do not let a later shell command or an inline comment replace
+            // the package selected from this `add` invocation.
+            if matches!(token, "&&" | "||" | "|" | ";" | "&" | "(" | ")") || token.starts_with('#')
+            {
+                break;
+            }
             if skip_option_value {
                 skip_option_value = false;
                 continue;
@@ -1856,11 +2362,40 @@ fn add_spec_from_command(command: &str) -> Option<String> {
             if token.starts_with('-') {
                 continue;
             }
-            return normalize_package_spec(token);
+            if let Some(spec) = normalize_package_spec(token) {
+                package = Some(spec);
+                continue;
+            }
+            // Version ranges may legitimately contain `>` or `<`, so shell
+            // metacharacters terminate parsing only after the entire token
+            // has failed registry-package normalization. This still stops at
+            // redirection tokens such as `>`, `2>>` and `<`.
+            if token
+                .chars()
+                .any(|c| matches!(c, '>' | '<' | '&' | '|' | ';' | '(' | ')' | '#'))
+            {
+                break;
+            }
         }
-        break;
+        return package;
     }
     None
+}
+
+fn pnpm_mutation_flags(verb: &str) -> &'static [&'static str] {
+    if verb == "remove" {
+        // Removal is the recovery path for an already-broken dependency
+        // tree. A profile-wide peer conflict must not make a direct
+        // dependency impossible to remove. pnpm 11's remove parser does not
+        // accept the add-only `--ignore-scripts` option, but the config form
+        // applies the same lifecycle-script policy.
+        &[
+            "--config.ignore-scripts=true",
+            "--no-strict-peer-dependencies",
+        ]
+    } else {
+        &["--ignore-scripts", "--strict-peer-dependencies"]
+    }
 }
 
 /// Reduce a pnpm package argument to its bare package name when it is a
@@ -1960,21 +2495,10 @@ fn copy_profile_candidate(source: &Path, dest: &Path) -> AppResult<()> {
 fn copy_profile_entry(source: &Path, dest: &Path) -> AppResult<()> {
     let metadata = fs::symlink_metadata(source).map_err(|error| AppError::io("io", &error))?;
     if metadata.file_type().is_symlink() {
-        let link = fs::read_link(source).map_err(|error| AppError::io("io", &error))?;
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(link, dest)
-            .map_err(|error| AppError::io("writeFailed", &error))?;
-        #[cfg(windows)]
-        {
-            if source.is_dir() {
-                std::os::windows::fs::symlink_dir(link, dest)
-                    .map_err(|error| AppError::io("writeFailed", &error))?;
-            } else {
-                std::os::windows::fs::symlink_file(link, dest)
-                    .map_err(|error| AppError::io("writeFailed", &error))?;
-            }
-        }
-        return Ok(());
+        return Err(AppError::new("marketProfileInvalid").detail(format!(
+            "profile contains unsupported symlink {}",
+            source.display()
+        )));
     }
     if metadata.is_dir() {
         fs::create_dir_all(dest).map_err(|error| AppError::io("createDirectory", &error))?;
@@ -1985,8 +2509,10 @@ fn copy_profile_entry(source: &Path, dest: &Path) -> AppResult<()> {
     } else if metadata.is_file() {
         fs::copy(source, dest).map_err(|error| AppError::io("writeFailed", &error))?;
     } else {
-        return Err(AppError::new("marketInstallFailed")
-            .detail("profile contains an unsupported special file"));
+        return Err(AppError::new("marketProfileInvalid").detail(format!(
+            "profile contains unsupported special file {}",
+            source.display()
+        )));
     }
     Ok(())
 }
@@ -1998,7 +2524,10 @@ fn move_dir(source: &Path, dest: &Path) -> std::io::Result<()> {
     match fs::rename(source, dest) {
         Ok(()) => Ok(()),
         Err(error) if is_cross_device(&error) => {
-            copy_dir_recursive(source, dest)?;
+            if let Err(copy_error) = copy_dir_recursive(source, dest) {
+                let _ = fs::remove_dir_all(dest);
+                return Err(copy_error);
+            }
             fs::remove_dir_all(source)
         }
         Err(error) => Err(error),
@@ -2022,9 +2551,9 @@ fn is_cross_device(error: &std::io::Error) -> bool {
     }
 }
 
-/// Recursive directory copy used by the cross-device fallback. Symlinks and
-/// special files are not recreated (consistent with the tarball extraction
-/// policy).
+/// Recursive directory copy used by the cross-device fallback. Refuse
+/// symlinks and special files instead of silently omitting them before the
+/// source tree is deleted.
 fn copy_dir_recursive(source: &Path, dest: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(source)? {
@@ -2035,6 +2564,11 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> std::io::Result<()> {
             copy_dir_recursive(&entry.path(), &target)?;
         } else if file_type.is_file() {
             fs::copy(entry.path(), &target)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported file type at {}", entry.path().display()),
+            ));
         }
     }
     Ok(())
@@ -2064,51 +2598,91 @@ fn trash_entry_age(path: &Path) -> Option<Duration> {
 /// The slice of a profile `package.json` the marketplace manages: dependency
 /// entries and the `dsh.profile.bundles` layer list. Unrelated keys are
 /// preserved untouched when writing back.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProfileManifest {
     dependencies: BTreeMap<String, String>,
     bundles: Vec<String>,
 }
 
-impl<'de> serde::Deserialize<'de> for ProfileManifest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = serde_json::Value::deserialize(deserializer)?;
-        let dependencies = raw
-            .get("dependencies")
-            .and_then(|v| v.as_object())
-            .map(|object| {
-                object
-                    .iter()
-                    .filter_map(|(key, value)| value.as_str().map(|s| (key.clone(), s.to_owned())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let bundles = raw
-            .get("dsh")
-            .and_then(|v| v.get("profile"))
-            .and_then(|v| v.get("bundles"))
-            .and_then(|v| v.as_array())
-            .map(|array| {
-                array
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(ProfileManifest {
-            dependencies,
-            bundles,
-        })
-    }
+fn has_installation_owned_foundation(manifest: &ProfileManifest) -> bool {
+    manifest
+        .bundles
+        .iter()
+        .any(|bundle| !manifest.dependencies.contains_key(bundle))
 }
 
 fn read_manifest(path: &Path) -> AppResult<ProfileManifest> {
     let bytes = fs::read(path).map_err(|error| AppError::io("io", &error))?;
-    let manifest: ProfileManifest = serde_json::from_slice(&bytes)?;
-    Ok(manifest)
+    let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let root = raw.as_object().ok_or_else(|| {
+        AppError::new("marketProfileInvalid").detail("package.json root must be an object")
+    })?;
+    let dependencies = match root.get("dependencies") {
+        None => BTreeMap::new(),
+        Some(value) => value
+            .as_object()
+            .ok_or_else(|| {
+                AppError::new("marketProfileInvalid").detail("dependencies must be an object")
+            })?
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|version| (key.clone(), version.to_owned()))
+                    .ok_or_else(|| {
+                        AppError::new("marketProfileInvalid")
+                            .detail(format!("dependency {key} must have a string version"))
+                    })
+            })
+            .collect::<AppResult<BTreeMap<_, _>>>()?,
+    };
+    let bundles = match root.get("dsh") {
+        None => Vec::new(),
+        Some(dsh) => {
+            let dsh = dsh.as_object().ok_or_else(|| {
+                AppError::new("marketProfileInvalid").detail("dsh must be an object")
+            })?;
+            match dsh.get("profile") {
+                None => Vec::new(),
+                Some(profile) => {
+                    let profile = profile.as_object().ok_or_else(|| {
+                        AppError::new("marketProfileInvalid")
+                            .detail("dsh.profile must be an object")
+                    })?;
+                    match profile.get("bundles") {
+                        None => Vec::new(),
+                        Some(bundles) => bundles
+                            .as_array()
+                            .ok_or_else(|| {
+                                AppError::new("marketProfileInvalid")
+                                    .detail("dsh.profile.bundles must be an array")
+                            })?
+                            .iter()
+                            .map(|bundle| {
+                                bundle.as_str().map(str::to_owned).ok_or_else(|| {
+                                    AppError::new("marketProfileInvalid")
+                                        .detail("every dsh.profile.bundles entry must be a string")
+                                })
+                            })
+                            .collect::<AppResult<Vec<_>>>()?,
+                    }
+                }
+            }
+        }
+    };
+    if bundles.iter().any(|bundle| bundle.trim().is_empty()) {
+        return Err(AppError::new("marketProfileInvalid")
+            .detail("dsh.profile.bundles contains an empty package name"));
+    }
+    let mut unique = HashSet::new();
+    if bundles.iter().any(|bundle| !unique.insert(bundle)) {
+        return Err(AppError::new("marketProfileInvalid")
+            .detail("dsh.profile.bundles contains duplicate entries"));
+    }
+    Ok(ProfileManifest {
+        dependencies,
+        bundles,
+    })
 }
 
 fn write_manifest(path: &Path, manifest: &ProfileManifest) -> AppResult<()> {
@@ -2148,6 +2722,143 @@ fn package_declares_bundle(profile_dir: &Path, dep: &str) -> bool {
         .and_then(|d| d.get("bundle"))
         .and_then(|b| b.get("patch"))
         .is_some()
+}
+
+fn validate_candidate_profile(
+    baseline: &ProfileManifest,
+    candidate_dir: &Path,
+    verb: &str,
+    spec: &str,
+) -> AppResult<()> {
+    let target = normalize_package_spec(spec).ok_or_else(|| {
+        AppError::new("marketProfileInvalid").detail("operation target is not a registry package")
+    })?;
+    let candidate = read_manifest(&candidate_dir.join("package.json"))?;
+
+    for foundation in &baseline.bundles {
+        if verb == "remove" && foundation == &target {
+            continue;
+        }
+        if !candidate.bundles.contains(foundation) {
+            return Err(AppError::new("marketProfileInvalid").detail(format!(
+                "profile mutation removed existing bundle {foundation}"
+            )));
+        }
+    }
+
+    match verb {
+        "add" => {
+            if !candidate.dependencies.contains_key(&target) {
+                return Err(AppError::new("marketProfileInvalid").detail(format!(
+                    "installed package {target} is missing from dependencies"
+                )));
+            }
+            if !package_declares_bundle(candidate_dir, &target) {
+                return Err(AppError::new("marketProfileInvalid").detail(format!(
+                    "installed package {target} does not declare dsh.bundle"
+                )));
+            }
+            if !candidate.bundles.contains(&target) {
+                return Err(AppError::new("marketProfileInvalid").detail(format!(
+                    "installed bundle {target} is not active in the profile"
+                )));
+            }
+        }
+        "remove" => {
+            if candidate.dependencies.contains_key(&target) || candidate.bundles.contains(&target) {
+                return Err(AppError::new("marketProfileInvalid")
+                    .detail(format!("removed package {target} is still active")));
+            }
+        }
+        _ => {
+            return Err(
+                AppError::new("marketProfileInvalid").detail("unsupported profile mutation")
+            );
+        }
+    }
+
+    for dependency in candidate.dependencies.keys() {
+        if !candidate_dir
+            .join("node_modules")
+            .join(dependency)
+            .join("package.json")
+            .is_file()
+        {
+            return Err(AppError::new("marketProfileInvalid")
+                .detail(format!("dependency {dependency} is not installed")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_reverse_package_dependencies(
+    profile_dir: &Path,
+    manifest: &ProfileManifest,
+    removed: &str,
+) -> AppResult<()> {
+    for bundle in &manifest.bundles {
+        if bundle == removed {
+            continue;
+        }
+        let package_path = profile_dir
+            .join("node_modules")
+            .join(bundle)
+            .join("package.json");
+        let Ok(bytes) = fs::read(package_path) else {
+            continue;
+        };
+        let Ok(package): Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else {
+            continue;
+        };
+        let required = ["dependencies", "peerDependencies", "optionalDependencies"]
+            .into_iter()
+            .any(|field| {
+                package
+                    .get(field)
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|dependencies| dependencies.contains_key(removed))
+            });
+        if required {
+            return Err(AppError::new("marketPluginRequired")
+                .value("plugin", removed)
+                .value("dependent", bundle));
+        }
+    }
+    Ok(())
+}
+
+fn profile_control_digest(profile_dir: &Path) -> AppResult<[u8; 32]> {
+    let mut digest = Sha256::new();
+    for name in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        digest.update(name.as_bytes());
+        let path = profile_dir.join(name);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                digest.update([1]);
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => digest.update([0]),
+            Err(error) => return Err(AppError::io("io", &error)),
+        }
+    }
+    Ok(digest.finalize().into())
+}
+
+fn remove_file_if_exists(path: &Path) -> AppResult<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn restore_pending_snapshot(path: &Path, previous: Option<&[u8]>) -> AppResult<()> {
+    if let Some(bytes) = previous {
+        crate::paths::atomic_write(path, bytes)
+    } else {
+        remove_file_if_exists(path)
+    }
 }
 
 fn read_installed_version(profile_dir: &Path, dep: &str) -> Option<String> {
@@ -2762,32 +3473,6 @@ fn command_env_path(
     Some(joined.into())
 }
 
-fn run_dsh_plugin(
-    paths: &ApplicationPaths,
-    pnpm_prepend: &[PathBuf],
-    profile: &str,
-    verb: &str,
-    pkg: &str,
-) -> AppResult<()> {
-    let mut command = Command::new(&paths.node_bin);
-    command
-        .arg(&paths.dsh_bin)
-        .arg("plugin")
-        .arg("--profile")
-        .arg(profile)
-        .arg(verb)
-        .arg(pkg)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    market_command_env(&mut command, paths, pnpm_prepend);
-    let (success, output) = run_child(command, INSTALL_TIMEOUT)?;
-    if !success {
-        return Err(AppError::new("marketInstallFailed").detail(tail(&output, 400)));
-    }
-    Ok(())
-}
-
 /// Run a child to completion with output capture and a hard timeout. Output
 /// is delivered over a channel with a bounded grace period so a backgrounded
 /// grandchild that keeps the pipes open can never block the caller forever.
@@ -3170,6 +3855,22 @@ mod tests {
             ],
         });
         assert_eq!(install_package_name(&item), Some("good-pkg".into()));
+
+        // Some plugins bootstrap a custom profile by installing the shared
+        // web surface and their own package in one command. The marketplace
+        // card must bind to the plugin package, not the shared prerequisite.
+        let mut read_paper = plugin("louwenbo580/read-paper", "read-paper", 0, None);
+        read_paper.install = Some(MarketInstallInfo {
+            method: Some("pnpm-profile".into()),
+            needs_config: Some(false),
+            commands: vec![
+                "dsh plugin --profile readPaper add @deepseek-ai/dsh-web-app paper-review".into(),
+            ],
+        });
+        assert_eq!(
+            install_package_name(&read_paper),
+            Some("paper-review".into())
+        );
     }
 
     #[test]
@@ -3197,11 +3898,61 @@ mod tests {
             add_spec_from_command("pnpm add @scope/pkg@1.2.3"),
             Some("@scope/pkg".into())
         );
+        assert_eq!(
+            add_spec_from_command(
+                "dsh plugin --profile readPaper add @deepseek-ai/dsh-web-app paper-review"
+            ),
+            Some("paper-review".into())
+        );
+        assert_eq!(
+            add_spec_from_command("dsh plugin add intended && pnpm add unrelated"),
+            Some("intended".into())
+        );
+        assert_eq!(
+            add_spec_from_command("dsh plugin add intended # install the plugin"),
+            Some("intended".into())
+        );
         assert_eq!(add_spec_from_command("dsh plugin remove old-plugin"), None);
         assert_eq!(add_spec_from_command("npm install -g dsh-tool"), None);
         assert_eq!(add_spec_from_command("dsh plugin add ./local-dir"), None);
         assert_eq!(add_spec_from_command("dsh plugin add $(pwd)"), None);
         assert_eq!(add_spec_from_command("dsh plugin add <本目录>"), None);
+        assert_eq!(
+            add_spec_from_command("pnpm add real-pkg > install.log"),
+            Some("real-pkg".into())
+        );
+        assert_eq!(
+            add_spec_from_command("pnpm add real-pkg 2>> install.log"),
+            Some("real-pkg".into())
+        );
+        assert_eq!(
+            add_spec_from_command("pnpm add real-pkg < input.txt"),
+            Some("real-pkg".into())
+        );
+        assert_eq!(
+            add_spec_from_command("pnpm add ranged-pkg@>=1.0.0"),
+            Some("ranged-pkg".into())
+        );
+        assert_eq!(
+            add_spec_from_command("pnpm add ranged-pkg@<2"),
+            Some("ranged-pkg".into())
+        );
+    }
+
+    #[test]
+    fn pnpm_remove_uses_supported_safe_recovery_flags() {
+        assert_eq!(
+            pnpm_mutation_flags("add"),
+            &["--ignore-scripts", "--strict-peer-dependencies"]
+        );
+        assert_eq!(
+            pnpm_mutation_flags("remove"),
+            &[
+                "--config.ignore-scripts=true",
+                "--no-strict-peer-dependencies"
+            ]
+        );
+        assert!(!pnpm_mutation_flags("remove").contains(&"--ignore-scripts"));
     }
 
     #[test]
@@ -3333,6 +4084,49 @@ mod tests {
     }
 
     #[test]
+    fn remove_reconciliation_preserves_installation_owned_profile_layers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let profile_dir = paths.dsh_home.join("profiles/web");
+        fs::create_dir_all(&profile_dir).expect("profile");
+        fs::write(
+            profile_dir.join("package.json"),
+            br#"{
+              "name":"dsh-profile-web",
+              "private":true,
+              "dependencies":{
+                "dsh-better-sidebar":"^0.15.2",
+                "dsh-pocket":"^1.13.4"
+              },
+              "dsh":{"profile":{"bundles":[
+                "@deepseek-ai/dsh-base",
+                "@deepseek-ai/dsh-web-app",
+                "dsh-better-sidebar",
+                "dsh-pocket",
+                "dsh-cost-meter"
+              ]}}
+            }"#,
+        )
+        .expect("manifest");
+        let marketplace = Marketplace::new(paths);
+
+        marketplace
+            .reconcile_bundles_after_remove("web", "dsh-cost-meter")
+            .expect("reconcile");
+
+        let manifest = read_manifest(&profile_dir.join("package.json")).expect("read");
+        assert_eq!(
+            manifest.bundles,
+            vec![
+                "@deepseek-ai/dsh-base",
+                "@deepseek-ai/dsh-web-app",
+                "dsh-better-sidebar",
+                "dsh-pocket",
+            ]
+        );
+    }
+
+    #[test]
     fn installed_scan_matches_skills_and_profiles() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = ApplicationPaths::from_home(temp.path().join("home"));
@@ -3367,6 +4161,38 @@ mod tests {
     }
 
     #[test]
+    fn installed_scan_does_not_alias_multi_package_plugin_to_prerequisite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let profile_dir = paths.dsh_home.join("profiles/web");
+        fs::create_dir_all(&profile_dir).expect("profile");
+        fs::write(
+            profile_dir.join("package.json"),
+            br#"{
+              "dependencies": {"@deepseek-ai/dsh-web-app":"^0.1.0"},
+              "dsh":{"profile":{"bundles":["@deepseek-ai/dsh-web-app"]}}
+            }"#,
+        )
+        .expect("manifest");
+        let mut read_paper = plugin("louwenbo580/read-paper", "read-paper", 0, None);
+        read_paper.install = Some(MarketInstallInfo {
+            method: Some("pnpm-profile".into()),
+            needs_config: Some(false),
+            commands: vec![
+                "dsh plugin --profile readPaper add @deepseek-ai/dsh-web-app paper-review".into(),
+            ],
+        });
+        let marketplace = Marketplace::new(paths);
+
+        let installed = marketplace.scan_installed(Some(&catalog(vec![read_paper])));
+
+        assert!(
+            installed.is_empty(),
+            "the shared web bundle is not read-paper"
+        );
+    }
+
+    #[test]
     fn uninstall_of_skill_moves_directory_to_trash() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = ApplicationPaths::from_home(temp.path().join("home"));
@@ -3380,8 +4206,15 @@ mod tests {
         )
         .expect("write");
         *marketplace.catalog.lock().expect("catalog") = Some(Arc::new(catalog));
+        let target = InstalledPlugin {
+            plugin_id: Some("x/url-manager".into()),
+            local_name: "url-manager".into(),
+            version: None,
+            source: PluginSource::Skills,
+            profile: None,
+        };
         let result = marketplace
-            .uninstall("x/url-manager", None, false)
+            .uninstall("x/url-manager", Some(&target), false)
             .expect("uninstall");
         assert!(result.ok);
         assert!(!skills_dir.join("url-manager").exists());
@@ -3983,6 +4816,373 @@ mod tests {
             .expect("uninstall selected");
         assert!(!skills.join("alpha-latest").exists());
         assert!(skills.join("alpha-1.0.0").is_dir());
+    }
+
+    #[test]
+    fn rapid_market_mutations_are_rejected_instead_of_queued() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        let first = marketplace.begin_operation().expect("first operation");
+        let busy = marketplace
+            .begin_operation()
+            .expect_err("a second operation must not queue");
+        assert_eq!(busy.code, "marketOperationBusy");
+        drop(first);
+        marketplace
+            .begin_operation()
+            .expect("gate released after operation");
+    }
+
+    #[test]
+    fn malformed_profile_fields_are_rejected_without_silent_filtering() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest = temp.path().join("package.json");
+        fs::write(
+            &manifest,
+            br#"{"dependencies":{"alpha":7},"dsh":{"profile":{"bundles":["alpha",9]}}}"#,
+        )
+        .expect("manifest");
+        let error = read_manifest(&manifest).expect_err("malformed fields must fail closed");
+        assert_eq!(error.code, "marketProfileInvalid");
+    }
+
+    #[test]
+    fn candidate_validation_preserves_foundations_and_requires_active_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let candidate = temp.path().join("candidate");
+        fs::create_dir_all(candidate.join("node_modules/alpha")).expect("alpha");
+        fs::write(
+            candidate.join("package.json"),
+            br#"{
+              "dependencies":{"alpha":"1.0.0"},
+              "dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","alpha"]}}
+            }"#,
+        )
+        .expect("profile");
+        fs::write(
+            candidate.join("node_modules/alpha/package.json"),
+            br#"{"name":"alpha","dsh":{"bundle":{"patch":{}}}}"#,
+        )
+        .expect("package");
+        let baseline = ProfileManifest {
+            dependencies: BTreeMap::new(),
+            bundles: vec!["@deepseek-ai/dsh-base".into()],
+        };
+        validate_candidate_profile(&baseline, &candidate, "add", "alpha@1.0.0")
+            .expect("valid candidate");
+
+        let mut broken = read_manifest(&candidate.join("package.json")).expect("manifest");
+        broken
+            .bundles
+            .retain(|bundle| bundle != "@deepseek-ai/dsh-base");
+        write_manifest(&candidate.join("package.json"), &broken).expect("break candidate");
+        let error = validate_candidate_profile(&baseline, &candidate, "add", "alpha")
+            .expect_err("foundation removal must fail");
+        assert_eq!(error.code, "marketProfileInvalid");
+    }
+
+    #[test]
+    fn foundation_validation_is_independent_of_upstream_package_names() {
+        let manifest = ProfileManifest {
+            dependencies: BTreeMap::from([("third-party-plugin".into(), "1.0.0".into())]),
+            bundles: vec!["@future/dsh-foundation".into(), "third-party-plugin".into()],
+        };
+        assert!(has_installation_owned_foundation(&manifest));
+
+        let missing = ProfileManifest {
+            dependencies: BTreeMap::from([("third-party-plugin".into(), "1.0.0".into())]),
+            bundles: vec!["third-party-plugin".into()],
+        };
+        assert!(!has_installation_owned_foundation(&missing));
+    }
+
+    #[test]
+    fn uninstall_refuses_a_package_required_by_a_remaining_bundle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let profile = temp.path();
+        fs::create_dir_all(profile.join("node_modules/consumer")).expect("consumer");
+        fs::write(
+            profile.join("node_modules/consumer/package.json"),
+            br#"{"name":"consumer","peerDependencies":{"provider":"^1"}}"#,
+        )
+        .expect("consumer package");
+        let manifest = ProfileManifest {
+            dependencies: BTreeMap::new(),
+            bundles: vec!["provider".into(), "consumer".into()],
+        };
+        let error = validate_reverse_package_dependencies(profile, &manifest, "provider")
+            .expect_err("reverse dependency must block uninstall");
+        assert_eq!(error.code, "marketPluginRequired");
+    }
+
+    #[test]
+    fn rollback_restores_batch_base_and_retains_rejected_profile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let marketplace = Marketplace::new(paths);
+        let active = marketplace.profile_dir("web");
+        let last_good = marketplace.last_good_profile("web");
+        fs::create_dir_all(&active).expect("active");
+        fs::create_dir_all(&last_good).expect("last good");
+        fs::write(active.join("package.json"), br#"{"state":"changed"}"#).expect("active");
+        fs::write(last_good.join("package.json"), br#"{"state":"baseline"}"#).expect("baseline");
+        for (name, action) in [
+            ("alpha", MarketOperationKind::Install),
+            ("beta", MarketOperationKind::Install),
+            ("gamma", MarketOperationKind::Install),
+            ("delta", MarketOperationKind::Uninstall),
+            ("epsilon", MarketOperationKind::Uninstall),
+            ("zeta", MarketOperationKind::Uninstall),
+        ] {
+            marketplace
+                .write_pending_change(&format!("x/{name}"), name, action, "web")
+                .expect("pending change");
+        }
+        let pending = marketplace
+            .pending_verification()
+            .expect("pending")
+            .expect("batch");
+        assert_eq!(pending.changes.len(), 6);
+        assert_eq!(pending.changes[0].name, "alpha");
+        assert_eq!(pending.changes[5].name, "zeta");
+
+        marketplace.rollback_pending().expect("rollback batch");
+
+        assert_eq!(
+            fs::read_to_string(active.join("package.json")).expect("restored"),
+            r#"{"state":"baseline"}"#
+        );
+        assert!(
+            marketplace
+                .pending_verification()
+                .expect("pending")
+                .is_none()
+        );
+        assert!(
+            fs::read_dir(marketplace.profiles_dir())
+                .expect("profiles")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".web.market-rejected-"))
+        );
+    }
+
+    #[test]
+    fn startup_recovers_a_profile_missing_mid_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let marketplace = Marketplace::new(paths);
+        let backup = marketplace.profile_dir(".web.market-backup-1");
+        fs::create_dir_all(&backup).expect("backup");
+        fs::write(backup.join("package.json"), "{}").expect("manifest");
+
+        marketplace.initialize();
+
+        assert!(
+            marketplace
+                .profile_dir("web")
+                .join("package.json")
+                .is_file()
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn crash_recovery_drops_only_the_unpublished_tail_of_a_batch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        let last_good = marketplace.last_good_profile("web");
+        let backup = marketplace.profile_dir(".web.market-backup-1");
+        fs::create_dir_all(&last_good).expect("last good");
+        fs::create_dir_all(&backup).expect("backup");
+        fs::write(last_good.join("package.json"), "baseline").expect("baseline");
+        fs::write(backup.join("package.json"), "after alpha").expect("first change");
+        marketplace
+            .write_pending_change("x/alpha", "alpha", MarketOperationKind::Install, "web")
+            .expect("first pending change");
+        marketplace
+            .write_pending_change("x/beta", "beta", MarketOperationKind::Install, "web")
+            .expect("second pending change");
+
+        marketplace.initialize();
+
+        assert_eq!(
+            fs::read_to_string(marketplace.profile_dir("web").join("package.json"))
+                .expect("restored first change"),
+            "after alpha"
+        );
+        let pending = marketplace
+            .pending_verification()
+            .expect("pending")
+            .expect("first change remains pending");
+        assert_eq!(pending.changes.len(), 1);
+        assert_eq!(pending.changes[0].name, "alpha");
+        assert!(last_good.exists());
+    }
+
+    #[test]
+    fn corrupt_pending_journal_is_quarantined_without_losing_rollback_coverage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        fs::create_dir_all(marketplace.last_good_profile("web")).expect("last good");
+        fs::create_dir_all(marketplace.catalog_dir()).expect("catalog");
+        fs::write(marketplace.pending_file(), "not json").expect("corrupt journal");
+
+        marketplace.initialize();
+
+        let pending = marketplace
+            .pending_verification()
+            .expect("read recovered journal")
+            .expect("rollback marker retained");
+        assert!(pending.journal_recovered);
+        assert_eq!(pending.changes[0].profile.as_deref(), Some("web"));
+        assert!(marketplace.has_pending_rollback());
+        assert!(
+            fs::read_dir(marketplace.catalog_dir())
+                .expect("catalog")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pending.corrupt-"))
+        );
+    }
+
+    #[test]
+    fn mutation_recovers_an_externally_corrupted_journal_and_keeps_new_plugin_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        fs::create_dir_all(marketplace.last_good_profile("web")).expect("last good");
+        fs::create_dir_all(marketplace.catalog_dir()).expect("catalog");
+        fs::write(marketplace.pending_file(), "externally damaged").expect("corrupt journal");
+
+        marketplace
+            .write_pending_change(
+                "x/new-plugin",
+                "new-plugin",
+                MarketOperationKind::Install,
+                "web",
+            )
+            .expect("recover and append");
+
+        let pending = marketplace
+            .pending_verification()
+            .expect("pending")
+            .expect("batch");
+        assert!(pending.journal_recovered);
+        assert_eq!(pending.changes.len(), 2);
+        assert!(pending.changes[0].plugin_id.is_empty());
+        assert_eq!(pending.changes[1].name, "new-plugin");
+        assert_eq!(marketplace.pending_change_summary(), "new-plugin, web");
+    }
+
+    #[test]
+    fn corrupt_journal_quarantine_retains_only_the_newest_five_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        fs::create_dir_all(marketplace.catalog_dir()).expect("catalog");
+        for index in 0..8 {
+            fs::write(
+                marketplace
+                    .catalog_dir()
+                    .join(format!("pending.corrupt-{index:04}.json")),
+                "damaged",
+            )
+            .expect("old quarantine");
+        }
+
+        marketplace.initialize();
+
+        let retained = fs::read_dir(marketplace.catalog_dir())
+            .expect("catalog")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pending.corrupt-")
+            })
+            .count();
+        assert_eq!(retained, CORRUPT_PENDING_RETENTION);
+        assert!(
+            !marketplace
+                .catalog_dir()
+                .join("pending.corrupt-0000.json")
+                .exists()
+        );
+        assert!(
+            marketplace
+                .catalog_dir()
+                .join("pending.corrupt-0007.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn verified_batch_is_not_pending_after_commit_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        fs::create_dir_all(marketplace.last_good_profile("web")).expect("last good");
+        marketplace
+            .write_pending_change("x/alpha", "alpha", MarketOperationKind::Install, "web")
+            .expect("pending");
+
+        marketplace
+            .clear_pending_verification()
+            .expect("commit verified batch");
+
+        assert!(!marketplace.has_pending_rollback());
+        assert!(!marketplace.last_good_profile("web").exists());
+    }
+
+    #[test]
+    fn rollback_uses_last_good_backup_when_pending_journal_is_corrupt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        let active = marketplace.profile_dir("web");
+        let last_good = marketplace.last_good_profile("web");
+        fs::create_dir_all(&active).expect("active");
+        fs::create_dir_all(&last_good).expect("last good");
+        fs::create_dir_all(marketplace.catalog_dir()).expect("catalog");
+        fs::write(active.join("package.json"), "changed").expect("active");
+        fs::write(last_good.join("package.json"), "baseline").expect("baseline");
+        fs::write(marketplace.pending_file(), "not json").expect("corrupt journal");
+
+        assert!(marketplace.has_pending_rollback());
+        marketplace.rollback_pending().expect("fallback rollback");
+
+        assert_eq!(
+            fs::read_to_string(active.join("package.json")).expect("restored"),
+            "baseline"
+        );
+    }
+
+    #[test]
+    fn duplicate_catalog_package_binding_is_not_attributed_to_either_card() {
+        let mut first = plugin("one/shared", "one", 0, None);
+        first.homepage = Some("https://www.npmjs.com/package/shared".into());
+        let mut second = plugin("two/shared", "two", 0, None);
+        second.homepage = Some("https://www.npmjs.com/package/shared".into());
+        let catalog = catalog(vec![first, second]);
+        let index = PluginIndex::build(Some(&catalog));
+        assert_eq!(index.by_package.get("shared"), Some(&None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_candidate_rejects_symlinks_that_escape_staging() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let candidate = temp.path().join("candidate");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("real.json"), "{}").expect("real");
+        std::os::unix::fs::symlink(source.join("real.json"), source.join("package.json"))
+            .expect("symlink");
+        let error = copy_profile_candidate(&source, &candidate)
+            .expect_err("candidate must reject symlinked control files");
+        assert_eq!(error.code, "marketProfileInvalid");
     }
 
     #[test]
