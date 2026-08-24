@@ -1824,10 +1824,15 @@ impl Marketplace {
                     }
                 }
                 for dep in names {
-                    let plugin_id = index
-                        .by_package
-                        .get(&dep.to_lowercase())
-                        .and_then(Clone::clone);
+                    let package_key = dep.to_lowercase();
+                    let plugin_id = read_installed_repository(&profile_dir, &dep)
+                        .and_then(|repository| {
+                            index
+                                .by_package_source
+                                .get(&(package_key.clone(), repository.to_lowercase()))
+                                .cloned()
+                        })
+                        .or_else(|| index.by_package.get(&package_key).and_then(Clone::clone));
                     if plugin_id.is_none() {
                         continue;
                     }
@@ -2180,11 +2185,13 @@ impl Marketplace {
 struct PluginIndex {
     by_name: HashMap<String, Option<String>>,
     by_package: HashMap<String, Option<String>>,
+    by_package_source: HashMap<(String, String), String>,
 }
 
 impl PluginIndex {
     fn build(catalog: Option<&MarketCatalogFile>) -> Self {
         let mut index = Self::default();
+        let mut package_binding_ranks = HashMap::new();
         let Some(catalog) = catalog else {
             return index;
         };
@@ -2196,11 +2203,17 @@ impl PluginIndex {
                 &plugin.id,
             );
             if let Some(package_name) = install_package_name(plugin) {
-                insert_unique_binding(
+                let package_key = package_name.to_lowercase();
+                insert_ranked_package_binding(
                     &mut index.by_package,
-                    package_name.to_lowercase(),
+                    &mut package_binding_ranks,
+                    package_key.clone(),
                     &plugin.id,
+                    u8::from(package_matches_plugin_identity(plugin, &package_name)),
                 );
+                index
+                    .by_package_source
+                    .insert((package_key, plugin.id.to_lowercase()), plugin.id.clone());
             }
         }
         index
@@ -2220,6 +2233,33 @@ fn insert_unique_binding(
             }
         })
         .or_insert_with(|| Some(plugin_id.into()));
+}
+
+fn insert_ranked_package_binding(
+    bindings: &mut HashMap<String, Option<String>>,
+    ranks: &mut HashMap<String, u8>,
+    key: String,
+    plugin_id: &str,
+    rank: u8,
+) {
+    let existing_rank = ranks.get(&key).copied();
+    match existing_rank {
+        None => {
+            bindings.insert(key.clone(), Some(plugin_id.into()));
+            ranks.insert(key, rank);
+        }
+        Some(current) if rank > current => {
+            bindings.insert(key.clone(), Some(plugin_id.into()));
+            ranks.insert(key, rank);
+        }
+        Some(current) if rank == current => {
+            let existing = bindings.get_mut(&key).expect("package binding missing");
+            if existing.as_deref() != Some(plugin_id) {
+                *existing = None;
+            }
+        }
+        Some(_) => {}
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2315,12 +2355,20 @@ fn install_package_name(plugin: &MarketPlugin) -> Option<String> {
     // e.g. `add @deepseek-ai/dsh-web-app paper-review`. In that shape the
     // final package is the repository's plugin; choosing the first package
     // would bind every such catalog entry to the shared host dependency.
-    if let Some(install) = &plugin.install {
-        for command in &install.commands {
-            if let Some(spec) = add_spec_from_command(command) {
-                return Some(spec);
-            }
-        }
+    let command_specs: Vec<String> = plugin
+        .install
+        .iter()
+        .flat_map(|install| &install.commands)
+        .filter_map(|command| add_spec_from_command(command))
+        .collect();
+    if let Some(spec) = command_specs
+        .iter()
+        .find(|spec| package_matches_plugin_identity(plugin, spec))
+    {
+        return Some(spec.clone());
+    }
+    if let Some(spec) = command_specs.first() {
+        return Some(spec.clone());
     }
     // Priority 2: an npm package URL in the homepage field.
     if let Some(homepage) = &plugin.homepage
@@ -2341,6 +2389,20 @@ fn install_package_name(plugin: &MarketPlugin) -> Option<String> {
         return Some(name);
     }
     None
+}
+
+fn package_matches_plugin_identity(plugin: &MarketPlugin, package_name: &str) -> bool {
+    let package_name = package_name.to_lowercase();
+    let package_base = package_name
+        .rsplit_once('/')
+        .map_or(package_name.as_str(), |(_, name)| name);
+    let repo_name = plugin.id.rsplit_once('/').map(|(_, repo)| repo);
+    [Some(plugin.name.as_str()), repo_name]
+        .into_iter()
+        .flatten()
+        .map(str::to_lowercase)
+        .filter_map(|name| normalize_package_spec(&name))
+        .any(|identity| identity == package_name || identity == package_base)
 }
 
 fn sanitize_catalog(catalog: &mut MarketCatalogFile) -> AppResult<()> {
@@ -2949,6 +3011,19 @@ fn read_installed_version(profile_dir: &Path, dep: &str) -> Option<String> {
     let bytes = fs::read(package_path).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     value.get("version")?.as_str().map(str::to_owned)
+}
+
+fn read_installed_repository(profile_dir: &Path, dep: &str) -> Option<String> {
+    let package_path = profile_dir
+        .join("node_modules")
+        .join(dep)
+        .join("package.json");
+    let bytes = fs::read(package_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("repository")
+        .and_then(repository_url)
+        .and_then(normalize_github_repository)
 }
 
 fn split_name_version(local_name: &str) -> (String, Option<String>) {
@@ -3935,6 +4010,24 @@ mod tests {
             ],
         });
         assert_eq!(install_package_name(&item), Some("good-pkg".into()));
+
+        // README instructions often install a prerequisite first and the
+        // repository's own package in a later command. Prefer the command
+        // whose package matches this catalog card's identity.
+        let mut sidebar_qa = plugin("ChenRuoT/dsh-sidebar-qa", "dsh-sidebar-qa", 0, None);
+        sidebar_qa.install = Some(MarketInstallInfo {
+            method: Some("pnpm-profile".into()),
+            needs_config: Some(false),
+            commands: vec![
+                "dsh plugin --profile web add dsh-better-sidebar@latest".into(),
+                "dsh plugin --profile web add dsh-sidebar-qa".into(),
+                "dsh plugin --profile web add <本仓库路径>".into(),
+            ],
+        });
+        assert_eq!(
+            install_package_name(&sidebar_qa),
+            Some("dsh-sidebar-qa".into())
+        );
 
         // Some plugins bootstrap a custom profile by installing the shared
         // web surface and their own package in one command. The marketplace
@@ -5274,6 +5367,91 @@ mod tests {
         let catalog = catalog(vec![first, second]);
         let index = PluginIndex::build(Some(&catalog));
         assert_eq!(index.by_package.get("shared"), Some(&None));
+    }
+
+    #[test]
+    fn installed_repository_disambiguates_duplicate_package_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let profile_dir = paths.dsh_home.join("profiles/web");
+        fs::create_dir_all(profile_dir.join("node_modules/shared")).expect("package");
+        fs::write(
+            profile_dir.join("package.json"),
+            br#"{
+              "dependencies":{"shared":"^1.0.0"},
+              "dsh":{"profile":{"bundles":["shared"]}}
+            }"#,
+        )
+        .expect("manifest");
+        fs::write(
+            profile_dir.join("node_modules/shared/package.json"),
+            br#"{
+              "name":"shared",
+              "version":"1.2.3",
+              "repository":"git+https://github.com/two/shared.git"
+            }"#,
+        )
+        .expect("installed package");
+
+        let mut first = plugin("one/shared", "one", 0, None);
+        first.homepage = Some("https://www.npmjs.com/package/shared".into());
+        let mut second = plugin("two/shared", "two", 0, None);
+        second.homepage = Some("https://www.npmjs.com/package/shared".into());
+        let marketplace = Marketplace::new(paths);
+
+        let installed = marketplace.scan_installed(Some(&catalog(vec![first, second])));
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].plugin_id.as_deref(), Some("two/shared"));
+        assert_eq!(installed[0].version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn installed_scan_prefers_the_package_owner_over_prerequisite_mentions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let profile_dir = paths.dsh_home.join("profiles/web");
+        fs::create_dir_all(&profile_dir).expect("profile");
+        fs::write(
+            profile_dir.join("package.json"),
+            br#"{
+              "dependencies":{"dsh-better-sidebar":"^0.15.2"},
+              "dsh":{"profile":{"bundles":["dsh-better-sidebar"]}}
+            }"#,
+        )
+        .expect("manifest");
+
+        let mut owner = plugin(
+            "omdsh-dev/DSH-better-sidebar",
+            "DSH-better-sidebar",
+            0,
+            None,
+        );
+        owner.install = Some(MarketInstallInfo {
+            method: Some("pnpm-profile".into()),
+            needs_config: Some(false),
+            commands: vec!["dsh plugin --profile web add dsh-better-sidebar@latest".into()],
+        });
+        let mut consumer = plugin(
+            "gunduziba/dsh-sidebar-open-in-ide",
+            "dsh-sidebar-open-in-ide",
+            0,
+            None,
+        );
+        consumer.install = Some(MarketInstallInfo {
+            method: Some("pnpm-profile".into()),
+            needs_config: Some(false),
+            commands: vec!["dsh plugin --profile web add dsh-better-sidebar".into()],
+        });
+
+        let marketplace = Marketplace::new(paths);
+        let installed = marketplace.scan_installed(Some(&catalog(vec![consumer, owner])));
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].plugin_id.as_deref(),
+            Some("omdsh-dev/DSH-better-sidebar")
+        );
     }
 
     #[cfg(unix)]
