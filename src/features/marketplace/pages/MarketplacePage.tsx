@@ -34,8 +34,10 @@ import {
   formatScore,
   formatStars,
   installedFilterValue,
+  isForceableCompatibilityError,
   isMarketCatalogUnavailable,
   marketCatalogView,
+  marketConflictDetail,
   paginationItems,
   pendingChangeLabels,
   shouldClearPendingVerification,
@@ -204,6 +206,7 @@ export function MarketplacePage() {
   const [conflict, setConflict] = useState<{
     plugin: PluginSummary;
     detail?: string;
+    force: boolean;
   } | null>(null);
   const [uninstallConfirm, setUninstallConfirm] = useState<{
     plugin: PluginSummary;
@@ -553,7 +556,7 @@ export function MarketplacePage() {
     marketApi
       .inspect(plugin.id)
       .then((inspected) => {
-        setConflict({ plugin: inspected });
+        setConflict({ plugin: inspected, force: false });
       })
       .catch((error: unknown) => {
         showTimedError(error, translate);
@@ -563,12 +566,24 @@ export function MarketplacePage() {
       });
   }
 
-  function install(plugin: PluginSummary) {
+  function confirmForcedInstall(plugin: PluginSummary, error: unknown) {
+    setConflict({
+      plugin,
+      detail: marketConflictDetail(error),
+      force: true,
+    });
+  }
+
+  function install(plugin: PluginSummary, force = false) {
     setBusyPlugin(plugin.id);
     marketApi
-      .install(plugin.id, false, plugin.installVersion)
+      .install(plugin.id, force, plugin.installVersion)
       .then((result) => {
         if (!result.ok) {
+          if (!force && isForceableCompatibilityError(result.error)) {
+            confirmForcedInstall(plugin, result.error);
+            return;
+          }
           showTimedError(result.error, translate);
           return;
         }
@@ -608,6 +623,10 @@ export function MarketplacePage() {
         runQuery(query);
       })
       .catch((error: unknown) => {
+        if (!force && isForceableCompatibilityError(error)) {
+          confirmForcedInstall(plugin, error);
+          return;
+        }
         showTimedError(error, translate);
       })
       .finally(() => {
@@ -941,14 +960,15 @@ export function MarketplacePage() {
         <ConfirmInstallDialog
           plugin={conflict.plugin}
           detail={conflict.detail}
+          risky={conflict.force}
           disabled={launcher.marketBusy || busyPlugin !== null}
           onCancel={() => {
             setConflict(null);
           }}
           onConfirm={() => {
-            const plugin = conflict.plugin;
+            const { plugin, force } = conflict;
             setConflict(null);
-            install(plugin);
+            install(plugin, force);
           }}
         />
       )}

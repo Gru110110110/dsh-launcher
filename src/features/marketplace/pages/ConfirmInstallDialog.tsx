@@ -14,12 +14,14 @@ const BINDING_TRANSLATION_KEYS = {
 export function ConfirmInstallDialog({
   plugin,
   detail,
+  risky = false,
   disabled = false,
   onCancel,
   onConfirm,
 }: {
   plugin: PluginSummary;
   detail?: string;
+  risky?: boolean;
   disabled?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
@@ -71,7 +73,9 @@ export function ConfirmInstallDialog({
             {t("market.install.title", { plugin: plugin.name })}
           </h2>
         </header>
-        <p className="market-dialog-copy">{t("market.install.detail")}</p>
+        <p className="market-dialog-copy">
+          {t(risky ? "market.confirm.detail" : "market.install.detail")}
+        </p>
         <p className="market-dialog-copy">
           {t(
             plugin.kind === "skill"
@@ -113,7 +117,9 @@ export function ConfirmInstallDialog({
             disabled={disabled || submitting}
             onClick={confirmOnce}
           >
-            {t("market.install.confirm")}
+            {t(
+              risky ? "market.confirm.installAnyway" : "market.install.confirm",
+            )}
           </button>
         </footer>
       </div>

@@ -5,8 +5,10 @@ import {
   formatScore,
   formatStars,
   installedFilterValue,
+  isForceableCompatibilityError,
   isMarketCatalogUnavailable,
   marketCatalogView,
+  marketConflictDetail,
   paginationItems,
   pendingChangeLabels,
   shouldClearPendingVerification,
@@ -149,6 +151,31 @@ describe("isMarketCatalogUnavailable", () => {
       false,
     );
     expect(isMarketCatalogUnavailable(null)).toBe(false);
+  });
+});
+
+describe("isForceableCompatibilityError", () => {
+  it("allows only compatibility decisions to be force-confirmed", () => {
+    expect(isForceableCompatibilityError({ code: "marketIncompatible" })).toBe(
+      true,
+    );
+    expect(isForceableCompatibilityError({ code: "marketCompatUnknown" })).toBe(
+      true,
+    );
+    expect(
+      isForceableCompatibilityError({ code: "marketSourceMismatch" }),
+    ).toBe(false);
+    expect(isForceableCompatibilityError({ code: "marketSourceUnknown" })).toBe(
+      false,
+    );
+  });
+
+  it("extracts only a non-empty safe conflict detail", () => {
+    expect(marketConflictDetail({ safeDetail: "requires cordis ^5" })).toBe(
+      "requires cordis ^5",
+    );
+    expect(marketConflictDetail({ safeDetail: "" })).toBeUndefined();
+    expect(marketConflictDetail(null)).toBeUndefined();
   });
 });
 

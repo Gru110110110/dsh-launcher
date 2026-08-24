@@ -158,3 +158,15 @@ export function isMarketCatalogUnavailable(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   return (error as { code?: unknown }).code === "marketCatalogUnavailable";
 }
+
+export function isForceableCompatibilityError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "marketIncompatible" || code === "marketCompatUnknown";
+}
+
+export function marketConflictDetail(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const detail = (error as { safeDetail?: unknown }).safeDetail;
+  return typeof detail === "string" && detail.length > 0 ? detail : undefined;
+}

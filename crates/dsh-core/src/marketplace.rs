@@ -812,7 +812,7 @@ impl Marketplace {
     pub fn install(
         &self,
         plugin_id: &str,
-        _force: bool,
+        force: bool,
         expected_version: Option<&str>,
         service_running: bool,
     ) -> AppResult<MarketOperationResult> {
@@ -833,7 +833,7 @@ impl Marketplace {
         let kind = PluginKind::parse(&plugin.kind);
         match kind {
             PluginKind::CordisPlugin => {
-                self.install_cordis(&plugin, _force, expected_version, service_running)
+                self.install_cordis(&plugin, force, expected_version, service_running)
             }
             PluginKind::Skill => self.install_skill(&plugin, expected_version),
         }
@@ -1290,7 +1290,7 @@ impl Marketplace {
     fn install_cordis(
         &self,
         plugin: &MarketPlugin,
-        _force: bool,
+        force: bool,
         expected_version: Option<&str>,
         service_running: bool,
     ) -> AppResult<MarketOperationResult> {
@@ -1303,30 +1303,7 @@ impl Marketplace {
             expected_version,
             verified.package_version.as_deref(),
         )?;
-        match verified.source_binding {
-            SourceBindingStatus::Mismatch => {
-                return Err(AppError::new("marketSourceMismatch")
-                    .value("plugin", &plugin.name)
-                    .detail(verified.source_binding_detail.clone().unwrap_or_default()));
-            }
-            SourceBindingStatus::Unknown | SourceBindingStatus::NotChecked => {
-                return Err(AppError::new("marketSourceUnknown")
-                    .value("plugin", &plugin.name)
-                    .detail(verified.source_binding_detail.clone().unwrap_or_default()));
-            }
-            SourceBindingStatus::Verified => {}
-        }
-        match verified.info.status {
-            CompatibilityStatus::Incompatible => {
-                return Err(AppError::new("marketIncompatible")
-                    .value("plugin", &plugin.name)
-                    .detail(verified.info.detail.clone().unwrap_or_default()));
-            }
-            CompatibilityStatus::Unknown | CompatibilityStatus::NotChecked => {
-                return Err(AppError::new("marketCompatUnknown").value("plugin", &plugin.name));
-            }
-            CompatibilityStatus::Compatible => {}
-        }
+        validate_install_metadata(&plugin.name, force, &verified)?;
         let pkg = install_package_name(plugin).ok_or_else(|| {
             AppError::new("marketInstallFailed")
                 .value("plugin", &plugin.name)
@@ -3328,6 +3305,38 @@ fn evaluate_cordis_compatibility(
     }
 }
 
+fn validate_install_metadata(
+    plugin_name: &str,
+    force: bool,
+    verified: &CachedCompatibility,
+) -> AppResult<()> {
+    match verified.source_binding {
+        SourceBindingStatus::Mismatch => {
+            return Err(AppError::new("marketSourceMismatch")
+                .value("plugin", plugin_name)
+                .detail(verified.source_binding_detail.clone().unwrap_or_default()));
+        }
+        SourceBindingStatus::Unknown | SourceBindingStatus::NotChecked => {
+            return Err(AppError::new("marketSourceUnknown")
+                .value("plugin", plugin_name)
+                .detail(verified.source_binding_detail.clone().unwrap_or_default()));
+        }
+        SourceBindingStatus::Verified => {}
+    }
+    if force {
+        return Ok(());
+    }
+    match verified.info.status {
+        CompatibilityStatus::Incompatible => Err(AppError::new("marketIncompatible")
+            .value("plugin", plugin_name)
+            .detail(verified.info.detail.clone().unwrap_or_default())),
+        CompatibilityStatus::Unknown | CompatibilityStatus::NotChecked => {
+            Err(AppError::new("marketCompatUnknown").value("plugin", plugin_name))
+        }
+        CompatibilityStatus::Compatible => Ok(()),
+    }
+}
+
 fn validate_expected_package_version(
     plugin_name: &str,
     expected: Option<&str>,
@@ -4946,6 +4955,40 @@ mod tests {
             .expect_err("changed dist tag must require a new confirmation");
         assert_eq!(changed.code, "marketPackageChanged");
         assert!(validate_expected_package_version("alpha", None, Some("1.1.0")).is_ok());
+    }
+
+    #[test]
+    fn forced_install_bypasses_only_the_compatibility_gate() {
+        let mut verified = CachedCompatibility {
+            package_name: "alpha".into(),
+            package_version: Some("1.0.0".into()),
+            cordis_version: Some("4.0.1".into()),
+            checked_at_ms: 1,
+            info: CompatibilityInfo {
+                status: CompatibilityStatus::Unknown,
+                detail: None,
+            },
+            source_binding: SourceBindingStatus::Verified,
+            source_binding_detail: None,
+        };
+
+        let blocked = validate_install_metadata("alpha", false, &verified)
+            .expect_err("unknown compatibility must require confirmation");
+        assert_eq!(blocked.code, "marketCompatUnknown");
+        validate_install_metadata("alpha", true, &verified)
+            .expect("forced confirmation must allow unknown compatibility");
+
+        verified.info.status = CompatibilityStatus::Incompatible;
+        let blocked = validate_install_metadata("alpha", false, &verified)
+            .expect_err("incompatible plugin must require confirmation");
+        assert_eq!(blocked.code, "marketIncompatible");
+        validate_install_metadata("alpha", true, &verified)
+            .expect("forced confirmation must allow incompatible metadata");
+
+        verified.source_binding = SourceBindingStatus::Mismatch;
+        let blocked = validate_install_metadata("alpha", true, &verified)
+            .expect_err("force must not bypass repository binding verification");
+        assert_eq!(blocked.code, "marketSourceMismatch");
     }
 
     #[test]
