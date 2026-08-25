@@ -1142,6 +1142,7 @@ mod tests {
         io::Write,
         os::unix::fs::{PermissionsExt, symlink},
         process::{Child, Command, Stdio},
+        sync::{Mutex, MutexGuard},
     };
 
     use tempfile::TempDir;
@@ -1152,6 +1153,14 @@ mod tests {
     struct TestChild(Child);
 
     struct TestGroup(u32);
+
+    static RECOVERY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn recovery_test_lock() -> MutexGuard<'static, ()> {
+        RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     impl Drop for TestGroup {
         fn drop(&mut self) {
@@ -1224,6 +1233,7 @@ mod tests {
 
     #[test]
     fn startup_recovery_stops_every_owned_service_group() {
+        let _serial = recovery_test_lock();
         let (_temp, paths) = fixture();
         let mut first = spawn_service(&paths.node_bin, &paths.dsh_bin);
         let mut second = spawn_service(&paths.node_bin, &paths.dsh_bin);
@@ -1240,6 +1250,7 @@ mod tests {
 
     #[test]
     fn startup_recovery_preserves_a_process_with_different_arguments() {
+        let _serial = recovery_test_lock();
         let (temp, paths) = fixture();
         let other = temp.path().join("other-script");
         fs::write(&other, "while :; do sleep 1; done\n").unwrap();
@@ -1253,6 +1264,7 @@ mod tests {
 
     #[test]
     fn startup_recovery_stops_service_after_its_group_leader_dies() {
+        let _serial = recovery_test_lock();
         let (temp, paths) = fixture();
         let child_pid_file = temp.path().join("orphan.pid");
         let mut command = Command::new("/bin/bash");
