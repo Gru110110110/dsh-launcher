@@ -130,6 +130,36 @@ if (
   );
 }
 
+const marketplaceSource = await read("crates/dsh-core/src/marketplace.rs");
+if (
+  !marketplaceSource.includes(
+    'const MARKET_PUBLIC_BASE: &str = "https://market.dsdesktop.com/v1";',
+  ) ||
+  !marketplaceSource.includes(
+    "const MARKET_PUBLIC_REPOSITORY: &str = MARKET_REPOSITORY;",
+  )
+) {
+  throw new Error(
+    "Desktop marketplace must use the dedicated Cloudflare R2 custom domain",
+  );
+}
+
+const marketplaceWorkflow = await read(".github/workflows/marketplace.yml");
+for (const required of [
+  'cron: "0 23 * * *"',
+  "MARKETPLACE_BUCKET: dsh-launcher-marketplace",
+  "MARKETPLACE_ORIGIN: https://market.dsdesktop.com/v1",
+  "R2_ACCESS_KEY_ID",
+  "R2_SECRET_ACCESS_KEY",
+  "aws s3api put-object",
+  "v1/catalog-$slot.json",
+  "v1/latest.json",
+]) {
+  if (!marketplaceWorkflow.includes(required)) {
+    throw new Error(`Marketplace publication contract is missing: ${required}`);
+  }
+}
+
 const vite = await read("vite.config.ts");
 if (!/publicDir\s*:\s*false/u.test(vite)) {
   throw new Error(

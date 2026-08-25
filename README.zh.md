@@ -16,7 +16,7 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 - Harness 安装实时展示依赖解析、依赖包获取、运行环境写入、验证与启用阶段；npm 长时间无输出时明确说明它可能仍在计算依赖，不会把无日志的计算阶段误判为卡死
 - 稳定的终端 `dsh` 命令，由启动器私有运行环境提供；Harness 安装成功后，应用会把自有 `bin` 目录追加到 macOS 登录与交互式 Shell 配置或 Windows 用户 PATH，不会替换无关的同名命令入口
 - 浏览器选择、系统托盘生命周期、中英双语、浅色/深色/跟随系统主题
-- 插件市场：消费 [dsh-market](https://github.com/2BingLing/dsh-market) 的 `plugins.json`（Rust 拉取、校验与本地缓存，CSP 下不经 Webview 直连），支持中文搜索、类型筛选、排序与分页；cordis 插件通过启动器锁定的 Harness CLI（`plugin --profile web add/remove`，pnpm 缺失时自动装入隔离的固定版本）安装，skill 插件通过校验后的 GitHub tarball 解包进 `dsh-home/skills`，卸载会备份可恢复；安装前按 cordis peerDependencies 给出兼容/不兼容/未知三态提示，安装后以启动验证兜底并在失败时提供一键卸载
+- 插件市场：通过 `market.dsdesktop.com` 每日验证快照消费 [dsh-market](https://github.com/2BingLing/dsh-market) 的 `plugins.json`（Rust 拉取、哈希校验、内容校验与本地缓存，CSP 下不经 Webview 直连），支持中文搜索、类型筛选、排序与分页；cordis 插件通过启动器锁定的 Harness CLI（`plugin --profile web add/remove`，pnpm 缺失时自动装入隔离的固定版本）安装，skill 插件通过校验后的 GitHub tarball 解包进 `dsh-home/skills`，卸载会备份可恢复；安装前按 cordis peerDependencies 给出兼容/不兼容/未知三态提示，安装后以启动验证兜底并在失败时提供一键卸载
 - Harness 更新与带密码学签名的桌面应用更新相互独立；Harness 可选择前台更新并显示进度，也可在当前服务继续运行时于后台准备经过校验的候选版本。后台准备完成后由用户确认切换；若此时退出应用，下次启动会自动切换
 
 Python/PyInstaller 版本无法识别 Tauri 更新产物。老用户需要手动安装第一版 Tauri 应用；新应用会直接复用兼容的 `~/.dsh-desktop` 目录。此后只在后台检查并先提示新版本，不会提前下载。用户确认后，后端会连续完成签名包下载、安装、安全停止 Harness 与重启。
@@ -70,7 +70,7 @@ CC Switch 只是可选的只读来源。导入器以只读方式打开 `cc-switc
 
 Harness 更新继续复用私有 npm 下载缓存，但会在安装前后检查 `cache/npm`，达到 1 GiB 就立即清理。旧版 Node 归档及中断的归档下载也会清退，仅保留当前已校验 Node 归档供复用。`install.log` 与 `server.log` 各自限制为 16 MiB。这些策略不会触碰 `dsh-home`、配置、会话或凭据。运行环境平时只保留当前版本和一个上一版本用于回滚；后台更新准备完成、尚未切换时会额外保留一个隔离且已校验的候选版本。
 
-插件市场数据只读消费 dsh-market 目录，缓存于 `cache/marketplace` 并按 `generatedAt` 每日刷新。每次刷新都会解析不可变的 GitHub commit，验证其历史仍继承自当前发行版内置的信任锚点，再按该 commit 下载目录并记录 SHA-256；不安全条目会被逐条隔离。安装与卸载全部落在隔离的 `dsh-home`：Cordis 变更先在完整候选 profile 中构建并校验，再以目录级事务发布；skill 卸载只把用户明确选择的目录移入 `cache/marketplace/trash`。安装前会即时解析并锁定确切 npm 版本或 Skill 提交，校验 npm `repository` 和目录来源字段与所展示 GitHub ID 的绑定，并展示来源、目标、版本、绑定状态和执行风险；卸载只影响明确选中的 profile 或技能副本。
+插件市场数据只读消费 dsh-market 目录，缓存于 `cache/marketplace` 并按 `generatedAt` 每日刷新。北京时间每天 07:00，公开仓库工作流解析不可变的 GitHub commit，验证其历史仍继承自内置信任锚点，校验目录后发布为受限双槽 R2 快照。客户端只访问 `market.dsdesktop.com`，核验清单大小和 SHA-256，刷新失败时保留最后一次验证成功的缓存；不安全条目会被逐条隔离。安装与卸载全部落在隔离的 `dsh-home`：Cordis 变更先在完整候选 profile 中构建并校验，再以目录级事务发布；skill 卸载只把用户明确选择的目录移入 `cache/marketplace/trash`。安装前会即时解析并锁定确切 npm 版本或 Skill 提交，校验 npm `repository` 和目录来源字段与所展示 GitHub ID 的绑定，并展示来源、目标、版本、绑定状态和执行风险；卸载只影响明确选中的 profile 或技能副本。
 
 ## 开发
 
@@ -96,7 +96,9 @@ pnpm tauri dev
 
 `pnpm bindings` 从 Rust 领域类型生成 [bindings.ts](src/platform/generated/bindings.ts)。生成结果需要提交，CI 会检查重新生成后没有差异。`pnpm deadcode` 约束前端依赖边界，严格 Clippy 对 Rust 执行同类约束。
 
-仓库根目录的 `public/` 是独立官网。Vite 配置了 `publicDir: false`，官网与桌面资源不会意外混入彼此。官网代码继续使用原生 HTML/CSS/JavaScript。Cloudflare Workers Builds 应将根目录设为 `public`、构建命令留空、部署命令设为 `npx wrangler deploy`。Worker 会在 `/latest.json` 代理已发布的 GitHub 更新清单；客户端优先请求此端点，失败后直接回退 GitHub。更新包及其强制签名仍是 GitHub Release 产物。`pnpm cloudflare:check` 会守护这一约定与全部本地资源，且不改变现有自动部署路径。
+仓库根目录的 `public/` 是独立官网。Vite 配置了 `publicDir: false`，官网与桌面资源不会意外混入彼此。官网代码继续使用原生 HTML/CSS/JavaScript。Cloudflare Workers Builds 应将根目录设为 `public`、构建命令留空、部署命令设为 `npx wrangler deploy`。Worker 会在 `/latest.json` 代理已发布的 GitHub 更新清单；客户端优先请求此端点，失败后直接回退 GitHub。更新包及其强制签名仍是 GitHub Release 产物。独立的 Standard 类 R2 桶 `dsh-launcher-marketplace` 通过 `market.dsdesktop.com` 只读公开，关闭 `r2.dev` 并为 JSON 配置缓存规则。市场发布通过 S3 兼容 API 使用桶级最小权限的 `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY` 与 `CLOUDFLARE_ACCOUNT_ID`；固定的 `latest.json`、`catalog-a.json`、`catalog-b.json` 控制存储增长并保持在预计免费额度内。`pnpm cloudflare:check` 会守护这些约定与全部本地资源，且不改变现有自动部署路径。
+
+配置市场发布通道时，创建 Standard 存储类的上述桶，只连接 `market.dsdesktop.com` 自定义域名并关闭 `r2.dev`，再为 `/v1/*.json` 添加 Cache Everything 规则且让完整查询参数参与缓存键。设置较低的 R2 预算提醒，创建只允许该桶 Object Read & Write 的 R2 令牌，将访问密钥、秘密密钥和账户 ID 添加为 Actions secrets，随后手动运行一次 **Publish Plugin Marketplace** 并设置 `bootstrap=true`。后续定时任务通过已认证的 S3 兼容 R2 API 直接读取 `latest.json`，不会使用可能滞后的 CDN 响应。
 
 ## 发布与签名
 

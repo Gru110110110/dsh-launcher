@@ -159,6 +159,25 @@ export function isMarketCatalogUnavailable(error: unknown): boolean {
   return (error as { code?: unknown }).code === "marketCatalogUnavailable";
 }
 
+export function isRetryableMarketRefreshError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || Array.isArray(error)) {
+    return false;
+  }
+  const candidate = error as {
+    code?: unknown;
+    values?: unknown;
+  };
+  if (
+    candidate.code !== "marketCatalogServiceUnavailable" ||
+    typeof candidate.values !== "object" ||
+    candidate.values === null ||
+    Array.isArray(candidate.values)
+  ) {
+    return false;
+  }
+  return (candidate.values as Record<string, unknown>).retryable === "true";
+}
+
 export function isForceableCompatibilityError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const code = (error as { code?: unknown }).code;

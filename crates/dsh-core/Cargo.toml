@@ -25,6 +25,7 @@ sys-locale.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+time.workspace = true
 ts-rs.workspace = true
 url.workspace = true
 uuid.workspace = true

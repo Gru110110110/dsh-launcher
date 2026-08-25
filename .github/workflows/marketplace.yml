@@ -1,0 +1,131 @@
+name: Publish Plugin Marketplace
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: Allow the first publication when latest.json does not exist
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # GitHub cron is UTC: 23:00 UTC is 07:00 the next day in Asia/Shanghai.
+    - cron: "0 23 * * *"
+
+concurrency:
+  group: marketplace-publication
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MARKETPLACE_BUCKET: dsh-launcher-marketplace
+  MARKETPLACE_ORIGIN: https://market.dsdesktop.com/v1
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255d43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: marketplace-sync
+          cache-on-failure: true
+      - name: Configure isolated data homes
+        run: |
+          echo "DSH_DESKTOP_HOME=$RUNNER_TEMP/dsh-desktop-market-sync" >> "$GITHUB_ENV"
+          echo "DSH_HOME=$RUNNER_TEMP/dsh-home-market-sync" >> "$GITHUB_ENV"
+          echo "DSH_DESKTOP_SOURCE_HOME=$RUNNER_TEMP/dsh-source-market-sync" >> "$GITHUB_ENV"
+          echo "DSH_DESKTOP_CC_SWITCH_HOME=$RUNNER_TEMP/cc-switch-market-sync" >> "$GITHUB_ENV"
+      - name: Read current publication
+        id: current
+        env:
+          BOOTSTRAP: ${{ inputs.bootstrap || 'false' }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/marketplace-current" "$RUNNER_TEMP/marketplace-next"
+          key="v1/latest.json"
+          if aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$MARKETPLACE_BUCKET" \
+            --key "$key" \
+            --no-cli-pager \
+            "$RUNNER_TEMP/marketplace-current/latest.json"; then
+            echo "current=$RUNNER_TEMP/marketplace-current/latest.json" >> "$GITHUB_OUTPUT"
+          elif [[ "$BOOTSTRAP" == "true" ]]; then
+            rm -f "$RUNNER_TEMP/marketplace-current/latest.json"
+            echo "Bootstrapping an empty marketplace bucket"
+          else
+            echo "Unable to read the current publication; use the bootstrap input only for an empty bucket" >&2
+            exit 1
+          fi
+      - name: Prepare trusted publication
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          args=("$RUNNER_TEMP/marketplace-next")
+          if [[ -n "${{ steps.current.outputs.current }}" ]]; then
+            args+=("${{ steps.current.outputs.current }}")
+          fi
+          output="$(cargo run --quiet -p dsh-core --example marketplace_sync -- "${args[@]}")"
+          echo "$output"
+          if [[ "$output" == unchanged ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            slot="$(node -e 'const m=require(process.argv[1]); process.stdout.write(m.slot)' "$RUNNER_TEMP/marketplace-next/latest.json")"
+            echo "slot=$slot" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish inactive catalog slot
+        if: steps.prepare.outputs.changed == 'true'
+        shell: bash
+        run: |
+          slot="${{ steps.prepare.outputs.slot }}"
+          source="$RUNNER_TEMP/marketplace-next/catalog-$slot.json"
+          key="v1/catalog-$slot.json"
+          aws s3api put-object \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$MARKETPLACE_BUCKET" \
+            --key "$key" \
+            --body "$source" \
+            --content-type "application/json; charset=utf-8" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --no-cli-pager
+          aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$MARKETPLACE_BUCKET" \
+            --key "$key" \
+            --no-cli-pager \
+            "$RUNNER_TEMP/marketplace-current/catalog-$slot.json"
+          cmp "$source" "$RUNNER_TEMP/marketplace-current/catalog-$slot.json"
+      - name: Publish manifest last
+        if: steps.prepare.outputs.changed == 'true'
+        shell: bash
+        run: |
+          source="$RUNNER_TEMP/marketplace-next/latest.json"
+          key="v1/latest.json"
+          aws s3api put-object \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$MARKETPLACE_BUCKET" \
+            --key "$key" \
+            --body "$source" \
+            --content-type "application/json; charset=utf-8" \
+            --cache-control "public, max-age=300, s-maxage=3600, stale-if-error=86400" \
+            --no-cli-pager
+          aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$MARKETPLACE_BUCKET" \
+            --key "$key" \
+            --no-cli-pager \
+            "$RUNNER_TEMP/marketplace-current/published-latest.json"
+          cmp "$source" "$RUNNER_TEMP/marketplace-current/published-latest.json"

@@ -7,6 +7,7 @@ import {
   installedFilterValue,
   isForceableCompatibilityError,
   isMarketCatalogUnavailable,
+  isRetryableMarketRefreshError,
   marketCatalogView,
   marketConflictDetail,
   paginationItems,
@@ -151,6 +152,26 @@ describe("isMarketCatalogUnavailable", () => {
       false,
     );
     expect(isMarketCatalogUnavailable(null)).toBe(false);
+  });
+});
+
+describe("isRetryableMarketRefreshError", () => {
+  it("retries only transient marketplace service failures", () => {
+    expect(
+      isRetryableMarketRefreshError({
+        code: "marketCatalogServiceUnavailable",
+        values: { retryable: "true" },
+      }),
+    ).toBe(true);
+    expect(
+      isRetryableMarketRefreshError({
+        code: "marketCatalogServiceUnavailable",
+        values: { retryable: "false" },
+      }),
+    ).toBe(false);
+    expect(
+      isRetryableMarketRefreshError({ code: "marketCatalogInvalid" }),
+    ).toBe(false);
   });
 });
 

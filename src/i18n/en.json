@@ -327,6 +327,7 @@
   "market.empty": "No plugins match the current filters.",
   "error.marketCatalogUnavailable": "The plugin catalog is not ready yet; refresh it first",
   "error.marketNetworkFailed": "Could not reach the plugin market data source; check your network and try again",
+  "error.marketCatalogServiceUnavailable": "Could not download the catalog from the plugin market service; try again later",
   "error.marketCatalogInvalid": "The plugin catalog data is invalid: {{detail}}",
   "error.marketPluginNotFound": "Plugin {{plugin}} was not found",
   "error.marketIncompatible": "Plugin {{plugin}} is incompatible with this Harness: {{detail}}",

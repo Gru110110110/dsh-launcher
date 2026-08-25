@@ -36,6 +36,7 @@ import {
   installedFilterValue,
   isForceableCompatibilityError,
   isMarketCatalogUnavailable,
+  isRetryableMarketRefreshError,
   marketCatalogView,
   marketConflictDetail,
   paginationItems,
@@ -539,7 +540,10 @@ export function MarketplacePage() {
         // First downloads can fail on slow networks; retry once before
         // asking the user to intervene.
         showTimedError(error, translate);
-        if (refreshAttempt.current < 1) {
+        if (
+          refreshAttempt.current < 1 &&
+          isRetryableMarketRefreshError(error)
+        ) {
           refreshAttempt.current += 1;
           refreshRetryTimer.current = window.setTimeout(() => {
             refresh();

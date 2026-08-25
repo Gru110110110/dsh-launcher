@@ -327,6 +327,7 @@
   "market.empty": "没有符合筛选条件的插件。",
   "error.marketCatalogUnavailable": "插件目录尚未就绪，请先刷新目录",
   "error.marketNetworkFailed": "无法连接插件市场数据源，请检查网络后重试",
+  "error.marketCatalogServiceUnavailable": "无法从插件市场静态服务获取目录，请稍后重试",
   "error.marketCatalogInvalid": "插件目录数据无效：{{detail}}",
   "error.marketPluginNotFound": "找不到插件 {{plugin}}",
   "error.marketIncompatible": "插件 {{plugin}} 与当前 Harness 不兼容：{{detail}}",

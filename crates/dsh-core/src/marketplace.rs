@@ -47,6 +47,9 @@ const MARKET_BRANCH: &str = "master";
 /// must remain descendants of this reviewed repository commit; force-pushed
 /// or repository-replaced histories are rejected.
 const MARKET_TRUST_ANCHOR: &str = "298e815d77412ea57eeb0ecc56fa2b4e4683d194";
+const MARKET_PUBLIC_BASE: &str = "https://market.dsdesktop.com/v1";
+const MARKET_PUBLIC_REPOSITORY: &str = MARKET_REPOSITORY;
+const MARKET_MANIFEST_MAX_BYTES: usize = 64 * 1024;
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const GITHUB_API: &str = "https://api.github.com";
 const DEFAULT_PROFILE: &str = "web";
@@ -473,6 +476,42 @@ struct CatalogTrustMeta {
     sha256: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketPublicationManifest {
+    pub schema_version: u32,
+    pub repository: String,
+    pub branch: String,
+    pub commit: String,
+    pub trust_anchor: String,
+    pub slot: String,
+    pub generated_at: Option<String>,
+    pub published_at: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedMarketPublication {
+    pub manifest: MarketPublicationManifest,
+    pub catalog: Vec<u8>,
+}
+
+impl PreparedMarketPublication {
+    pub fn write_to(&self, directory: &Path) -> AppResult<()> {
+        fs::create_dir_all(directory)?;
+        crate::paths::atomic_write(
+            &directory.join(format!("catalog-{}.json", self.manifest.slot)),
+            &self.catalog,
+        )?;
+        crate::paths::atomic_write(
+            &directory.join("latest.json"),
+            &serde_json::to_vec_pretty(&self.manifest)?,
+        )?;
+        Ok(())
+    }
+}
+
 fn cached_compatibility_is_valid(
     cached: &CachedCompatibility,
     package_name: &str,
@@ -635,8 +674,8 @@ impl Marketplace {
                         .clone()
                         .unwrap_or_else(|| error.code.clone()),
                 );
+                log::warn!("market catalog refresh failed: {error}");
                 if self.catalog.lock().expect("catalog poisoned").is_some() {
-                    log::warn!("market catalog refresh failed, keeping cached data: {error}");
                     self.ok_catalog_state(true)
                 } else {
                     Err(error)
@@ -684,7 +723,7 @@ impl Marketplace {
     }
 
     fn fetch_and_store(&self) -> AppResult<()> {
-        let (bytes, trust) = fetch_trusted_catalog()?;
+        let (bytes, trust) = fetch_published_catalog()?;
         let mut catalog: MarketCatalogFile = serde_json::from_slice(&bytes)
             .map_err(|error| AppError::new("marketCatalogInvalid").detail(error.to_string()))?;
         sanitize_catalog(&mut catalog)?;
@@ -3029,6 +3068,131 @@ fn http_client() -> AppResult<reqwest::blocking::Client> {
         .map_err(|error| AppError::new("marketNetworkFailed").detail(error.to_string()))
 }
 
+fn github_sync_client(token: &str) -> AppResult<reqwest::blocking::Client> {
+    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+
+    if token.trim().is_empty() {
+        return Err(AppError::new("marketSyncTokenMissing"));
+    }
+    let mut headers = HeaderMap::new();
+    let authorization = HeaderValue::from_str(&format!("Bearer {}", token.trim()))
+        .map_err(|_| AppError::new("marketSyncTokenInvalid"))?;
+    headers.insert(AUTHORIZATION, authorization);
+    reqwest::blocking::Client::builder()
+        .user_agent(format!(
+            "DSH-Launcher-Market-Sync/{}",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .default_headers(headers)
+        .build()
+        .map_err(|error| AppError::new("marketNetworkFailed").detail(error.to_string()))
+}
+
+fn market_service_error(error: reqwest::Error) -> AppError {
+    let status = error.status();
+    let retryable = status.is_none_or(|status| status.is_server_error());
+    let mut app_error = AppError::new("marketCatalogServiceUnavailable")
+        .value("source", "market.dsdesktop.com")
+        .value("retryable", retryable)
+        .detail(error.to_string());
+    if let Some(status) = status {
+        app_error = app_error.value("status", status.as_u16());
+    }
+    app_error
+}
+
+fn fetch_market_service_bytes(
+    url: &str,
+    timeout: Duration,
+    max_bytes: usize,
+) -> AppResult<Vec<u8>> {
+    let client = http_client().map_err(|error| {
+        AppError::new("marketCatalogServiceUnavailable")
+            .value("source", "market.dsdesktop.com")
+            .value("retryable", true)
+            .detail(error.to_string())
+    })?;
+    let response = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .map_err(market_service_error)?
+        .error_for_status()
+        .map_err(market_service_error)?;
+    if let Some(length) = response.content_length()
+        && usize::try_from(length).unwrap_or(usize::MAX) > max_bytes
+    {
+        return Err(
+            AppError::new("marketCatalogInvalid").detail("market response exceeds the size limit")
+        );
+    }
+    let mut bytes = Vec::new();
+    response
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            AppError::new("marketCatalogServiceUnavailable")
+                .value("source", "market.dsdesktop.com")
+                .value("retryable", true)
+                .detail(error.to_string())
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(
+            AppError::new("marketCatalogInvalid").detail("market response exceeds the size limit")
+        );
+    }
+    Ok(bytes)
+}
+
+fn valid_catalog_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+}
+
+fn validate_publication_manifest(manifest: &MarketPublicationManifest) -> AppResult<()> {
+    if manifest.schema_version != 1
+        || manifest.repository != MARKET_PUBLIC_REPOSITORY
+        || manifest.branch != MARKET_BRANCH
+        || manifest.trust_anchor != MARKET_TRUST_ANCHOR
+        || !matches!(manifest.slot.as_str(), "a" | "b")
+        || !valid_commit_sha(&manifest.commit)
+        || !valid_catalog_sha256(&manifest.sha256)
+        || manifest.size == 0
+        || manifest.size > CATALOG_MAX_BYTES as u64
+    {
+        return Err(AppError::new("marketCatalogInvalid")
+            .detail("market publication manifest failed validation"));
+    }
+    Ok(())
+}
+
+fn fetch_published_catalog() -> AppResult<(Vec<u8>, CatalogTrustMeta)> {
+    let manifest_url = format!("{MARKET_PUBLIC_BASE}/latest.json");
+    let manifest_bytes =
+        fetch_market_service_bytes(&manifest_url, REGISTRY_TIMEOUT, MARKET_MANIFEST_MAX_BYTES)?;
+    let manifest: MarketPublicationManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| AppError::new("marketCatalogInvalid").detail(error.to_string()))?;
+    validate_publication_manifest(&manifest)?;
+    let catalog_url = format!(
+        "{MARKET_PUBLIC_BASE}/catalog-{}.json?sha256={}",
+        manifest.slot, manifest.sha256
+    );
+    let bytes = fetch_market_service_bytes(&catalog_url, CATALOG_FETCH_TIMEOUT, CATALOG_MAX_BYTES)?;
+    if bytes.len() as u64 != manifest.size || sha256_bytes(&bytes) != manifest.sha256 {
+        return Err(AppError::new("marketCatalogInvalid")
+            .detail("published catalog length or SHA-256 does not match its manifest"));
+    }
+    Ok((
+        bytes,
+        CatalogTrustMeta {
+            commit: manifest.commit,
+            sha256: manifest.sha256,
+        },
+    ))
+}
+
 fn fetch_bytes(
     url: &str,
     timeout: Duration,
@@ -3080,9 +3244,12 @@ fn fetch_bytes_with(
     Ok(bytes)
 }
 
-fn fetch_trusted_catalog() -> AppResult<(Vec<u8>, CatalogTrustMeta)> {
+fn fetch_trusted_catalog_with(
+    client: &reqwest::blocking::Client,
+) -> AppResult<(Vec<u8>, CatalogTrustMeta)> {
     let commit_url = format!("{GITHUB_API}/repos/{MARKET_REPOSITORY}/commits/{MARKET_BRANCH}");
-    let commit_bytes = fetch_bytes(
+    let commit_bytes = fetch_bytes_with(
+        Some(client),
         &commit_url,
         REGISTRY_TIMEOUT,
         2 * 1024 * 1024,
@@ -3100,7 +3267,8 @@ fn fetch_trusted_catalog() -> AppResult<(Vec<u8>, CatalogTrustMeta)> {
         let compare_url = format!(
             "{GITHUB_API}/repos/{MARKET_REPOSITORY}/compare/{MARKET_TRUST_ANCHOR}...{head}"
         );
-        let compare_bytes = fetch_bytes(
+        let compare_bytes = fetch_bytes_with(
+            Some(client),
             &compare_url,
             REGISTRY_TIMEOUT,
             16 * 1024 * 1024,
@@ -3113,6 +3281,9 @@ fn fetch_trusted_catalog() -> AppResult<(Vec<u8>, CatalogTrustMeta)> {
 
     let catalog_url =
         format!("https://raw.githubusercontent.com/{MARKET_REPOSITORY}/{head}/data/plugins.json");
+    // Never forward the GitHub Actions token to the raw-content host. The
+    // public immutable object needs no authentication; only REST metadata
+    // calls use the scoped token above.
     let bytes = fetch_bytes(
         &catalog_url,
         CATALOG_FETCH_TIMEOUT,
@@ -3125,6 +3296,60 @@ fn fetch_trusted_catalog() -> AppResult<(Vec<u8>, CatalogTrustMeta)> {
         sha256: sha256_bytes(&bytes),
     };
     Ok((bytes, trust))
+}
+
+pub fn prepare_marketplace_publication(
+    current_manifest: Option<&[u8]>,
+    github_token: &str,
+) -> AppResult<Option<PreparedMarketPublication>> {
+    let client = github_sync_client(github_token)?;
+    let (catalog, trust) = fetch_trusted_catalog_with(&client)?;
+    build_marketplace_publication(&catalog, trust, current_manifest)
+}
+
+fn build_marketplace_publication(
+    catalog: &[u8],
+    trust: CatalogTrustMeta,
+    current_manifest: Option<&[u8]>,
+) -> AppResult<Option<PreparedMarketPublication>> {
+    let parsed: MarketCatalogFile = serde_json::from_slice(catalog)
+        .map_err(|error| AppError::new("marketCatalogInvalid").detail(error.to_string()))?;
+    let generated_at = parsed.generated_at.clone();
+    let mut sanitized = parsed;
+    sanitize_catalog(&mut sanitized)?;
+
+    let current = current_manifest
+        .map(serde_json::from_slice::<MarketPublicationManifest>)
+        .transpose()
+        .map_err(|error| AppError::new("marketCatalogInvalid").detail(error.to_string()))?;
+    if let Some(current) = current.as_ref() {
+        validate_publication_manifest(current)?;
+        if current.commit == trust.commit && current.sha256 == trust.sha256 {
+            return Ok(None);
+        }
+    }
+    let slot = match current.as_ref().map(|manifest| manifest.slot.as_str()) {
+        Some("a") => "b",
+        _ => "a",
+    };
+    let published_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| AppError::new("marketPublicationFailed").detail(error.to_string()))?;
+    Ok(Some(PreparedMarketPublication {
+        manifest: MarketPublicationManifest {
+            schema_version: 1,
+            repository: MARKET_PUBLIC_REPOSITORY.into(),
+            branch: MARKET_BRANCH.into(),
+            commit: trust.commit,
+            trust_anchor: MARKET_TRUST_ANCHOR.into(),
+            slot: slot.into(),
+            generated_at,
+            published_at,
+            sha256: trust.sha256,
+            size: catalog.len() as u64,
+        },
+        catalog: catalog.to_vec(),
+    }))
 }
 
 fn validate_catalog_lineage(_head: &str, compare: &serde_json::Value) -> AppResult<()> {
@@ -5644,5 +5869,62 @@ mod tests {
         );
         crate::paths::atomic_write(&marketplace.catalog_file(), b"{}").expect("tamper");
         assert!(marketplace.load_cached_catalog().is_err());
+    }
+
+    #[test]
+    fn publication_manifest_rejects_an_untrusted_source_or_slot() {
+        let mut manifest = MarketPublicationManifest {
+            schema_version: 1,
+            repository: MARKET_REPOSITORY.into(),
+            branch: MARKET_BRANCH.into(),
+            commit: MARKET_TRUST_ANCHOR.into(),
+            trust_anchor: MARKET_TRUST_ANCHOR.into(),
+            slot: "a".into(),
+            generated_at: None,
+            published_at: "2026-08-25T00:00:00Z".into(),
+            sha256: "a".repeat(64),
+            size: 1,
+        };
+        validate_publication_manifest(&manifest).expect("valid publication");
+        manifest.repository = "attacker/market".into();
+        assert!(validate_publication_manifest(&manifest).is_err());
+        manifest.repository = MARKET_REPOSITORY.into();
+        manifest.slot = "../catalog".into();
+        assert!(validate_publication_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn publication_rotates_slots_and_skips_an_unchanged_commit() {
+        let bytes = br#"{
+          "schemaVersion": 2,
+          "generatedAt": "2026-08-25T00:00:00Z",
+          "plugins": [{
+            "id": "x/y", "type": "cordis-plugin", "name": "y",
+            "owner": "x", "repo": "y", "fullName": "x/y",
+            "homepage": "https://www.npmjs.com/package/y"
+          }]
+        }"#;
+        let trust = CatalogTrustMeta {
+            commit: MARKET_TRUST_ANCHOR.into(),
+            sha256: sha256_bytes(bytes),
+        };
+        let first = build_marketplace_publication(bytes, trust.clone(), None)
+            .expect("publication")
+            .expect("changed");
+        assert_eq!(first.manifest.slot, "a");
+        let current = serde_json::to_vec(&first.manifest).expect("manifest");
+        assert!(
+            build_marketplace_publication(bytes, trust.clone(), Some(&current))
+                .expect("unchanged")
+                .is_none()
+        );
+        let changed_trust = CatalogTrustMeta {
+            commit: "a".repeat(40),
+            sha256: trust.sha256,
+        };
+        let second = build_marketplace_publication(bytes, changed_trust, Some(&current))
+            .expect("publication")
+            .expect("changed");
+        assert_eq!(second.manifest.slot, "b");
     }
 }
