@@ -73,14 +73,23 @@
         </div>
         <p class="hero-note reveal" data-i18n="hero.note">macOS（Apple Silicon / Intel）与 Windows x64 · 界面支持中文与 English</p>
 
-        <!-- 主截图 -->
+        <!-- 产品截图：复制一个 hero-shot-card 即可继续扩展 -->
         <div class="hero-shot reveal" id="heroShot">
-          <div class="shot-frame">
-            <div class="shot-bar">
-              <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
-              <span class="shot-title">DSH Launcher</span>
-            </div>
-            <img id="heroImg" src="screenshots/ScreenShot_zh.png" alt="DSH Launcher 主界面截图" width="1520" height="1024" decoding="async" fetchpriority="high" />
+          <div class="hero-shot-grid">
+            <figure class="shot-frame hero-shot-card">
+              <div class="shot-bar">
+                <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
+                <span class="shot-title" data-i18n="shots.main">启动器</span>
+              </div>
+              <img src="screenshots/ScreenShot_zh.png" data-screenshot-zh="screenshots/ScreenShot_zh.png" data-screenshot-en="screenshots/ScreenShot_en.png" data-i18n-alt="shots.mainAlt" alt="DSH Launcher 主界面截图" width="2360" height="1464" decoding="async" fetchpriority="high" />
+            </figure>
+            <figure class="shot-frame hero-shot-card">
+              <div class="shot-bar">
+                <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
+                <span class="shot-title" data-i18n="shots.plugin">插件市场</span>
+              </div>
+              <img src="screenshots/ScreenShot_plugin_zh.png" data-screenshot-zh="screenshots/ScreenShot_plugin_zh.png" data-screenshot-en="screenshots/ScreenShot_plugin_en.png" data-i18n-alt="shots.pluginAlt" alt="DSH Launcher 插件市场页面截图" width="2360" height="1462" decoding="async" fetchpriority="high" />
+            </figure>
           </div>
         </div>
       </div>
@@ -158,7 +167,7 @@
         <h2 class="section-title reveal" data-i18n-html="shots.title">桌面只管启动，<span class="grad">工作发生在浏览器</span></h2>
         <div class="shot-gallery">
           <figure class="reveal">
-            <img src="screenshots/ScreenShot_zh.png" alt="DSH Launcher 中文界面" width="1520" height="1024" loading="lazy" decoding="async" />
+            <img src="screenshots/ScreenShot_zh.png" data-screenshot-zh="screenshots/ScreenShot_zh.png" data-screenshot-en="screenshots/ScreenShot_en.png" data-i18n-alt="shots.mainAlt" alt="DSH Launcher 主界面截图" width="2360" height="1464" loading="lazy" decoding="async" />
             <figcaption data-i18n="shots.c1">启动器窗口 · 中文界面（可在侧栏随时切换 English）</figcaption>
           </figure>
           <figure class="reveal">

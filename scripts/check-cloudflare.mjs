@@ -142,6 +142,7 @@ const css = await read("public/style.css");
 const main = await read("public/main.js");
 const references = [
   ...html.matchAll(/\b(?:href|src)="([^"]+)"/gu),
+  ...html.matchAll(/\bdata-screenshot-(?:zh|en)="([^"]+)"/gu),
   ...css.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gu),
 ].map((match) => match[1]);
 
@@ -186,7 +187,7 @@ if (JSON.stringify(zhKeys) !== JSON.stringify(enKeys)) {
     "Website Chinese and English dictionaries have different keys",
   );
 }
-for (const match of html.matchAll(/data-i18n(?:-html)?="([^"]+)"/gu)) {
+for (const match of html.matchAll(/data-i18n(?:-html|-alt)?="([^"]+)"/gu)) {
   if (!(match[1] in dictionary.zh) || !(match[1] in dictionary.en)) {
     throw new Error(`Website translation is missing: ${match[1]}`);
   }

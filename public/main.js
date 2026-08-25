@@ -52,6 +52,10 @@
 
       "shots.kicker": "界面",
       "shots.title": "桌面只管启动，<span class=\"grad\">工作发生在浏览器</span>",
+      "shots.main": "启动器",
+      "shots.mainAlt": "DSH Launcher 主界面截图",
+      "shots.plugin": "插件市场",
+      "shots.pluginAlt": "DSH Launcher 插件市场页面截图",
       "shots.c1": "启动器窗口 · 中文界面（可在侧栏随时切换 English）",
       "shots.c2": "浏览器里的官方 Web UI · 完整模型与会话能力",
 
@@ -141,7 +145,11 @@
 
       "shots.kicker": "Interface",
       "shots.title": "The desktop launches; <span class=\"grad\">work happens in the browser</span>",
-      "shots.c1": "Launcher window · Chinese UI (switch to English anytime in the sidebar)",
+      "shots.main": "Launcher",
+      "shots.mainAlt": "DSH Launcher main window screenshot",
+      "shots.plugin": "Plugin marketplace",
+      "shots.pluginAlt": "DSH Launcher plugin marketplace screenshot",
+      "shots.c1": "Launcher window · English UI (switch to 中文 anytime in the sidebar)",
       "shots.c2": "The official Web UI in the browser · full model and session capabilities",
 
       "feat.kicker": "Features",
@@ -226,16 +234,15 @@
       if (dict[key] !== undefined) el.innerHTML = dict[key];
     });
 
-    // 主截图跟随语言
-    var heroImg = document.getElementById("heroImg");
-    if (heroImg) {
-      heroImg.src = lang === "zh"
-        ? "screenshots/ScreenShot_zh.png"
-        : "screenshots/ScreenShot_en.png";
-      heroImg.alt = lang === "zh"
-        ? "DSH Launcher 主界面截图"
-        : "DSH Launcher main window screenshot";
-    }
+    document.querySelectorAll("[data-i18n-alt]").forEach(function (el) {
+      var key = el.getAttribute("data-i18n-alt");
+      if (dict[key] !== undefined) el.alt = dict[key];
+    });
+
+    // 所有产品截图跟随语言；新增截图时只需声明两种语言的路径。
+    document.querySelectorAll("[data-screenshot-zh][data-screenshot-en]").forEach(function (img) {
+      img.src = img.getAttribute("data-screenshot-" + lang);
+    });
 
     var toggle = document.getElementById("langToggle");
     if (toggle) toggle.textContent = lang === "zh" ? "EN" : "中文";
