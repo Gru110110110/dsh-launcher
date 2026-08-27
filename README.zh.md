@@ -94,7 +94,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 pnpm tauri dev
 ```
 
-`pnpm bindings` 从 Rust 领域类型生成 [bindings.ts](src/platform/generated/bindings.ts)。生成结果需要提交，CI 会检查重新生成后没有差异。`pnpm deadcode` 约束前端依赖边界，严格 Clippy 对 Rust 执行同类约束。
+`pnpm bindings` 从 Rust 领域类型生成 [bindings.ts](src/platform/generated/bindings.ts)。生成结果需要提交，并在本机确认重新生成后没有差异。`pnpm deadcode` 约束前端依赖边界，严格 Clippy 对 Rust 执行同类约束。
 
 仓库根目录的 `public/` 是独立官网。Vite 配置了 `publicDir: false`，官网与桌面资源不会意外混入彼此。官网代码继续使用原生 HTML/CSS/JavaScript。Cloudflare Workers Builds 应将根目录设为 `public`、构建命令留空、部署命令设为 `npx wrangler deploy`。Worker 会在 `/latest.json` 代理已发布的 GitHub 更新清单；客户端优先请求此端点，失败后直接回退 GitHub。更新包及其强制签名仍是 GitHub Release 产物。独立的 Standard 类 R2 桶 `dsh-launcher-marketplace` 通过 `market.dsdesktop.com` 只读公开，关闭 `r2.dev` 并为 JSON 配置缓存规则。市场发布通过 S3 兼容 API 使用桶级最小权限的 `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY` 与 `CLOUDFLARE_ACCOUNT_ID`；固定的 `latest.json`、`catalog-a.json`、`catalog-b.json` 控制存储增长并保持在预计免费额度内。`pnpm cloudflare:check` 会守护这些约定与全部本地资源，且不改变现有自动部署路径。
 
@@ -118,7 +118,8 @@ pnpm tauri dev
 
 2. 将私钥和可选密码保存为 GitHub secrets：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
 3. 将 `signer-keys/dsh-launcher-updater.key.pub` 的完整内容保存为 GitHub Actions variable：`TAURI_UPDATER_PUBLIC_KEY`。
-4. 推送 `desktop-v<version>`。CI 会验证两端配置，核对固定 Node/npm 来源，再分别构建并签名 macOS arm64/x64 与 Windows x64 隔离产物，矩阵 job 不直接发布。最后由唯一一个 job 生成包含版本和架构的规范资产名，串行创建干净的 GitHub Release 草稿并上传全部文件，逐项核对安装包、更新归档、签名、manifest 条目和官网精确下载链接，全部通过后才正式发布。构建失败或产物不完整时 Release 会保持未发布状态，因此 `releases/latest/download/latest.json` 与已安装客户端不会看到残缺版本。
+4. 打 tag 前，在临时的 `DSH_DESKTOP_HOME`、`DSH_HOME`、`DSH_DESKTOP_SOURCE_HOME` 和 `DSH_DESKTOP_CC_SWITCH_HOME` 路径下执行完整本机通用门禁：`pnpm versions`、重新生成 bindings 并检查无差异、`pnpm format:check`、`pnpm lint`、`pnpm test`、`pnpm deadcode`、`pnpm cloudflare:check`、`pnpm build`、`cargo fmt --all -- --check`、`cargo test --workspace --all-targets`、`cargo clippy --workspace --all-targets -- -D warnings` 和 `cargo run --quiet -p dsh-core --example release_check`。
+5. 推送 `desktop-v<version>`。CI 只执行发布矩阵需要的原生平台回归测试，Windows 测试留在 Windows 打包 job，macOS 专项测试放在 arm64 Mac job；随后分别构建并签名 macOS arm64/x64 与 Windows x64 隔离产物，矩阵 job 不直接发布。最后由唯一一个 job 生成包含版本和架构的规范资产名，串行创建干净的 GitHub Release 草稿并上传全部文件，逐项核对安装包、更新归档、签名、manifest 条目和官网精确下载链接，全部通过后才正式发布。构建失败或产物不完整时 Release 会保持未发布状态，因此 `releases/latest/download/latest.json` 与已安装客户端不会看到残缺版本。
 
 仓库配置中的 updater 公钥有意留空：本地源码构建不属于生产更新频道。发布 CI 会校验 minisign 公钥格式、写入仅用于本次发布的临时 Tauri 配置，并通过 `--config` 显式交给 CLI；更新信任链任一端缺失都会阻止发布。没有 Developer ID 时，macOS App 会获得完整的 ad-hoc 签名，本地打包与 CI 都会用严格的 `codesign` 校验阻止签名不完整的产物。ad-hoc 签名不等于 Apple 公证：浏览器下载的版本首次启动时仍可能需要用户在 macOS「隐私与安全性」中确认放行；要让任意 Mac 首次启动都不出现身份提示，必须使用 Developer ID Application 证书并完成公证。Windows Authenticode 仍是独立的可选加固，不会降低 Tauri 更新签名的强制要求。
 
