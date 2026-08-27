@@ -37,6 +37,7 @@ if (import.meta.env.DEV && !isTauri) {
     harnessUpdate: { kind: "none" },
     migration: { kind: "notRequired" },
     trayAvailable: true,
+    showBalanceCard: true,
   };
   initializeLauncherPreview(previewSnapshot);
 } else {

@@ -4,6 +4,7 @@
 //! unit tests with isolated homes and by future UI surfaces without coupling
 //! product behavior to a specific window or command handler.
 
+pub mod balance;
 pub mod browser;
 pub mod error;
 pub mod import;

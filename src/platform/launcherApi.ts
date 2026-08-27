@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  BalanceSnapshot,
   HarnessUpdateMode,
   Language,
   LauncherSnapshot,
@@ -36,6 +37,10 @@ export const launcherApi = {
     action("preferences_set_language", { language }),
   setTheme: (theme: ThemePreference) =>
     action("preferences_set_theme", { theme }),
+  setShowBalanceCard: (show: boolean) =>
+    action("preferences_set_show_balance_card", { show }),
+  balanceGetSnapshot: () => command<BalanceSnapshot>("balance_get_snapshot"),
+  balanceRefresh: () => command<BalanceSnapshot>("balance_refresh"),
   checkDesktopUpdate: () => command<string | null>("application_check_update"),
   installDesktopUpdate: () => action("application_install_update"),
   onState: (

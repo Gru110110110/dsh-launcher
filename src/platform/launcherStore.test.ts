@@ -27,6 +27,7 @@ function snapshot(
     language: "zh",
     theme: "system",
     trayAvailable: false,
+    showBalanceCard: true,
     error: null,
   };
 }

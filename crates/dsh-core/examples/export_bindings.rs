@@ -4,6 +4,7 @@ use dsh_core::{
     ActivityCode, ActivityState, AppError, BrowserChoice, DesktopUpdateState, HarnessUpdateMode,
     HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep, MigrationPlan,
     MigrationState, ProgressState, ThemePreference,
+    balance::{BalanceSnapshot, BalanceStatus},
     marketplace::{
         CompatibilityInfo, CompatibilityStatus, InstalledPlugin, MarketCatalogState,
         MarketOperationKind, MarketOperationResult, MarketPage, MarketQuery, MarketSort,
@@ -49,6 +50,8 @@ fn main() {
         MarketOperationResult::decl(),
         PendingMarketChange::decl(),
         PendingVerification::decl(),
+        BalanceStatus::decl(),
+        BalanceSnapshot::decl(),
     ];
     let mut output =
         String::from("// Generated from dsh-core Rust types. Do not edit by hand.\n\n");

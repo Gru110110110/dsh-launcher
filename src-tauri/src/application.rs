@@ -13,6 +13,7 @@ use dsh_core::{
     ActivityCode, ActivityState, AppError, AppResult, ApplicationPaths, DesktopUpdateState,
     HarnessUpdateMode, HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep,
     MigrationState, ProgressState, ThemePreference,
+    balance::{BalanceService, BalanceSnapshot},
     browser::BrowserCatalog,
     marketplace::Marketplace,
     migration::MigrationService,
@@ -104,6 +105,7 @@ pub(crate) struct AppState {
     preferences: Mutex<Preferences>,
     browsers: BrowserCatalog,
     server: Mutex<ServerManager>,
+    balance: BalanceService,
     deployment: Mutex<Option<DeploymentController>>,
     background_update: Mutex<Option<DeploymentController>>,
     migration: MigrationService,
@@ -125,6 +127,7 @@ impl AppState {
         let mut snapshot = LauncherSnapshot::initial(env!("CARGO_PKG_VERSION"));
         snapshot.language = preferences.language;
         snapshot.theme = preferences.theme;
+        snapshot.show_balance_card = preferences.show_balance_card;
         snapshot.browsers = browsers.choices();
         snapshot.selected_browser_id = if browsers.contains(&preferences.browser_id) {
             preferences.browser_id.clone()
@@ -148,6 +151,7 @@ impl AppState {
             app,
             _instance_lock: instance_lock,
             server: Mutex::new(ServerManager::new(paths.clone())),
+            balance: BalanceService::new(),
             paths,
             snapshot: Mutex::new(snapshot),
             preferences: Mutex::new(preferences),
@@ -1065,6 +1069,28 @@ impl AppState {
         self.mutate(|snapshot| snapshot.theme = theme);
         Ok(())
     }
+    pub(crate) fn set_show_balance_card(&self, show: bool) -> AppResult<()> {
+        {
+            let mut preferences = self.preferences.lock().expect("preferences poisoned");
+            let mut candidate = preferences.clone();
+            candidate.show_balance_card = show;
+            candidate.save(&self.paths.preferences_file)?;
+            *preferences = candidate;
+        }
+        self.mutate(|snapshot| snapshot.show_balance_card = show);
+        Ok(())
+    }
+    /// Sanitized balance snapshot for the dashboard card. Only talks to the
+    /// loopback bridge of the currently running service; the port, token,
+    /// API key, and raw bridge output never leave this process.
+    pub(crate) fn balance_snapshot(&self, force_refresh: bool) -> BalanceSnapshot {
+        let endpoint = self
+            .server
+            .lock()
+            .expect("server poisoned")
+            .balance_endpoint();
+        self.balance.snapshot(endpoint.as_ref(), force_refresh)
+    }
     pub(crate) fn select_browser(&self, id: String) -> AppResult<()> {
         if !self.browsers.contains(&id) {
             return Err(AppError::new("browserUnavailable"));
@@ -1821,6 +1847,9 @@ pub fn run() {
             commands::application_copy_web_url,
             commands::preferences_set_language,
             commands::preferences_set_theme,
+            commands::preferences_set_show_balance_card,
+            commands::balance_get_snapshot,
+            commands::balance_refresh,
             commands::application_check_update,
             commands::application_install_update,
             commands::market_get_catalog,

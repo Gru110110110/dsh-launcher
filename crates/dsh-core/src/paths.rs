@@ -35,6 +35,11 @@ pub struct ApplicationPaths {
     pub migration_backups_dir: PathBuf,
     pub deployment_lock: PathBuf,
     pub launcher_lock: PathBuf,
+    /// Balance bridge staging, inside desktop-owned data and never DSH_HOME.
+    pub balance_bridge_dir: PathBuf,
+    pub balance_bridge_module: PathBuf,
+    pub balance_bridge_overlay: PathBuf,
+    pub balance_bridge_preflight: PathBuf,
 }
 
 impl ApplicationPaths {
@@ -85,6 +90,19 @@ impl ApplicationPaths {
             migration_backups_dir: app_home.join("backups"),
             deployment_lock: runtime_dir.join(".deployment.lock"),
             launcher_lock: app_home.join(".launcher.lock"),
+            balance_bridge_dir: app_home.join("balance").join("bridge"),
+            balance_bridge_module: app_home
+                .join("balance")
+                .join("bridge")
+                .join("balance-bridge.mjs"),
+            balance_bridge_overlay: app_home
+                .join("balance")
+                .join("bridge")
+                .join("balance-overlay.yml"),
+            balance_bridge_preflight: app_home
+                .join("balance")
+                .join("bridge")
+                .join("preflight.json"),
             app_home,
             runtime_dir,
             node_dir,
@@ -159,6 +177,12 @@ mod tests {
             "bin/dsh"
         }));
         assert!(paths.launcher_lock.ends_with(".launcher.lock"));
+        assert!(
+            paths
+                .balance_bridge_module
+                .ends_with("balance/bridge/balance-bridge.mjs")
+        );
+        assert!(!paths.balance_bridge_dir.starts_with(&paths.dsh_home));
         assert!(
             paths
                 .cc_switch_import_marker

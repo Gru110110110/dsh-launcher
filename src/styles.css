@@ -552,6 +552,10 @@ button:disabled {
   margin-top: 26px;
 }
 
+.balance-section {
+  margin-top: 26px;
+}
+
 .resource-panel .info-row {
   min-height: 64px;
 }

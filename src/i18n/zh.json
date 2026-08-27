@@ -355,5 +355,22 @@
   "market.installedLabel": "安装状态",
   "market.installed.all": "全部状态",
   "market.installed.installed": "已安装",
-  "market.installed.notInstalled": "未安装"
+  "market.installed.notInstalled": "未安装",
+  "dashboard.balanceSection": "账户",
+  "balance.title": "余额",
+  "balance.loading": "加载中…",
+  "balance.unavailable": "余额不可用",
+  "balance.refresh": "刷新",
+  "settings.balanceCard": "余额卡片",
+  "settings.balanceCardDetail": "在 Harness 页面显示 DeepSeek 官方余额",
+  "settings.balanceCardShow": "显示",
+  "settings.balanceCardHide": "隐藏",
+  "error.balanceNoCredential": "未配置 DeepSeek API Key，无法查询余额",
+  "error.balanceNonOfficialEndpoint": "DeepSeek 使用自定义 API 地址时无法查询官方余额",
+  "error.balanceHttpError": "DeepSeek 余额查询失败，请稍后重试",
+  "error.balanceTimeout": "DeepSeek 余额查询超时，请稍后重试",
+  "error.balanceInvalidResponse": "DeepSeek 返回了无效的余额数据",
+  "error.balanceUnavailable": "DeepSeek 余额当前不可用",
+  "error.balanceBridgeUnavailable": "余额服务不可用，请重启 Harness 后重试",
+  "error.balanceFetchFailed": "余额查询失败，请稍后重试"
 }

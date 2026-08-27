@@ -355,5 +355,22 @@
   "market.installedLabel": "Install status",
   "market.installed.all": "All statuses",
   "market.installed.installed": "Installed",
-  "market.installed.notInstalled": "Not installed"
+  "market.installed.notInstalled": "Not installed",
+  "dashboard.balanceSection": "Account",
+  "balance.title": "Balance",
+  "balance.loading": "Loading…",
+  "balance.unavailable": "Balance unavailable",
+  "balance.refresh": "Refresh",
+  "settings.balanceCard": "Balance card",
+  "settings.balanceCardDetail": "Show the official DeepSeek balance on the Harness page",
+  "settings.balanceCardShow": "Show",
+  "settings.balanceCardHide": "Hide",
+  "error.balanceNoCredential": "Balance could not be queried because no DeepSeek API key is configured",
+  "error.balanceNonOfficialEndpoint": "Balance is unavailable while DeepSeek uses a custom API endpoint",
+  "error.balanceHttpError": "The DeepSeek balance query failed; try again later",
+  "error.balanceTimeout": "The DeepSeek balance query timed out; try again later",
+  "error.balanceInvalidResponse": "DeepSeek returned an invalid balance response",
+  "error.balanceUnavailable": "The DeepSeek balance is currently unavailable",
+  "error.balanceBridgeUnavailable": "The balance service is unavailable; restart Harness and try again",
+  "error.balanceFetchFailed": "The balance query failed; try again later"
 }

@@ -17,10 +17,18 @@ pub struct Preferences {
     pub theme: ThemePreference,
     #[serde(default = "default_browser")]
     pub browser_id: String,
+    /// Whether the Harness dashboard shows the balance card. Defaults to true so
+    /// configurations written before this field existed keep the card visible.
+    #[serde(default = "default_show_balance_card")]
+    pub show_balance_card: bool,
 }
 
 fn default_browser() -> String {
     "system".into()
+}
+
+fn default_show_balance_card() -> bool {
+    true
 }
 
 impl Default for Preferences {
@@ -29,6 +37,7 @@ impl Default for Preferences {
             language: system_language(),
             theme: ThemePreference::System,
             browser_id: default_browser(),
+            show_balance_card: default_show_balance_card(),
         }
     }
 }
@@ -82,5 +91,14 @@ mod tests {
             &temp.path().join("language"),
         );
         assert_eq!(prefs.language, Language::En);
+    }
+
+    #[test]
+    fn balance_card_defaults_visible_for_existing_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("preferences.json");
+        fs::write(&file, "{\"language\":\"en\",\"theme\":\"dark\"}\n").unwrap();
+        let prefs = Preferences::load(&file, &temp.path().join("language"));
+        assert!(prefs.show_balance_card);
     }
 }

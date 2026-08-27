@@ -5,6 +5,7 @@ import {
   Languages,
   MoonStar,
   RefreshCw,
+  Wallet,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -55,6 +56,7 @@ export function SettingsPage() {
       language: snapshot.language,
       theme: snapshot.theme,
       desktopVersion: snapshot.desktopVersion,
+      showBalanceCard: snapshot.showBalanceCard,
     }),
     shallowEqual,
   );
@@ -115,6 +117,24 @@ export function SettingsPage() {
               ]}
               onChange={(theme) => {
                 run(launcherApi.setTheme(theme));
+              }}
+            />
+          </div>
+          <div className="info-row settings-row">
+            <Wallet className="row-icon" size={18} aria-hidden />
+            <div className="row-copy">
+              <strong>{t("settings.balanceCard")}</strong>
+              <span>{t("settings.balanceCardDetail")}</span>
+            </div>
+            <SegmentedControl<"show" | "hide">
+              label={t("settings.balanceCard")}
+              value={state.showBalanceCard ? "show" : "hide"}
+              options={[
+                { value: "show", label: t("settings.balanceCardShow") },
+                { value: "hide", label: t("settings.balanceCardHide") },
+              ]}
+              onChange={(choice) => {
+                run(launcherApi.setShowBalanceCard(choice === "show"));
               }}
             />
           </div>

@@ -23,6 +23,9 @@ use crate::runtime::WindowsProcessGuard;
 use crate::runtime::process_tree_alive;
 use crate::{
     AppError, AppResult, ApplicationPaths,
+    balance::{
+        BALANCE_OVERLAY_ENV, BalanceBridgeEndpoint, BalanceLaunchPlan, prepare_balance_launch,
+    },
     log_file::{BoundedLog, SERVER_LOG_MAX_BYTES},
     paths::atomic_write,
     process_recovery::recover_owned_services,
@@ -43,6 +46,7 @@ pub struct ServerManager {
     output_thread: Option<JoinHandle<()>>,
     web_url: Option<String>,
     guard_stdin: Option<ChildStdin>,
+    balance_endpoint: Option<BalanceBridgeEndpoint>,
     #[cfg(unix)]
     shutdown_pid: Option<u32>,
     #[cfg(windows)]
@@ -57,12 +61,20 @@ impl ServerManager {
             output_thread: None,
             web_url: None,
             guard_stdin: None,
+            balance_endpoint: None,
             #[cfg(unix)]
             shutdown_pid: None,
             #[cfg(windows)]
             job: None,
         }
     }
+
+    /// The loopback balance bridge endpoint of the running service, if
+    /// the bridge overlay was staged and injected for this launch.
+    pub fn balance_endpoint(&self) -> Option<BalanceBridgeEndpoint> {
+        self.balance_endpoint.clone()
+    }
+
     pub fn is_running(&mut self) -> bool {
         self.child
             .as_mut()
@@ -88,7 +100,41 @@ impl ServerManager {
             log::warn!("recovered {recovered} stale DSH service process tree(s)");
         }
         self.stop()?;
-        let environment = self.service_environment()?;
+        let plan = prepare_balance_launch(&self.paths);
+        if let Some(reason) = plan.unavailable_reason {
+            log::warn!("balance bridge unavailable for this launch: {reason}");
+        }
+        match self.start_attempt(&plan, &cancelled) {
+            Ok(url) => {
+                self.balance_endpoint = plan.endpoint.clone();
+                Ok(url)
+            }
+            Err(error) if should_retry_without_overlay(&plan, &error) => {
+                log::warn!(
+                    "Harness did not start with the balance bridge overlay; retrying without it: {error}"
+                );
+                let bare = plan.without_overlay();
+                match self.start_attempt(&bare, &cancelled) {
+                    Ok(url) => {
+                        self.balance_endpoint = None;
+                        Ok(url)
+                    }
+                    Err(retry_error) => {
+                        log::error!("balance-free Harness start also failed: {retry_error}");
+                        Err(retry_error)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn start_attempt(
+        &mut self,
+        plan: &BalanceLaunchPlan,
+        cancelled: impl Fn() -> bool,
+    ) -> AppResult<String> {
+        let environment = self.service_environment(&plan.env)?;
         let mut default_address_in_use = false;
         for use_free_port in [false, true] {
             if cancelled() {
@@ -313,19 +359,35 @@ impl ServerManager {
             );
         }
         self.web_url = None;
+        self.balance_endpoint = None;
         Ok(())
     }
 
-    fn service_environment(&self) -> AppResult<Vec<(String, std::ffi::OsString)>> {
+    fn service_environment(
+        &self,
+        extra: &[(String, std::ffi::OsString)],
+    ) -> AppResult<Vec<(String, std::ffi::OsString)>> {
         let mut environment: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
             .filter_map(|(key, value)| key.into_string().ok().map(|key| (key, value)))
             .collect();
+        // Always hand the guard the resolved desktop home explicitly: the
+        // guard's ownership check compares it against this manager's paths,
+        // and an inherited or absent value would resolve differently.
+        environment.retain(|(key, _)| key != "DSH_DESKTOP_HOME");
+        environment.push((
+            "DSH_DESKTOP_HOME".into(),
+            self.paths.app_home.clone().into_os_string(),
+        ));
         if std::env::var_os("DSH_HOME").is_none() {
             environment.retain(|(key, _)| key != "DSH_HOME");
             environment.push((
                 "DSH_HOME".into(),
                 self.paths.dsh_home.clone().into_os_string(),
             ));
+        }
+        for (key, value) in extra {
+            environment.retain(|(existing, _)| existing != key);
+            environment.push((key.clone(), value.clone()));
         }
         Ok(environment)
     }
@@ -402,13 +464,13 @@ fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult
     let mut command = Command::new(&paths.node_bin);
     command
         .arg(&paths.dsh_bin)
-        .arg("web")
+        .args(guard_web_args(
+            balance_overlay_from_environment().as_deref(),
+            use_free_port,
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    if use_free_port {
-        command.args(["--port", "0"]);
-    }
     let mut service = command
         .spawn()
         .map_err(|error| AppError::io("serviceStartFailed", &error))?;
@@ -461,13 +523,13 @@ fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult
     let mut command = Command::new(&paths.node_bin);
     command
         .arg(&paths.dsh_bin)
-        .arg("web")
+        .args(guard_web_args(
+            balance_overlay_from_environment().as_deref(),
+            use_free_port,
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    if use_free_port {
-        command.args(["--port", "0"]);
-    }
     configure_process_group(&mut command);
     run_windows_guarded_service(command)
 }
@@ -567,6 +629,41 @@ fn signal_guard_group(group: u32, signal: libc::c_int) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// Retry once without the optional balance overlay whenever it was
+/// actually injected and the failure was not an operator cancellation. A
+/// bridge that breaks Harness startup must never take the core service down
+/// with it.
+fn should_retry_without_overlay(plan: &BalanceLaunchPlan, error: &AppError) -> bool {
+    plan.overlay_active() && error.code != "deploymentCancelled"
+}
+
+/// The `dsh web` argument vector. The launcher-level `--patch` option belongs
+/// to the web subcommand and must precede every app-level pass-through flag
+/// (`--port`), which the CLI forwards verbatim from the first token it does
+/// not recognize.
+fn guard_web_args(
+    overlay: Option<&std::ffi::OsStr>,
+    use_free_port: bool,
+) -> Vec<std::ffi::OsString> {
+    let mut args = vec![std::ffi::OsString::from("web")];
+    if let Some(overlay) = overlay {
+        args.push(std::ffi::OsString::from("--patch"));
+        args.push(overlay.to_os_string());
+    }
+    if use_free_port {
+        args.push(std::ffi::OsString::from("--port"));
+        args.push(std::ffi::OsString::from("0"));
+    }
+    args
+}
+
+/// The overlay path the parent staged for this launch, if any. Delivered
+/// through the guard's environment so the guard CLI grammar stays unchanged.
+fn balance_overlay_from_environment() -> Option<std::ffi::OsString> {
+    let value = std::env::var_os(BALANCE_OVERLAY_ENV)?;
+    (!value.is_empty()).then_some(value)
 }
 
 fn stop_child(child: &mut Child) {
@@ -680,6 +777,54 @@ mod tests {
             }
             let _ = self.0.wait();
         }
+    }
+
+    #[test]
+    fn guard_web_args_place_the_overlay_before_app_passthrough_flags() {
+        let args = guard_web_args(Some(std::ffi::OsStr::new("/tmp/overlay.yml")), true);
+        let args: Vec<_> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["web", "--patch", "/tmp/overlay.yml", "--port", "0"]);
+
+        let args = guard_web_args(None, false);
+        let args: Vec<_> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["web"]);
+
+        let args = guard_web_args(None, true);
+        let args: Vec<_> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["web", "--port", "0"]);
+    }
+
+    #[test]
+    fn start_retries_without_the_overlay_unless_cancelled() {
+        let plan = BalanceLaunchPlan {
+            overlay: Some(PathBuf::from("overlay.yml")),
+            ..BalanceLaunchPlan::default()
+        };
+        assert!(should_retry_without_overlay(
+            &plan,
+            &AppError::new("serviceNoAddress")
+        ));
+        assert!(should_retry_without_overlay(
+            &plan,
+            &AppError::new("freePortFailed")
+        ));
+        assert!(!should_retry_without_overlay(
+            &plan,
+            &AppError::new("deploymentCancelled")
+        ));
+        assert!(!should_retry_without_overlay(
+            &BalanceLaunchPlan::default(),
+            &AppError::new("serviceNoAddress")
+        ));
     }
 
     #[test]
@@ -906,6 +1051,104 @@ mod tests {
         }
         assert!(guard.0.try_wait().unwrap().is_some());
         assert!(wait_for_port_release(&url, Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_service_guard_injects_the_overlay_before_app_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        fs::create_dir_all(paths.node_bin.parent().unwrap()).unwrap();
+        fs::create_dir_all(paths.dsh_bin.parent().unwrap()).unwrap();
+        symlink("/bin/sh", &paths.node_bin).unwrap();
+        let argv_file = temp.path().join("argv");
+        // The fake "dsh web" records the arguments the guard passed it.
+        fs::write(
+            &paths.dsh_bin,
+            "printf '%s\\n' \"$@\" > \"$DSH_GUARD_TEST_ARGV\"\n",
+        )
+        .unwrap();
+
+        let executable = std::env::current_exe().unwrap();
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "service::tests::unix_service_guard_helper",
+            ])
+            .env("DSH_DESKTOP_HOME", &paths.app_home)
+            .env("DSH_GUARD_TEST_ARGV", &argv_file)
+            .env(BALANCE_OVERLAY_ENV, "/tmp/dsh-test-overlay.yml")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut guard = GuardTestProcess(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !argv_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(argv_file.exists());
+        let args: Vec<String> = fs::read_to_string(&argv_file)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(args, ["web", "--patch", "/tmp/dsh-test-overlay.yml"]);
+        // The service script exits at once, so the guard reaps it and the
+        // group teardown ends the guard itself.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while guard.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(guard.0.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_service_guard_without_overlay_keeps_the_plain_web_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        fs::create_dir_all(paths.node_bin.parent().unwrap()).unwrap();
+        fs::create_dir_all(paths.dsh_bin.parent().unwrap()).unwrap();
+        symlink("/bin/sh", &paths.node_bin).unwrap();
+        let argv_file = temp.path().join("argv");
+        fs::write(
+            &paths.dsh_bin,
+            "printf '%s\\n' \"$@\" > \"$DSH_GUARD_TEST_ARGV\"\n",
+        )
+        .unwrap();
+
+        let executable = std::env::current_exe().unwrap();
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "service::tests::unix_service_guard_helper",
+            ])
+            .env("DSH_DESKTOP_HOME", &paths.app_home)
+            .env("DSH_GUARD_TEST_ARGV", &argv_file)
+            .env_remove(BALANCE_OVERLAY_ENV)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut guard = GuardTestProcess(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !argv_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(argv_file.exists());
+        assert_eq!(fs::read_to_string(&argv_file).unwrap(), "web\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while guard.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(guard.0.try_wait().unwrap().is_some());
     }
 
     #[cfg(unix)]

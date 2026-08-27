@@ -210,6 +210,7 @@ pub struct LauncherSnapshot {
     pub harness_update: HarnessUpdateState,
     pub migration: MigrationState,
     pub tray_available: bool,
+    pub show_balance_card: bool,
 }
 
 impl LauncherSnapshot {
@@ -236,6 +237,7 @@ impl LauncherSnapshot {
             harness_update: HarnessUpdateState::default(),
             migration: MigrationState::default(),
             tray_available: false,
+            show_balance_card: true,
         }
     }
 }

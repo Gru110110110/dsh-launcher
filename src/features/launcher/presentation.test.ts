@@ -25,6 +25,7 @@ function snapshot(overrides: Partial<LauncherSnapshot> = {}): LauncherSnapshot {
     harnessUpdate: { kind: "none" },
     migration: { kind: "notRequired" },
     trayAvailable: true,
+    showBalanceCard: true,
     ...overrides,
   };
 }

@@ -106,6 +106,7 @@ export type LauncherSnapshot = {
   harnessUpdate: HarnessUpdateState;
   migration: MigrationState;
   trayAvailable: boolean;
+  showBalanceCard: boolean;
 };
 
 export type PluginKind = "cordisPlugin" | "skill";
@@ -234,4 +235,15 @@ export type PendingVerification = {
    * individual plugin identities are no longer trustworthy.
    */
   journalRecovered: boolean;
+};
+
+export type BalanceStatus = "ok" | "stale" | "unavailable";
+
+export type BalanceSnapshot = {
+  status: BalanceStatus;
+  detail: string | null;
+  isAvailable: boolean | null;
+  currency: string | null;
+  totalBalance: string | null;
+  fetchedAtMs: number | null;
 };

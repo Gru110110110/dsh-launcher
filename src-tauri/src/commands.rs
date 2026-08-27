@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use dsh_core::{
     AppError, HarnessUpdateMode, Language, LauncherSnapshot, ThemePreference,
+    balance::BalanceSnapshot,
     marketplace::{
         CompatibilityInfo, InstalledPlugin, MarketCatalogState, MarketOperationResult, MarketPage,
         MarketQuery, PendingVerification, PluginSummary,
@@ -122,6 +123,34 @@ pub fn preferences_set_theme(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), AppError> {
     state.set_theme(theme)
+}
+
+#[tauri::command]
+pub fn preferences_set_show_balance_card(
+    show: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.set_show_balance_card(show)
+}
+
+/// Sanitized official balance state; credential values never leave Harness.
+#[tauri::command]
+pub async fn balance_get_snapshot(
+    state: State<'_, Arc<AppState>>,
+) -> Result<BalanceSnapshot, AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || Ok(state.balance_snapshot(false))).await,
+    )
+}
+
+/// Force a balance re-fetch, bypassing the bridge's five-minute cache.
+#[tauri::command]
+pub async fn balance_refresh(state: State<'_, Arc<AppState>>) -> Result<BalanceSnapshot, AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || Ok(state.balance_snapshot(true))).await,
+    )
 }
 
 #[tauri::command]
