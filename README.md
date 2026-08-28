@@ -18,8 +18,18 @@ The application uses React for presentation, a narrow Tauri command/event adapte
 - Browser selection, system tray lifecycle, English/Simplified Chinese, and light/dark/system themes
 - Plugin marketplace: consumes the [dsh-market](https://github.com/2BingLing/dsh-market) `plugins.json` through a daily validated snapshot at `market.dsdesktop.com` (fetched, hash-checked, validated, and cached in Rust; the CSP keeps the Webview from connecting directly) with Chinese search, type filters, sorting, and pagination. Cordis plugins install through the launcher's pinned Harness CLI (`plugin --profile web add/remove`; a pinned pnpm is provisioned into the isolated runtime when missing), skill plugins unpack from a validated GitHub tarball into `dsh-home/skills`, and uninstalls keep a recoverable backup. A three-state compatibility check against cordis peerDependencies runs before installation, with a startup verification pass and one-click uninstall as the final safety net
 - Separate Harness updates and cryptographically signed desktop updates; Harness updates can run in the foreground with visible progress or prepare a validated candidate in the background while the current service keeps running. A prepared update is activated after confirmation, or automatically on the next launch if the app exits first
+- Remote access: a sidebar page with master/LAN/public switches, QR codes, and rotatable 8-digit connection passwords. The self-contained authenticated reverse proxy in `dsh-core` (HTTP + WebSocket passthrough, per-IP and global login rate limiting, in-memory sessions) fronts the loopback-only Harness web UI; public access runs through a managed cloudflared quick tunnel admitted only by pinned SHA-256
 
 Python/PyInstaller releases do not understand Tauri updater artifacts. Existing users install the first Tauri release manually; it immediately reuses the compatible `~/.dsh-desktop` layout. Later releases are checked in the background and shown before any package is downloaded. After the user confirms, the backend performs the signed download, installation, safe Harness shutdown, and restart as one operation.
+
+## Remote access
+
+The Remote page (sidebar → Remote) exposes the loopback-only Harness web UI to the operator's phone through the launcher's own authenticated reverse proxies; the Harness service itself stays bound to 127.0.0.1 and is never reconfigured. A master switch gates two independent scopes:
+
+- **LAN**: a listener on all of the machine's IPv4 interfaces; the QR code and address field show the primary LAN address, paired with an 8-digit connection password. Phones on the same Wi-Fi scan the code, enter the password once, and keep the session while the launcher stays running.
+- **Public network**: a loopback-only listener fronted by a managed cloudflared quick tunnel (pinned release admitted by SHA-256, spawned shell-free with the launcher's proxy policy applied, no console window on Windows). Enabling requires an explicit security acknowledgement enforced by the backend; the random `*.trycloudflare.com` URL changes on every start, so an old link dies with its tunnel.
+
+Both scopes share one proxy design: only the request head is parsed, the login issues an opaque HttpOnly session cookie held in memory (a launcher restart ends every session), repeated password failures lock the source address for 60 seconds with an additional global lockout against distributed attempts, and after authentication every remaining byte — form posts, streaming responses, and WebSocket frames — flows through a raw bidirectional pipe. Rotating a password revokes that scope's sessions immediately and drops its live connections. Because the upstream address is resolved per connection, Harness restarts and updates never interrupt remote sessions or an open tunnel. Remote passwords live in the desktop-owned `remote/` directory, never in DSH_HOME.
 
 ## Proxy support
 
@@ -42,6 +52,7 @@ React feature registry + HashRouter
               ├─ source/CC Switch import
               ├─ managed dsh web process tree
               ├─ plugin marketplace (catalog cache, query, install/uninstall, installed detection, compatibility checks)
+              ├─ remote access proxies and cloudflared tunnel
               └─ browser and preferences ports
                   └─ pinned Node.js → published @deepseek-ai/dsh
 ```

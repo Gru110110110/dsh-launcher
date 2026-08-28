@@ -275,6 +275,59 @@ pub enum HarnessUpdateMode {
     Background,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteScope {
+    #[default]
+    Lan,
+    Public,
+}
+
+/// Lifecycle of the public tunnel, independent from the LAN listener.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteTunnelState {
+    #[default]
+    Off,
+    /// cloudflared is being downloaded or the tunnel is connecting.
+    Starting,
+    Running,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteLanSnapshot {
+    pub enabled: bool,
+    /// Listening and the upstream Harness web UI is reachable. The QR target.
+    pub url: Option<String>,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePublicSnapshot {
+    pub enabled: bool,
+    pub state: RemoteTunnelState,
+    /// Assigned trycloudflare URL once the tunnel is up. The QR target.
+    pub url: Option<String>,
+    pub password: String,
+    pub error: Option<AppError>,
+}
+
+/// Owner-facing remote-access state. Passwords are included deliberately:
+/// only the desktop operator sees this snapshot, and the UI needs them to
+/// render the connection cards. They never leave the local IPC boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSnapshot {
+    pub master: bool,
+    /// True when the Harness web UI is running and a proxy upstream exists.
+    pub service_ready: bool,
+    pub lan: RemoteLanSnapshot,
+    pub public: RemotePublicSnapshot,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct LauncherSnapshot {
@@ -305,6 +358,7 @@ pub struct LauncherSnapshot {
     pub tray_available: bool,
     pub show_balance_card: bool,
     pub proxy: ProxySettings,
+    pub remote: RemoteSnapshot,
 }
 
 impl LauncherSnapshot {
@@ -333,6 +387,7 @@ impl LauncherSnapshot {
             tray_available: false,
             show_balance_card: true,
             proxy: ProxySettings::default(),
+            remote: RemoteSnapshot::default(),
         }
     }
 }

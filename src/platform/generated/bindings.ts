@@ -108,6 +108,7 @@ export type LauncherSnapshot = {
   trayAvailable: boolean;
   showBalanceCard: boolean;
   proxy: ProxySettings;
+  remote: RemoteSnapshot;
 };
 
 export type PluginKind = "cordisPlugin" | "skill";
@@ -292,4 +293,38 @@ export type ProxyTestFailure = {
 export type ProxyTestReport = {
   sources: Array<ProxyTestSource>;
   failures: Array<ProxyTestFailure>;
+};
+
+export type RemoteScope = "lan" | "public";
+
+export type RemoteTunnelState = "off" | "starting" | "running" | "failed";
+
+export type RemoteLanSnapshot = {
+  enabled: boolean;
+  /**
+   * Listening and the upstream Harness web UI is reachable. The QR target.
+   */
+  url: string | null;
+  password: string;
+};
+
+export type RemotePublicSnapshot = {
+  enabled: boolean;
+  state: RemoteTunnelState;
+  /**
+   * Assigned trycloudflare URL once the tunnel is up. The QR target.
+   */
+  url: string | null;
+  password: string;
+  error: LauncherError | null;
+};
+
+export type RemoteSnapshot = {
+  master: boolean;
+  /**
+   * True when the Harness web UI is running and a proxy upstream exists.
+   */
+  serviceReady: boolean;
+  lan: RemoteLanSnapshot;
+  public: RemotePublicSnapshot;
 };

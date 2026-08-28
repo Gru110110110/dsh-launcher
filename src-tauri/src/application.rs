@@ -235,6 +235,7 @@ pub(crate) struct AppState {
     background_update: Mutex<Option<DeploymentController>>,
     migration: MigrationService,
     pub(crate) marketplace: Marketplace,
+    remote: Arc<dsh_core::remote::RemoteService>,
     desktop_update_busy: AtomicBool,
     harness_update_check_busy: AtomicBool,
     startup_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -276,6 +277,8 @@ impl AppState {
         let migration = MigrationService::from_environment(paths.clone())?;
         let marketplace = Marketplace::new(paths.clone());
         marketplace.initialize();
+        let remote = dsh_core::remote::RemoteService::new(paths.clone())?;
+        snapshot.remote = remote.snapshot();
         let state = Arc::new(Self {
             app,
             _instance_lock: instance_lock,
@@ -290,6 +293,7 @@ impl AppState {
             background_update: Mutex::new(None),
             migration,
             marketplace,
+            remote,
             desktop_update_busy: AtomicBool::new(false),
             harness_update_check_busy: AtomicBool::new(false),
             startup_thread: Mutex::new(None),
@@ -310,6 +314,12 @@ impl AppState {
                 state.market_catalog_changed();
             }
         });
+        let weak_state = Arc::downgrade(&state);
+        state.remote.set_change_listener(Box::new(move || {
+            if let Some(state) = weak_state.upgrade() {
+                state.remote_changed();
+            }
+        }));
         Ok(state)
     }
 
@@ -325,16 +335,35 @@ impl AppState {
     }
 
     fn mutate_if(&self, update: impl FnOnce(&mut LauncherSnapshot) -> bool) -> bool {
-        let value = {
+        let (value, previous_web_url) = {
             let mut snapshot = self.snapshot.lock().expect("snapshot poisoned");
+            let previous_web_url = snapshot.web_url.clone();
             if !update(&mut snapshot) {
                 return false;
             }
             snapshot.revision = snapshot.revision.saturating_add(1);
-            snapshot.clone()
+            (snapshot.clone(), previous_web_url)
         };
+        let web_url_changed = value.web_url != previous_web_url;
+        let web_url = value.web_url.clone();
         let _ = self.app.emit("launcher://state", value);
+        if web_url_changed {
+            // The remote proxies resolve the upstream per connection, so a
+            // Harness restart never interrupts them; they only need to know
+            // the new authority.
+            if let Err(error) = self.remote.set_upstream(web_url.as_deref()) {
+                log::warn!("remote upstream update failed: {error}");
+            }
+        }
         true
+    }
+
+    /// Mirrors the remote service state into the launcher snapshot. The
+    /// service notifies after releasing its own locks, so re-entering it
+    /// here cannot deadlock.
+    fn remote_changed(&self) {
+        let remote = self.remote.snapshot();
+        self.mutate(|snapshot| snapshot.remote = remote);
     }
 
     fn market_operation_changed(&self, busy: bool) {
@@ -1302,6 +1331,46 @@ impl AppState {
         }
         self.browsers.open("system", url)
     }
+    // -----------------------------------------------------------------------
+    // Remote access
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn set_remote_master(&self, enabled: bool) -> AppResult<()> {
+        self.remote.set_master(enabled)
+    }
+
+    pub(crate) fn set_remote_lan_enabled(&self, enabled: bool) -> AppResult<()> {
+        self.remote.set_lan_enabled(enabled)
+    }
+
+    pub(crate) fn set_remote_public_enabled(
+        &self,
+        enabled: bool,
+        acknowledged: bool,
+    ) -> AppResult<()> {
+        self.remote.set_public_enabled(enabled, acknowledged)
+    }
+
+    pub(crate) fn rotate_remote_password(&self, scope: dsh_core::RemoteScope) -> AppResult<()> {
+        self.remote.rotate_password(scope)
+    }
+
+    pub(crate) fn set_remote_password(
+        &self,
+        scope: dsh_core::RemoteScope,
+        password: String,
+    ) -> AppResult<()> {
+        self.remote.set_password(scope, password)
+    }
+
+    pub(crate) fn retry_remote_public(&self) -> AppResult<()> {
+        self.remote.retry_public_tunnel()
+    }
+
+    pub(crate) fn remote_qr_svg(&self, scope: dsh_core::RemoteScope) -> AppResult<String> {
+        self.remote.qr_svg(scope)
+    }
+
     pub(crate) fn web_url(&self) -> AppResult<String> {
         self.snapshot()
             .web_url
@@ -1681,6 +1750,7 @@ impl AppState {
             .into_iter()
             .find_map(|controller| controller.cleanup_error());
         self.server.lock().expect("server poisoned").stop()?;
+        self.remote.shutdown();
         if let Some(error) = deployment_error {
             return Err(error);
         }
@@ -2080,6 +2150,13 @@ pub fn run() {
             commands::market_pending_verification,
             commands::market_rollback_pending,
             commands::market_open_plugin_github,
+            commands::remote_set_master,
+            commands::remote_set_lan_enabled,
+            commands::remote_set_public_enabled,
+            commands::remote_rotate_password,
+            commands::remote_set_password,
+            commands::remote_retry_public,
+            commands::remote_qr,
         ])
         .build(tauri::generate_context!())
         .expect("error while building DSH Launcher")

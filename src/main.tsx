@@ -39,6 +39,18 @@ if (import.meta.env.DEV && !isTauri) {
     trayAvailable: true,
     showBalanceCard: true,
     proxy: { mode: "system", url: "", bypass: "" },
+    remote: {
+      master: false,
+      serviceReady: true,
+      lan: { enabled: false, url: null, password: "" },
+      public: {
+        enabled: false,
+        state: "off",
+        url: null,
+        password: "",
+        error: null,
+      },
+    },
   };
   initializeLauncherPreview(previewSnapshot);
 } else {

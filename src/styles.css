@@ -1474,3 +1474,156 @@ button:disabled {
   color: var(--danger);
   word-break: break-all;
 }
+
+/* ---------------------------------------------------------------------------
+   Remote access
+   ------------------------------------------------------------------------- */
+
+.remote-notice {
+  margin-top: 16px;
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--brand) 28%, var(--border));
+  border-radius: 8px;
+  background: var(--brand-soft);
+  color: var(--brand);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.remote-sections.remote-disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.remote-link-panel {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+  padding: 16px 22px 18px;
+  border-top: 1px solid var(--border);
+}
+
+.remote-qr {
+  flex: 0 0 auto;
+}
+
+.remote-qr img,
+.remote-qr-placeholder {
+  display: block;
+  width: 132px;
+  height: 132px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #ffffff;
+  box-shadow: var(--shadow);
+}
+
+.remote-qr img {
+  padding: 8px;
+  object-fit: contain;
+}
+
+.remote-link-fields {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.remote-field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.remote-field-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.remote-field-value {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.remote-field-value code {
+  overflow: hidden;
+  flex: 0 1 auto;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+
+.remote-field-value .icon-button {
+  flex: 0 0 28px;
+}
+
+.remote-password-modal input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 18px;
+  letter-spacing: 3px;
+  text-align: center;
+  outline: none;
+}
+
+.remote-password-modal input:focus {
+  border-color: var(--brand);
+}
+
+.remote-status-row {
+  min-height: 46px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.remote-status-row svg {
+  flex: 0 0 auto;
+  color: var(--brand);
+}
+
+.remote-error-row,
+.remote-error-row svg {
+  color: var(--danger);
+}
+
+.remote-retry-button {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--text);
+}
+
+.remote-retry-button svg {
+  color: var(--text);
+}
+
+.remote-disclaimer-check {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  margin-top: 16px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.remote-disclaimer-check input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--brand);
+  cursor: pointer;
+}

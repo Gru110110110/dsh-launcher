@@ -16,6 +16,7 @@ pub mod network;
 pub mod paths;
 pub mod preferences;
 mod process_recovery;
+pub mod remote;
 pub mod runtime;
 pub mod service;
 pub mod terminal;

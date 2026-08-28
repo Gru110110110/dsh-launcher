@@ -331,6 +331,69 @@ pub async fn market_rollback_pending(state: State<'_, Arc<AppState>>) -> Result<
     )
 }
 
+// ---------------------------------------------------------------------------
+// Remote access
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn remote_set_master(enabled: bool, state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    state.set_remote_master(enabled)
+}
+
+#[tauri::command]
+pub fn remote_set_lan_enabled(
+    enabled: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.set_remote_lan_enabled(enabled)
+}
+
+/// Enabling public access requires the UI's disclaimer acknowledgement; the
+/// backend enforces it and answers `remoteDisclaimerRequired` otherwise.
+#[tauri::command]
+pub fn remote_set_public_enabled(
+    enabled: bool,
+    acknowledged: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.set_remote_public_enabled(enabled, acknowledged)
+}
+
+#[tauri::command]
+pub fn remote_rotate_password(
+    scope: dsh_core::RemoteScope,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.rotate_remote_password(scope)
+}
+
+/// Sets a user-chosen 8-digit password; `remotePasswordInvalid` otherwise.
+/// Changing the password revokes every session of the scope.
+#[tauri::command]
+pub fn remote_set_password(
+    scope: dsh_core::RemoteScope,
+    password: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.set_remote_password(scope, password)
+}
+
+/// Re-runs the tunnel bootstrap after a failure (no toggle dance required).
+#[tauri::command]
+pub fn remote_retry_public(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    state.retry_remote_public()
+}
+
+/// SVG markup of the scope's QR code; `remoteUnavailable` while the scope
+/// has no active URL to encode.
+#[tauri::command]
+pub fn remote_qr(
+    scope: dsh_core::RemoteScope,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, AppError> {
+    state.remote_qr_svg(scope)
+}
+
 /// Flatten the task transport result without changing an application error.
 /// Only a failed/panicked blocking task is adapted to `serviceControlFailed`;
 /// `Ok(Err(AppError))` keeps its original localizable code and values.

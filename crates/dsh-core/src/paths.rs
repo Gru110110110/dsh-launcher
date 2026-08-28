@@ -40,6 +40,11 @@ pub struct ApplicationPaths {
     pub balance_bridge_module: PathBuf,
     pub balance_bridge_overlay: PathBuf,
     pub balance_bridge_preflight: PathBuf,
+    /// Remote-access state, secrets, and the managed cloudflared binary.
+    /// Desktop-owned data; never inside DSH_HOME.
+    pub remote_dir: PathBuf,
+    pub remote_settings_file: PathBuf,
+    pub cloudflared_bin: PathBuf,
 }
 
 impl ApplicationPaths {
@@ -103,6 +108,12 @@ impl ApplicationPaths {
                 .join("balance")
                 .join("bridge")
                 .join("preflight.json"),
+            remote_dir: app_home.join("remote"),
+            remote_settings_file: app_home.join("remote").join("settings.json"),
+            #[cfg(windows)]
+            cloudflared_bin: app_home.join("remote").join("cloudflared.exe"),
+            #[cfg(not(windows))]
+            cloudflared_bin: app_home.join("remote").join("cloudflared"),
             app_home,
             runtime_dir,
             node_dir,
@@ -183,6 +194,13 @@ mod tests {
                 .ends_with("balance/bridge/balance-bridge.mjs")
         );
         assert!(!paths.balance_bridge_dir.starts_with(&paths.dsh_home));
+        assert!(!paths.remote_dir.starts_with(&paths.dsh_home));
+        assert!(paths.remote_settings_file.ends_with("remote/settings.json"));
+        assert!(paths.cloudflared_bin.ends_with(if cfg!(windows) {
+            "remote/cloudflared.exe"
+        } else {
+            "remote/cloudflared"
+        }));
         assert!(
             paths
                 .cc_switch_import_marker

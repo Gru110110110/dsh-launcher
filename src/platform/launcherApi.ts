@@ -7,6 +7,7 @@ import type {
   LauncherSnapshot,
   ProxySettings,
   ProxyTestReport,
+  RemoteScope,
   ThemePreference,
 } from "./generated/bindings";
 
@@ -49,6 +50,18 @@ export const launcherApi = {
   balanceRefresh: () => command<BalanceSnapshot>("balance_refresh"),
   checkDesktopUpdate: () => command<string | null>("application_check_update"),
   installDesktopUpdate: () => action("application_install_update"),
+  remoteSetMaster: (enabled: boolean) =>
+    action("remote_set_master", { enabled }),
+  remoteSetLanEnabled: (enabled: boolean) =>
+    action("remote_set_lan_enabled", { enabled }),
+  remoteSetPublicEnabled: (enabled: boolean, acknowledged: boolean) =>
+    action("remote_set_public_enabled", { enabled, acknowledged }),
+  remoteRotatePassword: (scope: RemoteScope) =>
+    action("remote_rotate_password", { scope }),
+  remoteSetPassword: (scope: RemoteScope, password: string) =>
+    action("remote_set_password", { scope, password }),
+  remoteRetryPublic: () => action("remote_retry_public"),
+  remoteQr: (scope: RemoteScope) => command<string>("remote_qr", { scope }),
   onState: (
     handler: (snapshot: LauncherSnapshot) => void,
   ): Promise<UnlistenFn> =>

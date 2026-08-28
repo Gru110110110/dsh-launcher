@@ -27,6 +27,18 @@ function snapshot(overrides: Partial<LauncherSnapshot> = {}): LauncherSnapshot {
     trayAvailable: true,
     showBalanceCard: true,
     proxy: { mode: "system", url: "", bypass: "" },
+    remote: {
+      master: false,
+      serviceReady: false,
+      lan: { enabled: false, url: null, password: "" },
+      public: {
+        enabled: false,
+        state: "off",
+        url: null,
+        password: "",
+        error: null,
+      },
+    },
     ...overrides,
   };
 }

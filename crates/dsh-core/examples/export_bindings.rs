@@ -4,7 +4,8 @@ use dsh_core::{
     ActivityCode, ActivityState, AppError, BrowserChoice, DesktopUpdateState, HarnessUpdateMode,
     HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep, MigrationPlan,
     MigrationState, NetworkErrorKind, ProgressState, ProxyMode, ProxySettings, ProxyTestFailure,
-    ProxyTestReport, ProxyTestSource, ThemePreference,
+    ProxyTestReport, ProxyTestSource, RemoteLanSnapshot, RemotePublicSnapshot, RemoteScope,
+    RemoteSnapshot, RemoteTunnelState, ThemePreference,
     balance::{BalanceSnapshot, BalanceStatus},
     marketplace::{
         CompatibilityInfo, CompatibilityStatus, InstalledPlugin, MarketCatalogState,
@@ -60,6 +61,11 @@ fn main() {
         ProxyTestSource::decl(),
         ProxyTestFailure::decl(),
         ProxyTestReport::decl(),
+        RemoteScope::decl(),
+        RemoteTunnelState::decl(),
+        RemoteLanSnapshot::decl(),
+        RemotePublicSnapshot::decl(),
+        RemoteSnapshot::decl(),
     ];
     let mut output =
         String::from("// Generated from dsh-core Rust types. Do not edit by hand.\n\n");
