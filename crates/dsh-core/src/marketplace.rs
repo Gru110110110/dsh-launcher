@@ -63,6 +63,7 @@ const OUTPUT_CAP: usize = 256 * 1024;
 const TARBALL_MAX_BYTES: usize = 128 * 1024 * 1024;
 const TARBALL_MAX_FILES: usize = 50_000;
 const COMPAT_CONCURRENCY: usize = 8;
+const MAX_COMPATIBILITY_BATCH: usize = 100;
 /// Installed-state scans are cached for this long: the paired query +
 /// compatibility requests and rapid filter changes must not re-walk the
 /// filesystem on every call. Mutations invalidate the cache immediately.
@@ -90,6 +91,38 @@ pub(crate) struct MarketCatalogFile {
     pub generated_at: Option<String>,
     #[serde(default)]
     pub plugins: Vec<MarketPlugin>,
+}
+
+#[derive(Debug)]
+struct LoadedCatalog {
+    file: MarketCatalogFile,
+    by_id: HashMap<String, usize>,
+}
+
+impl LoadedCatalog {
+    fn new(file: MarketCatalogFile) -> Self {
+        let by_id = file
+            .plugins
+            .iter()
+            .enumerate()
+            .map(|(index, plugin)| (plugin.id.clone(), index))
+            .collect();
+        Self { file, by_id }
+    }
+
+    fn plugin(&self, plugin_id: &str) -> Option<&MarketPlugin> {
+        self.by_id
+            .get(plugin_id)
+            .and_then(|index| self.file.plugins.get(*index))
+    }
+}
+
+impl std::ops::Deref for LoadedCatalog {
+    type Target = MarketCatalogFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -263,6 +296,20 @@ pub struct PluginSummary {
     pub installed: Option<InstalledPlugin>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCompatibility {
+    pub plugin_id: String,
+    pub compatibility: CompatibilityStatus,
+    #[serde(default)]
+    pub compatibility_detail: Option<String>,
+    #[serde(default)]
+    pub install_version: Option<String>,
+    pub source_binding: SourceBindingStatus,
+    #[serde(default)]
+    pub source_binding_detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum MarketSort {
@@ -389,7 +436,7 @@ pub struct PendingVerification {
 
 pub struct Marketplace {
     paths: ApplicationPaths,
-    catalog: Mutex<Option<Arc<MarketCatalogFile>>>,
+    catalog: Mutex<Option<Arc<LoadedCatalog>>>,
     compat_cache: Mutex<HashMap<String, CachedCompatibility>>,
     pnpm_bin: Mutex<Option<PathBuf>>,
     installed_cache: Mutex<Option<InstalledCache>>,
@@ -564,7 +611,8 @@ impl Marketplace {
         if self.catalog.lock().expect("catalog poisoned").is_none()
             && let Ok(catalog) = self.load_cached_catalog()
         {
-            *self.catalog.lock().expect("catalog poisoned") = Some(Arc::new(catalog));
+            *self.catalog.lock().expect("catalog poisoned") =
+                Some(Arc::new(LoadedCatalog::new(catalog)));
         }
         let mut compat = self.compat_cache.lock().expect("compat poisoned");
         if compat.is_empty()
@@ -736,7 +784,8 @@ impl Marketplace {
             .map_err(|error| AppError::io("createDirectory", &error))?;
         crate::paths::atomic_write(&self.catalog_file(), &bytes)?;
         crate::paths::atomic_write(&self.catalog_meta_file(), &serde_json::to_vec(&trust)?)?;
-        *self.catalog.lock().expect("catalog poisoned") = Some(Arc::new(catalog));
+        *self.catalog.lock().expect("catalog poisoned") =
+            Some(Arc::new(LoadedCatalog::new(catalog)));
         self.compat_cache.lock().expect("compat poisoned").clear();
         let _ = fs::remove_file(self.compat_file());
         // Plugin ids may have changed; drop the installed scan so the next
@@ -776,7 +825,13 @@ impl Marketplace {
             // Fill missing compatibility entries for this page concurrently,
             // so browsing never waits on serial registry lookups. Cached
             // entries are reused and later pages resolve instantly.
-            self.fill_compatibility_parallel(&matched, start, page_size as usize);
+            let page_plugins: Vec<&MarketPlugin> = matched
+                .iter()
+                .skip(start)
+                .take(page_size as usize)
+                .copied()
+                .collect();
+            self.fill_compatibility_parallel(&page_plugins);
         }
         let items = matched
             .into_iter()
@@ -797,7 +852,7 @@ impl Marketplace {
     pub fn installed(&self) -> AppResult<Vec<InstalledPlugin>> {
         self.initialize();
         let catalog = self.catalog.lock().expect("catalog poisoned").clone();
-        Ok(self.scan_installed_cached(catalog.as_deref()))
+        Ok(self.scan_installed_cached(catalog.as_deref().map(|catalog| &catalog.file)))
     }
 
     pub fn compatibility(&self, plugin_id: &str) -> AppResult<CompatibilityInfo> {
@@ -809,11 +864,41 @@ impl Marketplace {
             .clone()
             .ok_or_else(|| AppError::new("marketCatalogUnavailable"))?;
         let plugin = catalog
-            .plugins
-            .iter()
-            .find(|plugin| plugin.id == plugin_id)
+            .plugin(plugin_id)
             .ok_or_else(|| AppError::new("marketPluginNotFound").value("plugin", plugin_id))?;
         Ok(self.check_compatibility(plugin))
+    }
+
+    /// Check compatibility for an already-rendered result page. Plugin ids
+    /// are resolved through the immutable catalog index, so this path avoids
+    /// repeating the page query's full scan, search normalization and sort.
+    pub fn compatibility_batch(
+        &self,
+        plugin_ids: &[String],
+    ) -> AppResult<Vec<PluginCompatibility>> {
+        self.initialize();
+        if plugin_ids.len() > MAX_COMPATIBILITY_BATCH {
+            return Err(AppError::new("marketCatalogInvalid").detail(format!(
+                "compatibility batch exceeds {MAX_COMPATIBILITY_BATCH} plugins"
+            )));
+        }
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("catalog poisoned")
+            .clone()
+            .ok_or_else(|| AppError::new("marketCatalogUnavailable"))?;
+        let mut seen = HashSet::new();
+        let plugins: Vec<&MarketPlugin> = plugin_ids
+            .iter()
+            .filter(|plugin_id| seen.insert(plugin_id.as_str()))
+            .filter_map(|plugin_id| catalog.plugin(plugin_id))
+            .collect();
+        self.fill_compatibility_parallel(&plugins);
+        Ok(plugins
+            .into_iter()
+            .map(|plugin| self.compatibility_summary(plugin, true))
+            .collect())
     }
 
     /// Resolve the exact install target and its current registry metadata for
@@ -829,9 +914,7 @@ impl Marketplace {
             .clone()
             .ok_or_else(|| AppError::new("marketCatalogUnavailable"))?;
         let plugin = catalog
-            .plugins
-            .iter()
-            .find(|plugin| plugin.id == plugin_id)
+            .plugin(plugin_id)
             .ok_or_else(|| AppError::new("marketPluginNotFound").value("plugin", plugin_id))?;
         let kind = PluginKind::parse(&plugin.kind);
         if kind == PluginKind::CordisPlugin {
@@ -864,9 +947,7 @@ impl Marketplace {
             .clone()
             .ok_or_else(|| AppError::new("marketCatalogUnavailable"))?;
         let plugin = catalog
-            .plugins
-            .iter()
-            .find(|plugin| plugin.id == plugin_id)
+            .plugin(plugin_id)
             .cloned()
             .ok_or_else(|| AppError::new("marketPluginNotFound").value("plugin", plugin_id))?;
         let kind = PluginKind::parse(&plugin.kind);
@@ -1128,6 +1209,58 @@ impl Marketplace {
         check_compatibility: bool,
     ) -> PluginSummary {
         let kind = PluginKind::parse(&plugin.kind);
+        let compatibility = self.compatibility_summary(plugin, check_compatibility);
+        PluginSummary {
+            id: plugin.id.clone(),
+            kind,
+            name: plugin.name.clone(),
+            owner: plugin.owner.clone(),
+            repo: plugin.repo.clone(),
+            full_name: plugin.full_name.clone(),
+            stars: plugin.stars,
+            description: plugin.description.clone(),
+            description_zh: if plugin.description_zh.is_empty() {
+                plugin.description.clone()
+            } else {
+                plugin.description_zh.clone()
+            },
+            tags: plugin.tags.clone(),
+            homepage: plugin.homepage.clone(),
+            license: plugin.license.clone(),
+            curated: plugin.curated,
+            pushed_at: plugin.pushed_at.clone(),
+            updated_at: plugin.updated_at.clone(),
+            needs_config: plugin
+                .install
+                .as_ref()
+                .and_then(|i| i.needs_config)
+                .unwrap_or(false),
+            install_method: plugin
+                .install
+                .as_ref()
+                .and_then(|i| i.method.clone())
+                .unwrap_or_default(),
+            install_target: match kind {
+                PluginKind::Skill => plugin.id.clone(),
+                PluginKind::CordisPlugin => install_package_name(plugin).unwrap_or_default(),
+            },
+            install_version: compatibility.install_version,
+            source_binding: compatibility.source_binding,
+            source_binding_detail: compatibility.source_binding_detail,
+            score_total: plugin.score.as_ref().and_then(|s| s.total),
+            score_explanation: plugin.score.as_ref().and_then(|s| s.explanation.clone()),
+            compatibility: compatibility.compatibility,
+            compatibility_detail: compatibility.compatibility_detail,
+            installed: installed_index.by_plugin.get(&plugin.id).cloned(),
+        }
+    }
+
+    fn compatibility_summary(
+        &self,
+        plugin: &MarketPlugin,
+        check_compatibility: bool,
+    ) -> PluginCompatibility {
+        let kind = PluginKind::parse(&plugin.kind);
         let (compatibility, install_version, source_binding, source_binding_detail) = match kind {
             PluginKind::Skill => (
                 CompatibilityInfo {
@@ -1168,48 +1301,13 @@ impl Marketplace {
                 None,
             ),
         };
-        PluginSummary {
-            id: plugin.id.clone(),
-            kind,
-            name: plugin.name.clone(),
-            owner: plugin.owner.clone(),
-            repo: plugin.repo.clone(),
-            full_name: plugin.full_name.clone(),
-            stars: plugin.stars,
-            description: plugin.description.clone(),
-            description_zh: if plugin.description_zh.is_empty() {
-                plugin.description.clone()
-            } else {
-                plugin.description_zh.clone()
-            },
-            tags: plugin.tags.clone(),
-            homepage: plugin.homepage.clone(),
-            license: plugin.license.clone(),
-            curated: plugin.curated,
-            pushed_at: plugin.pushed_at.clone(),
-            updated_at: plugin.updated_at.clone(),
-            needs_config: plugin
-                .install
-                .as_ref()
-                .and_then(|i| i.needs_config)
-                .unwrap_or(false),
-            install_method: plugin
-                .install
-                .as_ref()
-                .and_then(|i| i.method.clone())
-                .unwrap_or_default(),
-            install_target: match kind {
-                PluginKind::Skill => plugin.id.clone(),
-                PluginKind::CordisPlugin => install_package_name(plugin).unwrap_or_default(),
-            },
+        PluginCompatibility {
+            plugin_id: plugin.id.clone(),
+            compatibility: compatibility.status,
+            compatibility_detail: compatibility.detail,
             install_version,
             source_binding,
             source_binding_detail,
-            score_total: plugin.score.as_ref().and_then(|s| s.total),
-            score_explanation: plugin.score.as_ref().and_then(|s| s.explanation.clone()),
-            compatibility: compatibility.status,
-            compatibility_detail: compatibility.detail,
-            installed: installed_index.by_plugin.get(&plugin.id).cloned(),
         }
     }
 
@@ -1246,20 +1344,13 @@ impl Marketplace {
     /// Fill compatibility entries for one result page without serial network
     /// stalls: missing items are fetched concurrently with a shared HTTP
     /// client (bounded workers), then cached in a single lock acquisition.
-    fn fill_compatibility_parallel(
-        &self,
-        matched: &[&MarketPlugin],
-        start: usize,
-        page_size: usize,
-    ) {
+    fn fill_compatibility_parallel(&self, plugins: &[&MarketPlugin]) {
         let missing: Vec<&MarketPlugin> = {
             let cache = self.compat_cache.lock().expect("compat poisoned");
             let cordis_version = installed_cordis_version(&self.paths);
             let now = now_ms();
-            matched
+            plugins
                 .iter()
-                .skip(start)
-                .take(page_size)
                 .copied()
                 .filter(|plugin| {
                     PluginKind::parse(&plugin.kind) == PluginKind::CordisPlugin
@@ -4617,7 +4708,7 @@ mod tests {
             "# user-modified content",
         )
         .expect("write");
-        *marketplace.catalog.lock().expect("catalog") = Some(Arc::new(catalog));
+        *marketplace.catalog.lock().expect("catalog") = Some(Arc::new(LoadedCatalog::new(catalog)));
         let target = InstalledPlugin {
             plugin_id: Some("x/url-manager".into()),
             local_name: "url-manager".into(),
@@ -4893,8 +4984,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = ApplicationPaths::from_home(temp.path().join("home"));
         let marketplace = Marketplace::new(paths);
-        *marketplace.catalog.lock().expect("catalog") =
-            Some(Arc::new(catalog(vec![plugin("x/y", "y", 1, None)])));
+        *marketplace.catalog.lock().expect("catalog") = Some(Arc::new(LoadedCatalog::new(
+            catalog(vec![plugin("x/y", "y", 1, None)]),
+        )));
         marketplace.loading.store(true, Ordering::SeqCst);
         match marketplace.catalog_state() {
             MarketCatalogState::Ready { plugin_count, .. } => assert_eq!(plugin_count, 1),
@@ -4929,10 +5021,11 @@ mod tests {
         let skills_dir = paths.dsh_home.join("skills");
         fs::create_dir_all(skills_dir.join("alpha-latest")).expect("skills");
         let marketplace = Marketplace::new(paths);
-        *marketplace.catalog.lock().expect("catalog") = Some(Arc::new(catalog(vec![
-            plugin("x/alpha", "alpha", 1, None),
-            plugin("y/beta", "beta", 2, None),
-        ])));
+        *marketplace.catalog.lock().expect("catalog") =
+            Some(Arc::new(LoadedCatalog::new(catalog(vec![
+                plugin("x/alpha", "alpha", 1, None),
+                plugin("y/beta", "beta", 2, None),
+            ]))));
         let all = marketplace
             .query(&MarketQuery {
                 page_size: 10,
@@ -4971,7 +5064,8 @@ mod tests {
         for i in 0..10 {
             plugins.push(plugin(&format!("o/p{i}"), &format!("p{i}"), i, None));
         }
-        *marketplace.catalog.lock().expect("catalog") = Some(Arc::new(catalog(plugins)));
+        *marketplace.catalog.lock().expect("catalog") =
+            Some(Arc::new(LoadedCatalog::new(catalog(plugins))));
         let query = MarketQuery {
             page_size: 4,
             sort: MarketSort::Stars,
@@ -4991,6 +5085,63 @@ mod tests {
             })
             .expect("query");
         assert_eq!(page.items.len(), 2);
+    }
+
+    #[test]
+    fn compatibility_batch_resolves_only_requested_catalog_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let marketplace = Marketplace::new(paths);
+        let plugins = ["alpha", "beta", "gamma"]
+            .into_iter()
+            .map(|name| MarketPlugin {
+                kind: "skill".into(),
+                ..plugin(&format!("x/{name}"), name, 1, None)
+            })
+            .collect();
+        *marketplace.catalog.lock().expect("catalog") =
+            Some(Arc::new(LoadedCatalog::new(catalog(plugins))));
+
+        let results = marketplace
+            .compatibility_batch(&[
+                "x/gamma".into(),
+                "missing/plugin".into(),
+                "x/alpha".into(),
+                "x/gamma".into(),
+            ])
+            .expect("compatibility batch");
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.plugin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x/gamma", "x/alpha"]
+        );
+        assert!(results.iter().all(|result| {
+            result.compatibility == CompatibilityStatus::Compatible
+                && result.source_binding == SourceBindingStatus::Verified
+        }));
+    }
+
+    #[test]
+    fn compatibility_batch_rejects_oversized_requests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let marketplace = Marketplace::new(paths);
+        *marketplace.catalog.lock().expect("catalog") =
+            Some(Arc::new(LoadedCatalog::new(catalog(vec![MarketPlugin {
+                kind: "skill".into(),
+                ..plugin("x/alpha", "alpha", 1, None)
+            }]))));
+        let plugin_ids = (0..=MAX_COMPATIBILITY_BATCH)
+            .map(|index| format!("x/plugin-{index}"))
+            .collect::<Vec<_>>();
+
+        let error = marketplace
+            .compatibility_batch(&plugin_ids)
+            .expect_err("oversized batch");
+        assert_eq!(error.code, "marketCatalogInvalid");
     }
 
     #[test]
@@ -5248,8 +5399,9 @@ mod tests {
         fs::create_dir_all(skills.join("alpha-latest")).expect("latest");
         fs::create_dir_all(skills.join("alpha-1.0.0")).expect("version");
         let marketplace = Marketplace::new(paths);
-        *marketplace.catalog.lock().expect("catalog") =
-            Some(Arc::new(catalog(vec![plugin("x/alpha", "alpha", 1, None)])));
+        *marketplace.catalog.lock().expect("catalog") = Some(Arc::new(LoadedCatalog::new(
+            catalog(vec![plugin("x/alpha", "alpha", 1, None)]),
+        )));
         let target = InstalledPlugin {
             plugin_id: Some("x/alpha".into()),
             local_name: "alpha-latest".into(),

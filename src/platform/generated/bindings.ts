@@ -168,6 +168,15 @@ export type PluginSummary = {
   installed: InstalledPlugin | null;
 };
 
+export type PluginCompatibility = {
+  pluginId: string;
+  compatibility: CompatibilityStatus;
+  compatibilityDetail: string | null;
+  installVersion: string | null;
+  sourceBinding: SourceBindingStatus;
+  sourceBindingDetail: string | null;
+};
+
 export type MarketSort = "score" | "stars" | "recentlyUpdated" | "name";
 
 export type MarketQuery = {

@@ -9,8 +9,8 @@ use dsh_core::{
     marketplace::{
         CompatibilityInfo, CompatibilityStatus, InstalledPlugin, MarketCatalogState,
         MarketOperationKind, MarketOperationResult, MarketPage, MarketQuery, MarketSort,
-        PendingMarketChange, PendingVerification, PluginKind, PluginSource, PluginSummary,
-        SourceBindingStatus,
+        PendingMarketChange, PendingVerification, PluginCompatibility, PluginKind, PluginSource,
+        PluginSummary, SourceBindingStatus,
     },
 };
 use ts_rs::TS;
@@ -43,6 +43,7 @@ fn main() {
         CompatibilityInfo::decl(),
         InstalledPlugin::decl(),
         PluginSummary::decl(),
+        PluginCompatibility::decl(),
         MarketSort::decl(),
         MarketQuery::decl(),
         MarketPage::decl(),

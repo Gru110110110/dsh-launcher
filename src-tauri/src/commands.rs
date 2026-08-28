@@ -255,6 +255,20 @@ pub async fn market_compatibility(
 }
 
 #[tauri::command]
+pub async fn market_compatibility_batch(
+    plugin_ids: Vec<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<dsh_core::marketplace::PluginCompatibility>, AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || {
+            state.marketplace.compatibility_batch(&plugin_ids)
+        })
+        .await,
+    )
+}
+
+#[tauri::command]
 pub async fn market_inspect(
     plugin_id: String,
     state: State<'_, Arc<AppState>>,

@@ -2073,6 +2073,7 @@ pub fn run() {
             commands::market_query,
             commands::market_installed,
             commands::market_compatibility,
+            commands::market_compatibility_batch,
             commands::market_inspect,
             commands::market_install,
             commands::market_uninstall,

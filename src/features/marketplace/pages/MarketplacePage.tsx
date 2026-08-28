@@ -253,12 +253,53 @@ export function MarketplacePage() {
       });
   }, [translate]);
 
+  // Compatibility is hydrated from the ids returned by the page query. This
+  // keeps the immediate list render while avoiding a second full catalog
+  // filter and sort solely to rediscover the same page.
+  const runCompatPass = useCallback(
+    (items: PluginSummary[], resultPage: number, token: number) => {
+      if (items.length === 0) return;
+      marketApi
+        .compatibilityBatch(items.map((item) => item.id))
+        .then((result) => {
+          if (token !== compatToken.current) return;
+          setPage((previous) => {
+            if (!previous || previous.page !== resultPage) return previous;
+            const compatById = new Map(
+              result.map((item) => [item.pluginId, item]),
+            );
+            return {
+              ...previous,
+              items: previous.items.map((item) => {
+                const fresh = compatById.get(item.id);
+                if (!fresh) return item;
+                return {
+                  ...item,
+                  compatibility: fresh.compatibility,
+                  compatibilityDetail: fresh.compatibilityDetail,
+                  installVersion: fresh.installVersion,
+                  sourceBinding: fresh.sourceBinding,
+                  sourceBindingDetail: fresh.sourceBindingDetail,
+                };
+              }),
+            };
+          });
+        })
+        .catch(() => {
+          // Badges stay "not checked"; the install flow still enforces
+          // compatibility, so a silent background failure is safe.
+        });
+    },
+    [],
+  );
+
   // The data query owns the page content and the loading flag; it must win
-  // immediately. The compatibility pass runs independently in the background
-  // and only patches badge fields when it settles.
+  // immediately. Once it settles, only its returned ids are checked in the
+  // background compatibility pass.
   const runQuery = useCallback(
     (query: MarketQuery) => {
       const token = ++dataToken.current;
+      const compatibilityToken = ++compatToken.current;
       marketApi
         .query(query)
         .then((result) => {
@@ -268,6 +309,7 @@ export function MarketplacePage() {
             setPageNumber(result.page);
           }
           setLoading(false);
+          runCompatPass(result.items, result.page, compatibilityToken);
         })
         .catch((error: unknown) => {
           if (token !== dataToken.current) return;
@@ -278,42 +320,8 @@ export function MarketplacePage() {
           showTimedError(error, translate);
         });
     },
-    [translate],
+    [runCompatPass, translate],
   );
-
-  const runCompatPass = useCallback((query: MarketQuery) => {
-    const token = ++compatToken.current;
-    marketApi
-      .query({ ...query, checkCompatibility: true })
-      .then((result) => {
-        if (token !== compatToken.current) return;
-        setPage((previous) => {
-          if (!previous || previous.page !== result.page) return previous;
-          const compatById = new Map(
-            result.items.map((item) => [item.id, item]),
-          );
-          return {
-            ...previous,
-            items: previous.items.map((item) => {
-              const fresh = compatById.get(item.id);
-              if (!fresh) return item;
-              return {
-                ...item,
-                compatibility: fresh.compatibility,
-                compatibilityDetail: fresh.compatibilityDetail,
-                installVersion: fresh.installVersion,
-                sourceBinding: fresh.sourceBinding,
-                sourceBindingDetail: fresh.sourceBindingDetail,
-              };
-            }),
-          };
-        });
-      })
-      .catch(() => {
-        // Badges stay "not checked"; the install flow still enforces
-        // compatibility, so a silent background failure is safe.
-      });
-  }, []);
 
   // Load the current catalog state on mount. An in-flight refresh settles via
   // the durable catalog revision in the launcher snapshot, so no polling is
@@ -417,14 +425,12 @@ export function MarketplacePage() {
     observedMarketRevision.current = launcher.marketRevision;
     const query = buildQuery(pageNumber);
     runQuery(query);
-    runCompatPass(query);
     runPendingQuery();
   }, [
     launcher.marketRevision,
     pageNumber,
     buildQuery,
     runQuery,
-    runCompatPass,
     runPendingQuery,
   ]);
 
@@ -443,7 +449,6 @@ export function MarketplacePage() {
           catalogStamp.current = state.generatedAt;
           const query = buildQuery(pageNumber);
           runQuery(query);
-          runCompatPass(query);
         }
       })
       .catch((error: unknown) => {
@@ -456,7 +461,6 @@ export function MarketplacePage() {
     pageNumber,
     buildQuery,
     runQuery,
-    runCompatPass,
     translate,
   ]);
 
@@ -464,9 +468,6 @@ export function MarketplacePage() {
     setLoading(true);
     const query = buildQuery(pageNumber);
     runQuery(query);
-    // A background pass fills the compatibility badges for this page only;
-    // results are cached Rust-side so later pages resolve instantly.
-    runCompatPass(query);
   }, [
     appliedSearch,
     kind,
@@ -475,7 +476,6 @@ export function MarketplacePage() {
     pageNumber,
     buildQuery,
     runQuery,
-    runCompatPass,
   ]);
 
   // Silent TTL refresh: downloads only when the cached catalog is older than
@@ -506,7 +506,6 @@ export function MarketplacePage() {
           }
           const query = buildQuery(pageNumber);
           runQuery(query);
-          runCompatPass(query);
         }
       })
       .catch(() => {
@@ -533,7 +532,6 @@ export function MarketplacePage() {
           }
           const query = buildQuery(pageNumber);
           runQuery(query);
-          runCompatPass(query);
         }
       })
       .catch((error: unknown) => {

@@ -6,6 +6,7 @@ import type {
   MarketPage,
   MarketQuery,
   PendingVerification,
+  PluginCompatibility,
   PluginKind,
   PluginSummary,
 } from "./generated/bindings";
@@ -23,6 +24,8 @@ export const marketApi = {
   refreshCatalogIfStale: () =>
     command<MarketCatalogState>("market_refresh_if_stale"),
   query: (query: MarketQuery) => command<MarketPage>("market_query", { query }),
+  compatibilityBatch: (pluginIds: string[]) =>
+    command<PluginCompatibility[]>("market_compatibility_batch", { pluginIds }),
   installed: () => command<InstalledPlugin[]>("market_installed"),
   inspect: (pluginId: string) =>
     command<PluginSummary>("market_inspect", { pluginId }),
@@ -234,6 +237,19 @@ if (!isTauri) {
       : Promise.reject(new Error(`plugin not found: ${pluginId}`));
   };
   marketApi.query = devQuery;
+  marketApi.compatibilityBatch = (pluginIds) =>
+    delay(
+      devPlugins
+        .filter((plugin) => pluginIds.includes(plugin.id))
+        .map((plugin) => ({
+          pluginId: plugin.id,
+          compatibility: "compatible" as const,
+          compatibilityDetail: "cordis 4.0.1",
+          installVersion: plugin.installVersion,
+          sourceBinding: plugin.sourceBinding,
+          sourceBindingDetail: plugin.sourceBindingDetail,
+        })),
+    );
   marketApi.installed = () => delay<InstalledPlugin[]>([]);
   marketApi.install = (pluginId: string) =>
     delay<MarketOperationResult>(
