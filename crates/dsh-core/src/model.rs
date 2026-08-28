@@ -22,6 +22,99 @@ pub enum ThemePreference {
     Dark,
 }
 
+/// Proxy mode for every Launcher-owned network operation. `System` is the
+/// default so installations and configurations written before proxy support
+/// keep their previous behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    #[default]
+    System,
+    Direct,
+    Manual,
+}
+
+/// Proxy configuration. Every persistence and snapshot boundary canonicalizes
+/// this value through `network::for_persistence`: manual URLs carrying
+/// userinfo are rejected, while inactive URL/bypass fields are erased.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySettings {
+    pub mode: ProxyMode,
+    /// Single proxy URL for manual mode (http, https, socks5, socks5h).
+    #[serde(default)]
+    pub url: String,
+    /// Optional comma/semicolon separated bypass (NO_PROXY) list for manual
+    /// mode.
+    #[serde(default)]
+    pub bypass: String,
+}
+
+/// Conservative classification of a failed network operation. Anything that
+/// does not clearly match a known category stays `Other` so diagnostics never
+/// claim a cause they cannot prove.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkErrorKind {
+    Timeout,
+    ProxyAuth,
+    Tls,
+    Connect,
+    HttpStatus,
+    #[default]
+    Other,
+}
+
+impl NetworkErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::ProxyAuth => "proxyAuth",
+            Self::Tls => "tls",
+            Self::Connect => "connect",
+            Self::HttpStatus => "httpStatus",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "timeout" => Self::Timeout,
+            "proxyAuth" => Self::ProxyAuth,
+            "tls" => Self::Tls,
+            "connect" => Self::Connect,
+            "httpStatus" => Self::HttpStatus,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A Harness registry that answered the proxy connection test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestSource {
+    pub source: String,
+    pub version: String,
+}
+
+/// A Harness registry that failed the proxy connection test. `detail` is
+/// sanitized: proxy credentials and URL userinfo never appear in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestFailure {
+    pub source: String,
+    pub kind: NetworkErrorKind,
+    pub detail: String,
+}
+
+/// Outcome of a proxy connection test across all Harness registries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestReport {
+    pub sources: Vec<ProxyTestSource>,
+    pub failures: Vec<ProxyTestFailure>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum LauncherStep {
@@ -211,6 +304,7 @@ pub struct LauncherSnapshot {
     pub migration: MigrationState,
     pub tray_available: bool,
     pub show_balance_card: bool,
+    pub proxy: ProxySettings,
 }
 
 impl LauncherSnapshot {
@@ -238,6 +332,7 @@ impl LauncherSnapshot {
             migration: MigrationState::default(),
             tray_available: false,
             show_balance_card: true,
+            proxy: ProxySettings::default(),
         }
     }
 }

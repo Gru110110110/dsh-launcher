@@ -18,7 +18,7 @@ hex = "0.4"
 libc = "0.2"
 log = "0.4"
 regex = "1.11"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots", "socks", "system-proxy"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -4,19 +4,36 @@ import {
   Info,
   Languages,
   MoonStar,
+  Network,
   RefreshCw,
   Wallet,
 } from "lucide-react";
+import { useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { launcherApi } from "@/platform/launcherApi";
 import { shallowEqual, useLauncherSelector } from "@/platform/launcherStore";
-import type { Language, ThemePreference } from "@/platform/generated/bindings";
+import type {
+  Language,
+  ProxyMode,
+  ProxySettings,
+  ProxyTestReport,
+  ThemePreference,
+} from "@/platform/generated/bindings";
 import { showTimedError } from "@/shared/errorToast";
 import githubIconUrl from "../../../../assets/external/github.svg";
 import {
   getDesktopUpdateAction,
   getDesktopUpdateDetail,
+  proxyDraftAfterSave,
+  proxyDraftChanged,
+  proxyDraftFromSettings,
+  proxySettingsFromDraft,
+  proxyTestFailureCopy,
+  proxyTestSuccessCopy,
+  proxyValidationErrorKey,
+  validateProxyDraft,
+  type ProxyDraft,
 } from "../presentation";
 
 function SegmentedControl<T extends string>({
@@ -50,6 +67,269 @@ function SegmentedControl<T extends string>({
   );
 }
 
+function proxyErrorMessage(
+  error: unknown,
+  t: (key: string) => string,
+): string | null {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === "proxyUrlInvalid"
+  ) {
+    const values = (error as { values?: Record<string, unknown> }).values;
+    const reason = typeof values?.reason === "string" ? values.reason : null;
+    return t(proxyValidationErrorKey(reason));
+  }
+  return null;
+}
+
+function revealFullTextOnTruncation(
+  event: ReactMouseEvent<HTMLSpanElement>,
+  fullText: string,
+) {
+  const element = event.currentTarget;
+  // Only surface the native tooltip when the ellipsis actually hides content.
+  element.title = element.scrollWidth > element.clientWidth ? fullText : "";
+}
+
+function ProxySection({
+  proxy,
+  run,
+  t,
+}: {
+  proxy: ProxySettings;
+  run: (task: Promise<unknown>) => void;
+  t: (key: string, values?: Record<string, unknown>) => string;
+}) {
+  const [draft, setDraft] = useState<ProxyDraft>(() =>
+    proxyDraftFromSettings(proxy),
+  );
+  const [formError, setFormError] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [report, setReport] = useState<ProxyTestReport | null>(null);
+  const testRequest = useRef(0);
+  const draftRevision = useRef(0);
+  const draftError = validateProxyDraft(draft);
+  const dirty = proxyDraftChanged(draft, proxy);
+  const modeDetail: Record<ProxyMode, string> = {
+    system: "settings.proxyModeSystemDetail",
+    direct: "settings.proxyModeDirectDetail",
+    manual: "settings.proxyModeManualDetail",
+  };
+  const successCopy = report ? proxyTestSuccessCopy(report) : null;
+  const proxyNote = `${t("settings.proxyCredentialsNote")} ${t("settings.proxyTestNote")}`;
+
+  const update = (patch: Partial<ProxyDraft>) => {
+    // Invalidate any in-flight connection test. Its result belongs to the old
+    // form values and must never be rendered under the updated draft.
+    testRequest.current += 1;
+    draftRevision.current += 1;
+    setDraft((current) => ({ ...current, ...patch }));
+    setFormError(null);
+    setReport(null);
+    setTesting(false);
+  };
+
+  const save = () => {
+    if (draftError) {
+      setFormError(t(proxyValidationErrorKey(draftError)));
+      return;
+    }
+    setFormError(null);
+    const settings = proxySettingsFromDraft(draft);
+    const saveRevision = draftRevision.current;
+    run(
+      launcherApi
+        .setProxy(settings)
+        .then((restartRequired) => {
+          // Match the backend's canonical persistence representation. Inactive
+          // manual fields are not retained after Direct/System is saved.
+          setDraft((current) =>
+            proxyDraftAfterSave(
+              current,
+              settings,
+              saveRevision,
+              draftRevision.current,
+            ),
+          );
+          if (!restartRequired) {
+            toast.success(t("settings.proxySaved"));
+            return;
+          }
+          toast.success(t("settings.proxySavedRestartRequired"), {
+            duration: 12_000,
+            action: {
+              label: t("settings.proxyRestart"),
+              onClick: () => {
+                run(launcherApi.restart());
+              },
+            },
+          });
+        })
+        .catch((error: unknown) => {
+          const message = proxyErrorMessage(error, t);
+          if (message) {
+            if (draftRevision.current === saveRevision) {
+              setFormError(message);
+            }
+            return;
+          }
+          throw error;
+        }),
+    );
+  };
+
+  const test = () => {
+    if (draftError) {
+      setFormError(t(proxyValidationErrorKey(draftError)));
+      return;
+    }
+    setFormError(null);
+    setReport(null);
+    setTesting(true);
+    const request = ++testRequest.current;
+    launcherApi
+      .testProxy(proxySettingsFromDraft(draft))
+      .then((result) => {
+        if (testRequest.current !== request) return;
+        setReport(result);
+      })
+      .catch((error: unknown) => {
+        if (testRequest.current !== request) return;
+        const message = proxyErrorMessage(error, t);
+        if (message) {
+          setFormError(message);
+        } else {
+          showTimedError(error, (key, values) => t(key, values));
+        }
+      })
+      .finally(() => {
+        if (testRequest.current !== request) return;
+        setTesting(false);
+      });
+  };
+
+  return (
+    <section className="page-section settings-proxy">
+      <h2 className="section-label">{t("settings.proxy")}</h2>
+      <div className="panel rows-panel">
+        <div className="info-row settings-row">
+          <Network className="row-icon" size={18} aria-hidden />
+          <div className="row-copy">
+            <strong>{t("settings.proxy")}</strong>
+            <span>{t(modeDetail[draft.mode])}</span>
+          </div>
+          <SegmentedControl<ProxyMode>
+            label={t("settings.proxy")}
+            value={draft.mode}
+            options={[
+              { value: "system", label: t("settings.proxyModeSystem") },
+              { value: "direct", label: t("settings.proxyModeDirect") },
+              { value: "manual", label: t("settings.proxyModeManual") },
+            ]}
+            onChange={(mode) => {
+              update({ mode });
+            }}
+          />
+        </div>
+        {draft.mode === "manual" && (
+          <>
+            <div className="info-row settings-row proxy-field-row">
+              <div className="proxy-field">
+                <label htmlFor="proxy-url">{t("settings.proxyUrl")}</label>
+                <input
+                  id="proxy-url"
+                  type="text"
+                  value={draft.url}
+                  placeholder={t("settings.proxyUrlPlaceholder")}
+                  spellCheck={false}
+                  autoComplete="off"
+                  onChange={(event) => {
+                    update({ url: event.target.value });
+                  }}
+                />
+              </div>
+            </div>
+            <div className="info-row settings-row proxy-field-row">
+              <div className="proxy-field">
+                <label htmlFor="proxy-bypass">
+                  {t("settings.proxyBypass")}
+                </label>
+                <input
+                  id="proxy-bypass"
+                  type="text"
+                  value={draft.bypass}
+                  placeholder={t("settings.proxyBypassPlaceholder")}
+                  spellCheck={false}
+                  autoComplete="off"
+                  onChange={(event) => {
+                    update({ bypass: event.target.value });
+                  }}
+                />
+                <span className="proxy-hint">
+                  {t("settings.proxyBypassDetail")}
+                </span>
+              </div>
+            </div>
+          </>
+        )}
+        <div className="info-row settings-row proxy-actions-row">
+          <div className="row-copy">
+            <span
+              className="proxy-hint"
+              onMouseEnter={(event) => {
+                revealFullTextOnTruncation(event, proxyNote);
+              }}
+            >
+              {proxyNote}
+            </span>
+            {formError && <span className="proxy-error">{formError}</span>}
+          </div>
+          <button
+            className="outline-button"
+            type="button"
+            disabled={testing || draftError !== null}
+            onClick={test}
+          >
+            <RefreshCw size={14} className={testing ? "spin" : ""} />
+            {testing ? t("settings.proxyTesting") : t("settings.proxyTest")}
+          </button>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={!dirty || draftError !== null}
+            onClick={save}
+          >
+            {t("settings.proxySave")}
+          </button>
+        </div>
+        {report && (
+          <div className="proxy-report" role="status">
+            {successCopy && (
+              <span className="proxy-report-success">
+                {t(successCopy.key, successCopy.values)}
+              </span>
+            )}
+            {report.sources.length === 0 && (
+              <span className="proxy-error">
+                {t("settings.proxyTestFailed")}
+              </span>
+            )}
+            {report.failures.map((failure) => {
+              const copy = proxyTestFailureCopy(failure);
+              return (
+                <span className="proxy-report-failure" key={failure.source}>
+                  {t(copy.key, copy.values)} — {failure.detail}
+                </span>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export function SettingsPage() {
   const state = useLauncherSelector(
     (snapshot) => ({
@@ -60,6 +340,7 @@ export function SettingsPage() {
     }),
     shallowEqual,
   );
+  const proxy = useLauncherSelector((snapshot) => snapshot.proxy, shallowEqual);
   const desktopUpdate = useLauncherSelector(
     (snapshot) => snapshot.desktopUpdate,
     shallowEqual,
@@ -140,6 +421,8 @@ export function SettingsPage() {
           </div>
         </div>
       </section>
+
+      <ProxySection proxy={proxy} run={run} t={t} />
 
       <section className="page-section settings-about">
         <h2 className="section-label">{t("settings.about")}</h2>

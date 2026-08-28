@@ -107,6 +107,7 @@ export type LauncherSnapshot = {
   migration: MigrationState;
   trayAvailable: boolean;
   showBalanceCard: boolean;
+  proxy: ProxySettings;
 };
 
 export type PluginKind = "cordisPlugin" | "skill";
@@ -246,4 +247,40 @@ export type BalanceSnapshot = {
   currency: string | null;
   totalBalance: string | null;
   fetchedAtMs: number | null;
+};
+
+export type ProxyMode = "system" | "direct" | "manual";
+
+export type ProxySettings = {
+  mode: ProxyMode;
+  /**
+   * Single proxy URL for manual mode (http, https, socks5, socks5h).
+   */
+  url: string;
+  /**
+   * Optional comma/semicolon separated bypass (NO_PROXY) list for manual
+   * mode.
+   */
+  bypass: string;
+};
+
+export type NetworkErrorKind =
+  | "timeout"
+  | "proxyAuth"
+  | "tls"
+  | "connect"
+  | "httpStatus"
+  | "other";
+
+export type ProxyTestSource = { source: string; version: string };
+
+export type ProxyTestFailure = {
+  source: string;
+  kind: NetworkErrorKind;
+  detail: string;
+};
+
+export type ProxyTestReport = {
+  sources: Array<ProxyTestSource>;
+  failures: Array<ProxyTestFailure>;
 };

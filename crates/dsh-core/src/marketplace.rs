@@ -3062,10 +3062,7 @@ fn split_name_version(local_name: &str) -> (String, Option<String>) {
 // ---------------------------------------------------------------------------
 
 fn http_client() -> AppResult<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .user_agent(format!("DSH-Launcher/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|error| AppError::new("marketNetworkFailed").detail(error.to_string()))
+    crate::network::active_blocking_client(&format!("DSH-Launcher/{}", env!("CARGO_PKG_VERSION")))
 }
 
 fn github_sync_client(token: &str) -> AppResult<reqwest::blocking::Client> {
@@ -3078,14 +3075,16 @@ fn github_sync_client(token: &str) -> AppResult<reqwest::blocking::Client> {
     let authorization = HeaderValue::from_str(&format!("Bearer {}", token.trim()))
         .map_err(|_| AppError::new("marketSyncTokenInvalid"))?;
     headers.insert(AUTHORIZATION, authorization);
-    reqwest::blocking::Client::builder()
-        .user_agent(format!(
-            "DSH-Launcher-Market-Sync/{}",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .default_headers(headers)
-        .build()
-        .map_err(|error| AppError::new("marketNetworkFailed").detail(error.to_string()))
+    crate::network::blocking_builder(
+        &format!("DSH-Launcher-Market-Sync/{}", env!("CARGO_PKG_VERSION")),
+        &crate::network::active(),
+    )?
+    .default_headers(headers)
+    .build()
+    .map_err(|error| {
+        AppError::new("marketNetworkFailed")
+            .detail(crate::network::sanitize_detail(&error.to_string()))
+    })
 }
 
 fn market_service_error(error: reqwest::Error) -> AppError {
@@ -3094,7 +3093,7 @@ fn market_service_error(error: reqwest::Error) -> AppError {
     let mut app_error = AppError::new("marketCatalogServiceUnavailable")
         .value("source", "market.dsdesktop.com")
         .value("retryable", retryable)
-        .detail(error.to_string());
+        .detail(crate::network::sanitize_detail(&error.to_string()));
     if let Some(status) = status {
         app_error = app_error.value("status", status.as_u16());
     }
@@ -3223,9 +3222,15 @@ fn fetch_bytes_with(
         .get(url)
         .timeout(timeout)
         .send()
-        .map_err(|error| AppError::new("marketNetworkFailed").detail(error.to_string()))?
+        .map_err(|error| {
+            AppError::new("marketNetworkFailed")
+                .detail(crate::network::sanitize_detail(&error.to_string()))
+        })?
         .error_for_status()
-        .map_err(|error| AppError::new("marketNetworkFailed").detail(error.to_string()))?;
+        .map_err(|error| {
+            AppError::new("marketNetworkFailed")
+                .detail(crate::network::sanitize_detail(&error.to_string()))
+        })?;
     if let Some(length) = response.content_length()
         && usize::try_from(length).unwrap_or(usize::MAX) > max_bytes
     {
@@ -3237,7 +3242,10 @@ fn fetch_bytes_with(
     response
         .take((max_bytes + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|error| AppError::new("marketNetworkFailed").detail(error.to_string()))?;
+        .map_err(|error| {
+            AppError::new("marketNetworkFailed")
+                .detail(crate::network::sanitize_detail(&error.to_string()))
+        })?;
     if bytes.len() > max_bytes {
         return Err(AppError::new(code).detail(format!("{subject} exceeds the size limit")));
     }
@@ -3798,12 +3806,13 @@ fn market_command_env<'a>(
     paths: &ApplicationPaths,
     path_prepend: &[PathBuf],
 ) -> &'a mut Command {
+    // Proxy variables are deliberately absent from this allowlist: they are
+    // injected deterministically by the unified proxy configuration below.
     let allowed = [
         "COMSPEC",
         "LANG",
         "LC_ALL",
         "NODE_EXTRA_CA_CERTS",
-        "NO_PROXY",
         "PATH",
         "SSL_CERT_DIR",
         "SSL_CERT_FILE",
@@ -3811,11 +3820,6 @@ fn market_command_env<'a>(
         "TEMP",
         "TMP",
         "TMPDIR",
-        "http_proxy",
-        "https_proxy",
-        "no_proxy",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
     ];
     let values: Vec<_> = allowed
         .iter()
@@ -3828,6 +3832,7 @@ fn market_command_env<'a>(
         .env("USERPROFILE", &paths.app_home)
         .env("DSH_HOME", &paths.dsh_home)
         .env("DSH_TELEMETRY_DISABLED", "1");
+    crate::network::apply_to_command(command);
     // The bundled node directory must be on PATH as well: pnpm shims carry a
     // `#!/usr/bin/env node` shebang, and the Harness CLI spawns pnpm through
     // PATH, so without this the shim dies with "env: node: No such file or

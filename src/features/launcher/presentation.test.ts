@@ -26,6 +26,7 @@ function snapshot(overrides: Partial<LauncherSnapshot> = {}): LauncherSnapshot {
     migration: { kind: "notRequired" },
     trayAvailable: true,
     showBalanceCard: true,
+    proxy: { mode: "system", url: "", bypass: "" },
     ...overrides,
   };
 }

@@ -23,8 +23,16 @@ serde_json.workspace = true
 tauri = { version = "2.8", features = ["tray-icon", "image-png"] }
 tauri-plugin-clipboard-manager = "2.3"
 tauri-plugin-log = "2.7"
-tauri-plugin-updater = "2.9"
+# Pinned to a minor series: `UpdaterBuilder::configure_client` exposes the
+# plugin's reqwest 0.13 ClientBuilder type, which can change across plugin
+# minor versions.
+tauri-plugin-updater = "~2.10.1"
 tokio = { version = "1", features = ["time"] }
+url.workspace = true
+# Alias for the updater plugin's reqwest 0.13: feature unification enables
+# socks and system-proxy for updater checks and downloads, and the shared
+# version keeps the `configure_client` ClientBuilder type identical.
+reqwest-updater = { package = "reqwest", version = "0.13", default-features = false, features = ["socks", "system-proxy"] }
 
 [dev-dependencies]
 tempfile.workspace = true

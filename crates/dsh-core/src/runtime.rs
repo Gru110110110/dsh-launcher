@@ -24,6 +24,8 @@ use uuid::Uuid;
 use crate::{
     ActivityCode, AppError, AppResult, ApplicationPaths,
     log_file::{INSTALL_LOG_MAX_BYTES, trim_log_tail},
+    model::{NetworkErrorKind, ProxySettings, ProxyTestFailure, ProxyTestReport, ProxyTestSource},
+    network,
     paths::atomic_write,
 };
 
@@ -144,6 +146,7 @@ pub fn latest_harness_version(controller: &DeploymentController) -> AppResult<St
     // and the newest observed latest version wins.
     let mut latest = None;
     let mut failures = Vec::new();
+    let mut failure_kinds = Vec::new();
     for registry in registries {
         controller.check()?;
         match query_registry_version(&client, &registry) {
@@ -153,14 +156,18 @@ pub fn latest_harness_version(controller: &DeploymentController) -> AppResult<St
                     _ => version,
                 });
             }
-            Err(error) => failures.push(format!(
-                "{}: {}",
-                display_source(&registry),
-                error
-                    .safe_detail
-                    .clone()
-                    .unwrap_or_else(|| error.code.clone())
-            )),
+            Err(error) => {
+                // Query errors already carry their (sanitized) source prefix;
+                // prefixing again would duplicate the registry address.
+                failures.push(
+                    error.safe_detail.clone().unwrap_or_else(|| {
+                        format!("{}: {}", display_source(&registry), error.code)
+                    }),
+                );
+                if let Some(kind) = error.values.get("kind") {
+                    failure_kinds.push(NetworkErrorKind::parse(kind));
+                }
+            }
         }
     }
     latest.map(|version| version.to_string()).ok_or_else(|| {
@@ -169,8 +176,39 @@ pub fn latest_harness_version(controller: &DeploymentController) -> AppResult<St
         } else {
             failures.join("; ")
         };
-        AppError::new("versionQueryFailed").detail(detail)
+        let kind = primary_version_query_failure(&failure_kinds);
+        let code = match kind {
+            Some(NetworkErrorKind::ProxyAuth) => "versionQueryProxyAuth",
+            Some(NetworkErrorKind::Tls) => "versionQueryTls",
+            Some(NetworkErrorKind::Timeout) => "versionQueryTimeout",
+            Some(NetworkErrorKind::Connect) => "versionQueryConnect",
+            Some(NetworkErrorKind::HttpStatus) => "versionQueryHttpStatus",
+            Some(NetworkErrorKind::Other) | None => "versionQueryFailed",
+        };
+        let error = AppError::new(code).detail(detail);
+        match kind {
+            Some(kind) => error.value("kind", kind.as_str()),
+            None => error,
+        }
     })
+}
+
+/// Chooses the most actionable transport cause when every registry failed.
+/// Proxy authentication and TLS configuration need different user action from
+/// an ordinary connection failure, so they take priority when sources fail in
+/// different ways. Metadata-only failures carry no kind and retain the generic
+/// version-query error.
+fn primary_version_query_failure(kinds: &[NetworkErrorKind]) -> Option<NetworkErrorKind> {
+    [
+        NetworkErrorKind::ProxyAuth,
+        NetworkErrorKind::Tls,
+        NetworkErrorKind::Timeout,
+        NetworkErrorKind::Connect,
+        NetworkErrorKind::HttpStatus,
+        NetworkErrorKind::Other,
+    ]
+    .into_iter()
+    .find(|candidate| kinds.contains(candidate))
 }
 
 pub fn verify_release_sources() -> AppResult<Vec<String>> {
@@ -185,8 +223,11 @@ pub fn verify_release_sources() -> AppResult<Vec<String>> {
                 .and_then(|response| response.error_for_status())
                 .and_then(|response| response.text())
                 .map_err(|error| {
-                    AppError::new("releaseSourceFailed")
-                        .detail(format!("{}: {error}", display_source(&manifest_url)))
+                    AppError::new("releaseSourceFailed").detail(format!(
+                        "{}: {}",
+                        display_source(&manifest_url),
+                        network::sanitize_detail(&error.to_string())
+                    ))
                 })
         })?;
         for (filename, expected) in RELEASE_NODE_ASSETS {
@@ -286,8 +327,14 @@ fn query_registry_packument(client: &Client, registry: &str) -> AppResult<Value>
         .and_then(|response| response.error_for_status())
         .and_then(|response| response.json::<Value>())
         .map_err(|error| {
+            let classified = network::classify_reqwest(&error);
             AppError::new("versionQueryFailed")
-                .detail(format!("{}: {error}", display_source(registry)))
+                .value("kind", classified.kind.as_str())
+                .detail(format!(
+                    "{}: {}",
+                    display_source(registry),
+                    classified.detail
+                ))
         })
 }
 
@@ -418,8 +465,11 @@ fn download_harness_tarball(
             if error.is_timeout() || Instant::now() >= deadline {
                 AppError::new("downloadTimedOut")
             } else {
-                AppError::new("downloadFailed")
-                    .detail(format!("{}: {error}", display_source(&source.tarball)))
+                AppError::new("downloadFailed").detail(format!(
+                    "{}: {}",
+                    display_source(&source.tarball),
+                    network::sanitize_detail(&error.to_string())
+                ))
             }
         })?;
     if response
@@ -1560,7 +1610,7 @@ fn download_once(
             if error.is_timeout() || Instant::now() >= deadline {
                 AppError::new("downloadTimedOut")
             } else {
-                AppError::new("downloadFailed").detail(error.to_string())
+                AppError::new("downloadFailed").detail(network::sanitize_detail(&error.to_string()))
             }
         })?;
     let total = response.content_length();
@@ -2232,12 +2282,13 @@ fn stop_windows_command_tree(
 }
 
 fn isolated_command(command: &mut Command, paths: &ApplicationPaths) {
+    // Proxy variables are deliberately absent from this allowlist: they are
+    // injected deterministically by the unified proxy configuration below.
     let allowed = [
         "COMSPEC",
         "LANG",
         "LC_ALL",
         "NODE_EXTRA_CA_CERTS",
-        "NO_PROXY",
         "PATH",
         "SSL_CERT_DIR",
         "SSL_CERT_FILE",
@@ -2245,11 +2296,6 @@ fn isolated_command(command: &mut Command, paths: &ApplicationPaths) {
         "TEMP",
         "TMP",
         "TMPDIR",
-        "http_proxy",
-        "https_proxy",
-        "no_proxy",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
     ];
     let values: Vec<_> = allowed
         .iter()
@@ -2266,6 +2312,7 @@ fn isolated_command(command: &mut Command, paths: &ApplicationPaths) {
         )
         .env("DSH_HOME", paths.cache_dir.join("validation-home"))
         .env("DSH_TELEMETRY_DISABLED", "1");
+    network::apply_to_command(command);
 }
 
 #[cfg(unix)]
@@ -2689,15 +2736,74 @@ fn acquire_lock(file: &File, controller: &DeploymentController) -> AppResult<()>
 }
 
 fn http_client() -> AppResult<Client> {
-    Client::builder()
-        .user_agent("dsh-desktop")
+    network::blocking_builder("dsh-desktop", &network::active())?
         .connect_timeout(Duration::from_secs(env_seconds(
             "DSH_DESKTOP_NETWORK_TIMEOUT_SECONDS",
             10,
         )))
         .timeout(Duration::from_secs(60))
         .build()
-        .map_err(|error| AppError::new("networkClientFailed").detail(error.to_string()))
+        .map_err(|error| {
+            AppError::new("networkClientFailed")
+                .detail(network::sanitize_detail(&error.to_string()))
+        })
+}
+
+/// Tests the given (possibly not yet persisted) proxy settings against every
+/// configured Harness registry and reports each outcome. Validation and
+/// client-construction problems are errors; per-registry outcomes — success
+/// with the resolved latest version or a classified, sanitized failure — are
+/// data, so the caller can show every source at once. A usable configuration
+/// has at least one entry in `sources`.
+pub fn test_proxy_connection(settings: &ProxySettings) -> AppResult<ProxyTestReport> {
+    network::validate(settings)?;
+    let client = network::blocking_builder("dsh-desktop-proxy-test", settings)?
+        .connect_timeout(Duration::from_secs(env_seconds(
+            "DSH_DESKTOP_NETWORK_TIMEOUT_SECONDS",
+            10,
+        )))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| {
+            AppError::new("networkClientFailed")
+                .detail(network::sanitize_detail(&error.to_string()))
+        })?;
+    let mut report = ProxyTestReport::default();
+    for registry in npm_registries() {
+        match query_registry_version(&client, &registry) {
+            Ok(version) => report.sources.push(ProxyTestSource {
+                source: display_source(&registry),
+                version: version.to_string(),
+            }),
+            Err(error) => {
+                // Query errors are already prefixed with their source; strip
+                // it so the report (and any joined detail) never repeats the
+                // registry address.
+                let source = display_source(&registry);
+                let detail = error
+                    .safe_detail
+                    .clone()
+                    .unwrap_or_else(|| error.code.clone());
+                let detail = detail
+                    .strip_prefix(&format!("{source}: "))
+                    .map(str::to_owned)
+                    .unwrap_or(detail);
+                report.failures.push(ProxyTestFailure {
+                    source,
+                    kind: error
+                        .values
+                        .get("kind")
+                        .map(|kind| NetworkErrorKind::parse(kind))
+                        .unwrap_or_default(),
+                    detail,
+                });
+            }
+        }
+    }
+    if report.sources.is_empty() && report.failures.is_empty() {
+        return Err(AppError::new("proxyTestFailed").detail("no npm registry configured"));
+    }
+    Ok(report)
 }
 fn sha256(path: &Path) -> AppResult<String> {
     let mut file = File::open(path)?;
@@ -3911,5 +4017,198 @@ mod tests {
             }
         });
         (format!("http://{address}"), server)
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-registry and proxy-behavior tests. `npm_registries` and the
+    // system proxy mode read process environment variables, so these run in
+    // a child copy of the test binary with a cleared, controlled environment
+    // instead of mutating the shared environment of the test runner.
+    // -----------------------------------------------------------------------
+
+    fn closed_loopback_registry() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    fn spawn_version_query_child(
+        registries: &str,
+        extra: &[(&str, String)],
+    ) -> std::process::Output {
+        let executable = std::env::current_exe().unwrap();
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "runtime::tests::latest_harness_version_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("DSH_DESKTOP_NPM_REGISTRIES", registries)
+            .env("DSH_DESKTOP_TEST_SYSTEM_PROXY", "1")
+            .envs(extra.iter().map(|(key, value)| (*key, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.output().unwrap()
+    }
+
+    #[test]
+    #[ignore]
+    fn latest_harness_version_child() {
+        match latest_harness_version(&DeploymentController::default()) {
+            Ok(version) => println!("VERSION={version}"),
+            Err(error) => {
+                println!("ERROR_CODE={}", error.code);
+                println!("ERROR_DETAIL={}", error.safe_detail.unwrap_or_default());
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[test]
+    fn latest_version_succeeds_when_at_least_one_registry_answers() {
+        let (good, good_server) = serve_responses(vec![harness_packument("0.1.0-rc.7")]);
+        let bad = closed_loopback_registry();
+        let output = spawn_version_query_child(&format!("{bad},{good}"), &[]);
+        good_server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("VERSION=0.1.0-rc.7"), "{stdout}");
+    }
+
+    #[test]
+    fn failed_version_query_lists_each_registry_once_and_leaks_no_credentials() {
+        let bad_a = closed_loopback_registry();
+        let bad_b = closed_loopback_registry();
+        let output = spawn_version_query_child(
+            &format!("{bad_a},{bad_b}"),
+            &[
+                ("HTTP_PROXY", "http://user:topsecret@127.0.0.1:1".to_owned()),
+                (
+                    "HTTPS_PROXY",
+                    "http://user:topsecret@127.0.0.1:1".to_owned(),
+                ),
+            ],
+        );
+        assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("ERROR_CODE=versionQueryConnect"),
+            "{stdout}"
+        );
+        for registry in [&bad_a, &bad_b] {
+            let address = registry.trim_start_matches("http://");
+            assert_eq!(
+                stdout.matches(address).count(),
+                1,
+                "registry {address} must appear exactly once: {stdout}"
+            );
+        }
+        assert!(!stdout.contains("topsecret"), "{stdout}");
+        assert!(!stdout.contains("user@"), "{stdout}");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_proxy_connection_child() {
+        let settings: ProxySettings =
+            serde_json::from_str(&std::env::var("DSH_PROXY_TEST_SETTINGS").unwrap()).unwrap();
+        match test_proxy_connection(&settings) {
+            Ok(report) => println!("REPORT={}", serde_json::to_string(&report).unwrap()),
+            Err(error) => {
+                println!("ERROR_CODE={}", error.code);
+                println!("ERROR_DETAIL={}", error.safe_detail.unwrap_or_default());
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_connection_test_reports_each_registry_outcome() {
+        let (good, good_server) = serve_responses(vec![harness_packument("0.1.0-rc.7")]);
+        let bad = closed_loopback_registry();
+        let executable = std::env::current_exe().unwrap();
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "runtime::tests::test_proxy_connection_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("DSH_DESKTOP_NPM_REGISTRIES", format!("{bad},{good}"))
+            .env(
+                "DSH_PROXY_TEST_SETTINGS",
+                serde_json::to_string(&ProxySettings {
+                    mode: crate::model::ProxyMode::Direct,
+                    ..ProxySettings::default()
+                })
+                .unwrap(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command.output().unwrap();
+        good_server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report_line = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("REPORT="))
+            .expect("report line");
+        let report: crate::model::ProxyTestReport =
+            serde_json::from_str(report_line).expect("report json");
+        assert_eq!(report.sources.len(), 1);
+        assert_eq!(report.sources[0].version, "0.1.0-rc.7");
+        assert_eq!(report.sources[0].source, good);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].source, bad);
+        assert_eq!(report.failures[0].kind, NetworkErrorKind::Connect);
+        // The per-registry detail must not repeat the registry address.
+        assert!(
+            !report.failures[0]
+                .detail
+                .contains(bad.trim_start_matches("http://")),
+            "detail: {}",
+            report.failures[0].detail
+        );
+    }
+
+    #[test]
+    fn proxy_connection_test_rejects_invalid_settings() {
+        let invalid = ProxySettings {
+            mode: crate::model::ProxyMode::Manual,
+            url: "http://user:pw@127.0.0.1:8080".into(),
+            bypass: String::new(),
+        };
+        let error = test_proxy_connection(&invalid).expect_err("userinfo must be rejected");
+        assert_eq!(error.code, "proxyUrlInvalid");
+    }
+
+    #[test]
+    fn version_query_failure_prefers_actionable_proxy_causes() {
+        assert_eq!(
+            primary_version_query_failure(&[
+                NetworkErrorKind::Connect,
+                NetworkErrorKind::ProxyAuth,
+                NetworkErrorKind::Timeout,
+            ]),
+            Some(NetworkErrorKind::ProxyAuth)
+        );
+        assert_eq!(primary_version_query_failure(&[]), None);
     }
 }

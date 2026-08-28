@@ -370,6 +370,11 @@ impl ServerManager {
         let mut environment: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
             .filter_map(|(key, value)| key.into_string().ok().map(|key| (key, value)))
             .collect();
+        // Proxy variables are never vaguely inherited: the unified proxy
+        // configuration decides exactly which ones the guard (and through it
+        // the Harness service and its pnpm/npm children) receives.
+        environment.retain(|(key, _)| !crate::network::is_proxy_env_key(key));
+        environment.extend(crate::network::active_subprocess_env());
         // Always hand the guard the resolved desktop home explicitly: the
         // guard's ownership check compares it against this manager's paths,
         // and an inherited or absent value would resolve differently.

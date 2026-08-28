@@ -3,7 +3,8 @@ use std::{env, fs, path::PathBuf};
 use dsh_core::{
     ActivityCode, ActivityState, AppError, BrowserChoice, DesktopUpdateState, HarnessUpdateMode,
     HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep, MigrationPlan,
-    MigrationState, ProgressState, ThemePreference,
+    MigrationState, NetworkErrorKind, ProgressState, ProxyMode, ProxySettings, ProxyTestFailure,
+    ProxyTestReport, ProxyTestSource, ThemePreference,
     balance::{BalanceSnapshot, BalanceStatus},
     marketplace::{
         CompatibilityInfo, CompatibilityStatus, InstalledPlugin, MarketCatalogState,
@@ -52,6 +53,12 @@ fn main() {
         PendingVerification::decl(),
         BalanceStatus::decl(),
         BalanceSnapshot::decl(),
+        ProxyMode::decl(),
+        ProxySettings::decl(),
+        NetworkErrorKind::decl(),
+        ProxyTestSource::decl(),
+        ProxyTestFailure::decl(),
+        ProxyTestReport::decl(),
     ];
     let mut output =
         String::from("// Generated from dsh-core Rust types. Do not edit by hand.\n\n");

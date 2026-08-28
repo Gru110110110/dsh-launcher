@@ -28,6 +28,7 @@ function snapshot(
     theme: "system",
     trayAvailable: false,
     showBalanceCard: true,
+    proxy: { mode: "system", url: "", bypass: "" },
     error: null,
   };
 }

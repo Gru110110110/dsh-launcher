@@ -21,6 +21,16 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 
 Python/PyInstaller 版本无法识别 Tauri 更新产物。老用户需要手动安装第一版 Tauri 应用；新应用会直接复用兼容的 `~/.dsh-desktop` 目录。此后只在后台检查并先提示新版本，不会提前下载。用户确认后，后端会连续完成签名包下载、安装、安全停止 Harness 与重启。
 
+## 代理支持
+
+「设置 → 代理」控制启动器自身的全部联网行为——Harness registry 版本查询、tarball 与 Node.js 下载、发布来源检查、插件市场的 catalog/registry/GitHub 客户端、会联网的 npm/pnpm/Harness 子进程，以及桌面更新的检查与下载，都使用同一份配置（Tauri 更新器通过其 `configure_client` 钩子适配，检查和下载使用同一份代理计划）。三种互斥模式：
+
+- **跟随系统**（默认值，对代理功能之前写入的旧配置同样生效）：使用代理环境变量（`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 及其小写形式，大小写间取第一个有效值——传统的无协议 `host:port` 按 HTTP 代理处理），并在 reqwest 提供系统代理读取能力的平台合并操作系统代理。macOS 下 HTTP 客户端与更新器会合并环境变量和 OS 系统代理；Linux 下 reqwest 的系统模式由环境变量驱动。子进程只会得到环境变量推导出的代理变量（OS 系统代理没有变量形式，不会导出给子进程）。Windows 下系统代理匹配器无法处理注册表中的逐协议条目，启动器会为客户端、更新器和子进程解析一份合并的逐协议代理计划：每个协议优先使用对应环境变量，其次是 `ALL_PROXY`/`all_proxy`；只有环境未覆盖的协议，才由当前用户 Internet Settings（`ProxyEnable`、`ProxyServer`、`ProxyOverride`，严格只读）的对应项补齐，并把单地址或 `http=...;https=...;socks=...` 形式转换为 npm/pnpm 可用的变量，将 `<local>` 展开为明确的回环绕过项（面向 npm/pnpm 的近似处理，并非完整复刻 WinInet 的本地域名语义）。`NO_PROXY`/`no_proxy` 优先于 `ProxyOverride`。CGI 环境（设置了 `REQUEST_METHOD`）下不信任任何代理来源。启动器不会修改注册表或系统代理。
+- **直连**：始终直接连接，忽略系统代理与所有代理环境变量；子进程得到不含代理变量的环境。
+- **手动**：所有启动器流量、更新器（检查与下载）和子进程使用同一个代理 URL（支持 `http`、`https`、`socks5`、`socks5h`，仅允许 `scheme://host[:port]`），可另配绕过列表（NO_PROXY，支持域名、IP 及 IPv4/IPv6 CIDR 段）。IE 风格的 `*.domain` 条目会被规范化为 reqwest、curl、npm 都能理解的等价前导点域名规则；其他通配符形式会被丢弃，不会传给 reqwest。
+
+保存后，启动器请求、「重试」和新启动的子进程立即使用新设置。已经运行的进程无法原地修改环境变量，因此 Harness 正在运行时，设置页会明确提供重启操作，不会擅自中断当前会话。「测试连接」使用表单中当前填写的内容（无论是否已保存）请求 Harness 的两个 registry，逐一报告来源结果，失败时给出分类且脱敏的网络错误（超时、代理要求认证——包括 CONNECT 隧道 407——、TLS/证书、连接/DNS、HTTP 状态）。本版本拒绝并永不保存代理 URL 中的用户名和密码；跟随系统/直连模式还会清除未启用的手动字段，诊断信息也不会回显 URL userinfo。PAC/WPAD 自动配置与 NTLM/Kerberos 集成代理认证暂不支持。
+
 ## 架构
 
 ```text

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use dsh_core::{
-    AppError, HarnessUpdateMode, Language, LauncherSnapshot, ThemePreference,
+    AppError, HarnessUpdateMode, Language, LauncherSnapshot, ProxySettings, ProxyTestReport,
+    ThemePreference,
     balance::BalanceSnapshot,
     marketplace::{
         CompatibilityInfo, InstalledPlugin, MarketCatalogState, MarketOperationResult, MarketPage,
@@ -131,6 +132,28 @@ pub fn preferences_set_show_balance_card(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), AppError> {
     state.set_show_balance_card(show)
+}
+
+/// Validates, atomically saves, and immediately activates proxy settings.
+#[tauri::command]
+pub fn preferences_set_proxy(
+    proxy: ProxySettings,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, AppError> {
+    state.set_proxy(proxy)
+}
+
+/// Tests the candidate proxy configuration from the settings form against the
+/// Harness registries. The candidate is never persisted by this command.
+#[tauri::command]
+pub async fn proxy_test_connection(
+    proxy: ProxySettings,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ProxyTestReport, AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.test_proxy(proxy)).await,
+    )
 }
 
 /// Sanitized official balance state; credential values never leave Harness.

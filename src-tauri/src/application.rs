@@ -12,11 +12,12 @@ use std::{
 use dsh_core::{
     ActivityCode, ActivityState, AppError, AppResult, ApplicationPaths, DesktopUpdateState,
     HarnessUpdateMode, HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep,
-    MigrationState, ProgressState, ThemePreference,
+    MigrationState, ProgressState, ProxyMode, ProxySettings, ThemePreference,
     balance::{BalanceService, BalanceSnapshot},
     browser::BrowserCatalog,
     marketplace::Marketplace,
     migration::MigrationService,
+    network,
     preferences::Preferences,
     runtime::{
         DeploymentController, DeploymentEvent, activate_prepared_harness_update, deploy_runtime,
@@ -97,12 +98,136 @@ fn external_link_url(target: &str) -> Option<&'static str> {
     }
 }
 
+/// How the unified proxy configuration maps onto the updater. `Direct` uses
+/// the builder's `no_proxy`; `Manual` goes through `configure_client` so the
+/// bypass list applies to update checks and downloads alike. `System` only
+/// uses `configure_client` when the Windows takeover decision yields a
+/// non-empty merged plan (see `dsh_core::network::takeover_system_plan`);
+/// on macOS/Linux, or whenever nothing explicit resolved, the plugin's
+/// default builder is kept so reqwest merges environment variables with the
+/// OS system proxy itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdaterProxyPlan {
+    System,
+    Direct,
+    Manual {
+        url: url::Url,
+        bypass: Option<String>,
+    },
+}
+
+fn updater_proxy_plan(settings: &ProxySettings) -> AppResult<UpdaterProxyPlan> {
+    match settings.mode {
+        ProxyMode::System => Ok(UpdaterProxyPlan::System),
+        ProxyMode::Direct => Ok(UpdaterProxyPlan::Direct),
+        ProxyMode::Manual => {
+            // Reuse the core validation so the updater never receives a URL
+            // the rest of the launcher already rejected (bad scheme, empty
+            // host, non-root path, or embedded credentials).
+            network::validate(settings)?;
+            let url = url::Url::parse(settings.url.trim())
+                .map_err(|_| AppError::new("proxyUrlInvalid").value("reason", "invalid"))?;
+            Ok(UpdaterProxyPlan::Manual {
+                url,
+                bypass: network::normalized_bypass(&settings.bypass),
+            })
+        }
+    }
+}
+
+/// Builds the updater-plugin (reqwest 0.13) proxy for manual mode, including
+/// the normalized bypass list.
+fn updater_manual_proxy(url: &url::Url, bypass: Option<&str>) -> AppResult<reqwest_updater::Proxy> {
+    let proxy = reqwest_updater::Proxy::all(url.as_str())
+        .map_err(|_| AppError::new("proxyUrlInvalid").value("reason", "invalid"))?;
+    Ok(
+        match bypass.and_then(reqwest_updater::NoProxy::from_string) {
+            Some(no_proxy) => proxy.no_proxy(Some(no_proxy)),
+            None => proxy,
+        },
+    )
+}
+
+/// Applies a resolved system plan to the updater's reqwest 0.13 builder.
+/// Mirrors `dsh_core::network::apply_system_plan`: disables the plugin's own
+/// env/system reading and installs the merged per-protocol proxies, so the
+/// broken per-protocol `ProxyServer` handling of hyper-util's Windows matcher
+/// is never in play. Test-only: production never hands an empty plan to
+/// explicit takeover (see `takeover_system_plan`); it builds proxies up front
+/// via [`updater_system_proxies`] and applies them inside `configure_client`,
+/// while an empty or non-Windows resolution keeps the default builder.
+#[cfg(test)]
+fn apply_updater_system_plan(
+    builder: reqwest_updater::ClientBuilder,
+    plan: &network::SystemProxyPlan,
+) -> AppResult<reqwest_updater::ClientBuilder> {
+    let proxies = updater_system_proxies(plan)?;
+    if proxies.is_empty() {
+        return Ok(builder);
+    }
+    let mut builder = builder.no_proxy();
+    for proxy in proxies {
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder)
+}
+
+/// Builds the reqwest 0.13 proxies for a resolved system plan, with the
+/// normalized bypass list attached to each. Called only for a non-empty
+/// Windows takeover plan; the resulting proxies are installed inside
+/// `configure_client`, which also disables the plugin's own env/system
+/// reading.
+fn updater_system_proxies(
+    plan: &network::SystemProxyPlan,
+) -> AppResult<Vec<reqwest_updater::Proxy>> {
+    let invalid = |error: reqwest_updater::Error| {
+        AppError::new("desktopUpdateConfigurationInvalid")
+            .detail(network::sanitize_detail(&error.to_string()))
+    };
+    let no_proxy = plan
+        .no_proxy
+        .as_deref()
+        .and_then(reqwest_updater::NoProxy::from_string);
+    let mut proxies = Vec::new();
+    if let Some(http) = &plan.http {
+        proxies.push(
+            reqwest_updater::Proxy::http(http)
+                .map_err(invalid)?
+                .no_proxy(no_proxy.clone()),
+        );
+    }
+    if let Some(https) = &plan.https {
+        proxies.push(
+            reqwest_updater::Proxy::https(https)
+                .map_err(invalid)?
+                .no_proxy(no_proxy),
+        );
+    }
+    Ok(proxies)
+}
+
+/// Sanitized one-line form of an updater error for logs. Transport details
+/// can embed URLs, and proxy credentials inherited from the environment must
+/// never reach the log, so everything passes through the core sanitizer and
+/// the raw `Debug` form is never logged.
+fn updater_error_log(error: &tauri_plugin_updater::Error) -> String {
+    use tauri_plugin_updater::Error;
+    match error {
+        Error::Reqwest(transport) => format!(
+            "request failed: {}",
+            network::sanitize_detail(&transport.to_string())
+        ),
+        other => network::sanitize_detail(&other.to_string()),
+    }
+}
+
 pub(crate) struct AppState {
     app: AppHandle,
     paths: ApplicationPaths,
     _instance_lock: File,
     snapshot: Mutex<LauncherSnapshot>,
     preferences: Mutex<Preferences>,
+    proxy_update: Mutex<()>,
     browsers: BrowserCatalog,
     server: Mutex<ServerManager>,
     balance: BalanceService,
@@ -123,11 +248,15 @@ impl AppState {
     fn new(app: AppHandle, paths: ApplicationPaths) -> AppResult<Arc<Self>> {
         let instance_lock = acquire_instance_lock(&paths)?;
         let preferences = Preferences::load(&paths.preferences_file, &paths.language_file);
+        // The unified proxy configuration applies to every Launcher-owned
+        // network operation from the start, before any update check runs.
+        network::activate(preferences.proxy.clone());
         let browsers = BrowserCatalog::discover();
         let mut snapshot = LauncherSnapshot::initial(env!("CARGO_PKG_VERSION"));
         snapshot.language = preferences.language;
         snapshot.theme = preferences.theme;
         snapshot.show_balance_card = preferences.show_balance_card;
+        snapshot.proxy = preferences.proxy.clone();
         snapshot.browsers = browsers.choices();
         snapshot.selected_browser_id = if browsers.contains(&preferences.browser_id) {
             preferences.browser_id.clone()
@@ -155,6 +284,7 @@ impl AppState {
             paths,
             snapshot: Mutex::new(snapshot),
             preferences: Mutex::new(preferences),
+            proxy_update: Mutex::new(()),
             browsers,
             deployment: Mutex::new(None),
             background_update: Mutex::new(None),
@@ -1080,6 +1210,44 @@ impl AppState {
         self.mutate(|snapshot| snapshot.show_balance_card = show);
         Ok(())
     }
+    /// Validates, atomically persists, and immediately activates a new proxy
+    /// configuration. The next network operation and any "retry" use it
+    /// without a restart; nothing about the runtime or user data is rebuilt
+    /// when the new settings fail.
+    pub(crate) fn set_proxy(&self, proxy: ProxySettings) -> AppResult<bool> {
+        // Serialize persistence, activation, and snapshot publication so two
+        // concurrent IPC calls cannot leave disk, the active client policy,
+        // and the UI snapshot describing different proxy settings.
+        let _update = self.proxy_update.lock().expect("proxy update poisoned");
+        let proxy = network::for_persistence(proxy)?;
+        let changed = {
+            let mut preferences = self.preferences.lock().expect("preferences poisoned");
+            let changed = preferences.proxy != proxy;
+            let mut candidate = preferences.clone();
+            candidate.proxy = proxy.clone();
+            candidate.save(&self.paths.preferences_file)?;
+            *preferences = candidate;
+            changed
+        };
+        network::activate(proxy.clone());
+        self.mutate(|snapshot| snapshot.proxy = proxy);
+        // Process environments are immutable. Launcher requests and newly
+        // spawned subprocesses use the active settings immediately, but an
+        // already-running Harness must be restarted by an explicit user
+        // action. Return that fact rather than silently disrupting a session.
+        let harness_restart_required = changed
+            && self
+                .server
+                .lock()
+                .expect("server manager poisoned")
+                .is_running();
+        Ok(harness_restart_required)
+    }
+    /// Tests the candidate proxy configuration from the settings form. The
+    /// candidate is used as-is and never persisted by the test.
+    pub(crate) fn test_proxy(&self, proxy: ProxySettings) -> AppResult<dsh_core::ProxyTestReport> {
+        dsh_core::runtime::test_proxy_connection(&proxy)
+    }
     /// Sanitized balance snapshot for the dashboard card. Only talks to the
     /// loopback bridge of the currently running service; the port, token,
     /// API key, and raw bridge output never leave this process.
@@ -1159,21 +1327,55 @@ impl AppState {
 
     fn desktop_updater(self: &Arc<Self>) -> AppResult<tauri_plugin_updater::Updater> {
         let state = Arc::clone(self);
-        self.app
-            .updater_builder()
-            .on_before_exit(move || {
-                // Tauri's Windows updater starts the installer and then calls
-                // process::exit(0). Cleanup after Update::install is therefore
-                // unreachable on Windows and must live in this hook.
-                if let Err(error) = state.prepare_restart() {
-                    log::error!("service cleanup before updater exit failed: {error:?}");
+        let builder = self.app.updater_builder().on_before_exit(move || {
+            // Tauri's Windows updater starts the installer and then calls
+            // process::exit(0). Cleanup after Update::install is therefore
+            // unreachable on Windows and must live in this hook.
+            if let Err(error) = state.prepare_restart() {
+                log::error!("service cleanup before updater exit failed: {error:?}");
+            }
+        });
+        // Adapt the unified proxy configuration to the updater. Both the
+        // update check and the signed download go through the same
+        // `configure_client` hook inside the plugin, so one configuration
+        // covers both.
+        let builder = match updater_proxy_plan(&network::active())? {
+            UpdaterProxyPlan::System => {
+                // Explicit takeover only on the Windows path; on macOS/Linux
+                // the plugin's default client already merges proxy
+                // environment variables with the OS system proxy, and
+                // replacing that with an env-only plan would disable the
+                // macOS system proxy whenever any single variable is set.
+                match network::takeover_system_plan(
+                    &|key| std::env::var_os(key),
+                    network::platform_proxy_source(),
+                ) {
+                    Some(plan) => {
+                        let proxies = updater_system_proxies(&plan)?;
+                        builder.configure_client(move |mut client| {
+                            client = client.no_proxy();
+                            for proxy in &proxies {
+                                client = client.proxy(proxy.clone());
+                            }
+                            client
+                        })
+                    }
+                    None => builder,
                 }
-            })
-            .build()
-            .map_err(|error| {
-                log::error!("desktop updater configuration is invalid: {error:?}");
-                AppError::new("desktopUpdateConfigurationInvalid")
-            })
+            }
+            UpdaterProxyPlan::Direct => builder.no_proxy(),
+            UpdaterProxyPlan::Manual { url, bypass } => {
+                let proxy = updater_manual_proxy(&url, bypass.as_deref())?;
+                builder.configure_client(move |client| client.proxy(proxy.clone()))
+            }
+        };
+        builder.build().map_err(|error| {
+            log::error!(
+                "desktop updater configuration is invalid: {}",
+                updater_error_log(&error)
+            );
+            AppError::new("desktopUpdateConfigurationInvalid")
+        })
     }
 
     pub(crate) async fn check_desktop_update(
@@ -1188,7 +1390,10 @@ impl AppState {
                 .await
                 .map_err(|_| AppError::new("desktopUpdateCheckTimedOut"))?
                 .map_err(|error| {
-                    log::warn!("desktop update check request failed: {error:?}");
+                    log::warn!(
+                        "desktop update check request failed: {}",
+                        updater_error_log(&error)
+                    );
                     desktop_update_check_error(classify_desktop_update_check_error(&error))
                 })
         }
@@ -1260,7 +1465,10 @@ impl AppState {
                 return Err(AppError::new("desktopUpdateNotAvailable"));
             }
             Ok(Err(error)) => {
-                log::warn!("desktop update check before download failed: {error:?}");
+                log::warn!(
+                    "desktop update check before download failed: {}",
+                    updater_error_log(&error)
+                );
                 self.mutate(|snapshot| {
                     snapshot.desktop_update = DesktopUpdateState::Failed {
                         version: previous_version,
@@ -1318,7 +1526,8 @@ impl AppState {
                     let failure = classify_desktop_update_download_error(&error);
                     if should_retry_desktop_update_download(attempt, failure) {
                         log::warn!(
-                            "desktop update download attempt {attempt}/{DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS} failed; will retry: {error:?}"
+                            "desktop update download attempt {attempt}/{DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS} failed; will retry: {}",
+                            updater_error_log(&error)
                         );
                         self.mutate(|snapshot| {
                             snapshot.desktop_update = DesktopUpdateState::Downloading {
@@ -1332,7 +1541,8 @@ impl AppState {
                         continue;
                     }
                     log::warn!(
-                        "desktop update download attempt {attempt}/{DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS} failed; giving up: {error:?}"
+                        "desktop update download attempt {attempt}/{DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS} failed; giving up: {}",
+                        updater_error_log(&error)
                     );
                     self.mutate(|snapshot| {
                         snapshot.desktop_update = DesktopUpdateState::Failed {
@@ -1363,7 +1573,10 @@ impl AppState {
             }
         });
         if let Err(error) = update.install(bytes) {
-            log::warn!("desktop update install failed: {error:?}");
+            log::warn!(
+                "desktop update install failed: {}",
+                updater_error_log(&error)
+            );
             self.mutate(|snapshot| {
                 snapshot.desktop_update = DesktopUpdateState::Failed {
                     version: Some(version),
@@ -1848,6 +2061,8 @@ pub fn run() {
             commands::preferences_set_language,
             commands::preferences_set_theme,
             commands::preferences_set_show_balance_card,
+            commands::preferences_set_proxy,
+            commands::proxy_test_connection,
             commands::balance_get_snapshot,
             commands::balance_refresh,
             commands::application_check_update,
@@ -1952,18 +2167,126 @@ mod tests {
         DEEPSEEK_PLATFORM, DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS, DesktopUpdateCheckFailure,
         DesktopUpdateDownloadFailure, DownloadProgressThrottle, GITHUB_REPOSITORY,
         HARNESS_GITHUB_REPOSITORY, LifecycleDecision, PROGRESS_EVENT_INTERVAL,
-        ProgressEventThrottle, WEBSITE, acquire_instance_lock, acquire_instance_lock_with_timeout,
+        ProgressEventThrottle, UpdaterProxyPlan, WEBSITE, acquire_instance_lock,
+        acquire_instance_lock_with_timeout, apply_updater_system_plan,
         classify_desktop_update_check_error, classify_desktop_update_download_error,
         complete_harness_deployment, desktop_update_check_error, desktop_update_download_error,
         desktop_update_start_state, external_link_url, harness_update_after_check,
         lifecycle_decision, mark_harness_update_checking, replace_harness_update_if_checking,
         retryable_download_http_status, should_retry_desktop_update_download,
         should_rollback_marketplace_after_start_failure, update_market_operation_state,
+        updater_error_log, updater_manual_proxy, updater_proxy_plan,
     };
     use dsh_core::{
         AppError, ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherSnapshot,
+        ProxyMode, ProxySettings,
     };
     use semver::Version;
+
+    #[test]
+    fn updater_proxy_plan_maps_each_mode() {
+        assert_eq!(
+            updater_proxy_plan(&ProxySettings::default()).unwrap(),
+            UpdaterProxyPlan::System
+        );
+        let direct = ProxySettings {
+            mode: ProxyMode::Direct,
+            ..ProxySettings::default()
+        };
+        assert_eq!(
+            updater_proxy_plan(&direct).unwrap(),
+            UpdaterProxyPlan::Direct
+        );
+        let manual = ProxySettings {
+            mode: ProxyMode::Manual,
+            url: "http://127.0.0.1:7890".into(),
+            bypass: "localhost; *.internal".into(),
+        };
+        assert_eq!(
+            updater_proxy_plan(&manual).unwrap(),
+            UpdaterProxyPlan::Manual {
+                url: url::Url::parse("http://127.0.0.1:7890").unwrap(),
+                // The bypass list survives onto the updater path, normalized
+                // to reqwest's domain grammar.
+                bypass: Some("localhost,.internal".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn updater_proxy_plan_supports_socks_and_builds_proxies_with_bypass() {
+        for url in ["socks5://127.0.0.1:1080", "socks5h://127.0.0.1:1080"] {
+            let manual = ProxySettings {
+                mode: ProxyMode::Manual,
+                url: url.into(),
+                bypass: String::new(),
+            };
+            let plan = updater_proxy_plan(&manual).unwrap();
+            let UpdaterProxyPlan::Manual {
+                url: parsed,
+                bypass,
+            } = plan
+            else {
+                panic!("expected manual plan");
+            };
+            assert_eq!(parsed.as_str().trim_end_matches('/'), url);
+            assert_eq!(bypass, None);
+            // The reqwest 0.13 alias must build proxies for SOCKS URLs (the
+            // socks feature is unified onto the updater plugin's reqwest).
+            let _ = updater_manual_proxy(&parsed, None).unwrap();
+        }
+        let url = url::Url::parse("http://127.0.0.1:7890").unwrap();
+        let _ = updater_manual_proxy(&url, Some("localhost,.internal")).unwrap();
+        // System plan application is a no-op for an empty plan and succeeds
+        // for a populated one.
+        let empty = dsh_core::network::SystemProxyPlan::default();
+        let _ = apply_updater_system_plan(reqwest_updater::ClientBuilder::new(), &empty).unwrap();
+        let plan = dsh_core::network::SystemProxyPlan {
+            http: Some("http://127.0.0.1:7890".into()),
+            https: Some("socks5://127.0.0.1:1080".into()),
+            all: None,
+            no_proxy: Some("localhost".into()),
+        };
+        let _ = apply_updater_system_plan(reqwest_updater::ClientBuilder::new(), &plan).unwrap();
+    }
+
+    #[test]
+    fn updater_proxy_plan_rejects_invalid_manual_urls() {
+        for url in [
+            "",
+            "not-a-url",
+            "ftp://127.0.0.1:21",
+            "http://user:pw@127.0.0.1:1",
+            "http://127.0.0.1:8080/path",
+            "http://127.0.0.1:8080?x=1",
+        ] {
+            let manual = ProxySettings {
+                mode: ProxyMode::Manual,
+                url: url.into(),
+                bypass: String::new(),
+            };
+            let error = updater_proxy_plan(&manual).expect_err(url);
+            assert_eq!(error.code, "proxyUrlInvalid", "{url}");
+            assert_eq!(error.safe_detail, None, "{url}");
+            assert!(!format!("{error:?}").contains("user:pw"), "{url}");
+        }
+    }
+
+    #[test]
+    fn updater_error_logging_never_contains_proxy_credentials() {
+        let with_creds = tauri_plugin_updater::Error::Network(
+            "connect via http://user:topsecret@proxy.local:3128 failed".to_owned(),
+        );
+        let rendered = updater_error_log(&with_creds);
+        assert!(
+            rendered.contains("http://***@proxy.local:3128"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("topsecret"), "{rendered}");
+        assert!(!rendered.contains("user@"), "{rendered}");
+        let deterministic = tauri_plugin_updater::Error::EmptyEndpoints;
+        assert_eq!(updater_error_log(&deterministic), deterministic.to_string());
+    }
 
     #[test]
     fn product_website_uses_the_public_homepage() {

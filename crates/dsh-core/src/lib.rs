@@ -12,6 +12,7 @@ mod log_file;
 pub mod marketplace;
 pub mod migration;
 pub mod model;
+pub mod network;
 pub mod paths;
 pub mod preferences;
 mod process_recovery;

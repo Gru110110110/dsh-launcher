@@ -5,6 +5,8 @@ import type {
   HarnessUpdateMode,
   Language,
   LauncherSnapshot,
+  ProxySettings,
+  ProxyTestReport,
   ThemePreference,
 } from "./generated/bindings";
 
@@ -39,6 +41,10 @@ export const launcherApi = {
     action("preferences_set_theme", { theme }),
   setShowBalanceCard: (show: boolean) =>
     action("preferences_set_show_balance_card", { show }),
+  setProxy: (proxy: ProxySettings) =>
+    command<boolean>("preferences_set_proxy", { proxy }),
+  testProxy: (proxy: ProxySettings) =>
+    command<ProxyTestReport>("proxy_test_connection", { proxy }),
   balanceGetSnapshot: () => command<BalanceSnapshot>("balance_get_snapshot"),
   balanceRefresh: () => command<BalanceSnapshot>("balance_refresh"),
   checkDesktopUpdate: () => command<string | null>("application_check_update"),

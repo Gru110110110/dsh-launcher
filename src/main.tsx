@@ -38,6 +38,7 @@ if (import.meta.env.DEV && !isTauri) {
     migration: { kind: "notRequired" },
     trayAvailable: true,
     showBalanceCard: true,
+    proxy: { mode: "system", url: "", bypass: "" },
   };
   initializeLauncherPreview(previewSnapshot);
 } else {

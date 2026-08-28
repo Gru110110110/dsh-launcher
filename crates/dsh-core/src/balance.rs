@@ -333,6 +333,9 @@ fn fetch_bridge(endpoint: &BalanceBridgeEndpoint, path: &str) -> AppResult<Vec<u
     let client = reqwest::blocking::Client::builder()
         .timeout(BRIDGE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
+        // The bridge is loopback-only; proxies (system, environment, or
+        // manual) must never intercept or break it.
+        .no_proxy()
         .build()
         .map_err(|_| AppError::new("balanceBridgeClientFailed"))?;
     let response = client
