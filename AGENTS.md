@@ -30,5 +30,6 @@ Run every Rust test, Tauri build, and package check with isolated temporary desk
 - Keep subprocess calls shell-free and pass URLs and paths as separate arguments.
 - Validate downloaded Node archives against the pinned SHA-256 before extraction, reject archive traversal and links outside the expected top-level directory, and install an exact Harness version.
 - Keep English and Simplified Chinese UI dictionaries structurally identical. Update `README.md` and `README.zh.md` together.
+- Keep `README.md` / `README.zh.md` user-facing and concise. Detailed internal implementation, operations, release/signing, and deployment content must go into `docs/IMPLEMENTATION.md` / `docs/IMPLEMENTATION.zh.md`, never into the README. Update the README and the matching `IMPLEMENTATION` doc together in both languages.
 - Tauri updater signatures are mandatory for releases; platform code signing remains optional. Never commit the updater private key.
 - Do not commit `node_modules/`, `target/`, `dist/`, TypeScript build info, or platform metadata.
