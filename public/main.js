@@ -54,8 +54,29 @@
       "shots.title": "桌面只管启动，<span class=\"grad\">工作发生在浏览器</span>",
       "shots.main": "启动器",
       "shots.mainAlt": "DSH Launcher 主界面截图",
+      "shots.mainFeature": "启动与管理 Harness",
+      "shots.mainDesc": "安装并校验独立运行环境，一键启动官方服务、查看运行状态并打开 Web UI。",
       "shots.plugin": "插件市场",
       "shots.pluginAlt": "DSH Launcher 插件市场页面截图",
+      "shots.pluginFeature": "发现与安装插件",
+      "shots.pluginDesc": "搜索、筛选并查看插件详情，在来源与兼容性检查后安全安装或卸载。",
+      "shots.remote": "远程访问",
+      "shots.remoteAlt": "DSH Launcher 远程访问页面截图",
+      "shots.remoteFeature": "在手机上使用 Harness",
+      "shots.remoteDesc": "通过二维码和可轮换密码从局域网访问，也可明确开启临时公网隧道。",
+      "shots.settings": "设置",
+      "shots.settingsAlt": "DSH Launcher 设置页面截图",
+      "shots.settingsFeature": "集中管理桌面体验",
+      "shots.settingsDesc": "切换语言与主题，配置代理并测试连接，管理余额卡片和桌面端更新。",
+      "shots.carouselLabel": "产品功能截图",
+      "shots.previous": "上一张截图",
+      "shots.next": "下一张截图",
+      "shots.pagination": "选择功能截图",
+      "shots.go1": "查看启动器截图",
+      "shots.go2": "查看插件市场截图",
+      "shots.go3": "查看远程访问截图",
+      "shots.go4": "查看设置截图",
+      "shots.status": "第 {current} 张，共 {total} 张",
       "shots.c1": "启动器窗口 · 中文界面（可在侧栏随时切换 English）",
       "shots.c2": "浏览器里的官方 Web UI · 完整模型与会话能力",
 
@@ -147,8 +168,29 @@
       "shots.title": "The desktop launches; <span class=\"grad\">work happens in the browser</span>",
       "shots.main": "Launcher",
       "shots.mainAlt": "DSH Launcher main window screenshot",
+      "shots.mainFeature": "Launch and manage Harness",
+      "shots.mainDesc": "Install and verify the isolated runtime, start the official service, inspect its status, and open the Web UI.",
       "shots.plugin": "Plugin marketplace",
       "shots.pluginAlt": "DSH Launcher plugin marketplace screenshot",
+      "shots.pluginFeature": "Discover and install plugins",
+      "shots.pluginDesc": "Search, filter, and inspect plugins, then install or remove them after source and compatibility checks.",
+      "shots.remote": "Remote access",
+      "shots.remoteAlt": "DSH Launcher remote access screenshot",
+      "shots.remoteFeature": "Use Harness from your phone",
+      "shots.remoteDesc": "Connect over your LAN with a QR code and rotatable password, or explicitly enable a temporary public tunnel.",
+      "shots.settings": "Settings",
+      "shots.settingsAlt": "DSH Launcher settings screenshot",
+      "shots.settingsFeature": "Manage the desktop experience",
+      "shots.settingsDesc": "Choose language and theme, configure and test the proxy, and manage the balance card and desktop updates.",
+      "shots.carouselLabel": "Product feature screenshots",
+      "shots.previous": "Previous screenshot",
+      "shots.next": "Next screenshot",
+      "shots.pagination": "Choose a feature screenshot",
+      "shots.go1": "View launcher screenshot",
+      "shots.go2": "View plugin marketplace screenshot",
+      "shots.go3": "View remote access screenshot",
+      "shots.go4": "View settings screenshot",
+      "shots.status": "Slide {current} of {total}",
       "shots.c1": "Launcher window · English UI (switch to 中文 anytime in the sidebar)",
       "shots.c2": "The official Web UI in the browser · full model and session capabilities",
 
@@ -239,10 +281,25 @@
       if (dict[key] !== undefined) el.alt = dict[key];
     });
 
+    document.querySelectorAll("[data-i18n-aria]").forEach(function (el) {
+      var key = el.getAttribute("data-i18n-aria");
+      if (dict[key] !== undefined) el.setAttribute("aria-label", dict[key]);
+    });
+
     // 所有产品截图跟随语言；新增截图时只需声明两种语言的路径。
     document.querySelectorAll("[data-screenshot-zh][data-screenshot-en]").forEach(function (img) {
       img.src = img.getAttribute("data-screenshot-" + lang);
     });
+
+    var carouselStatus = document.getElementById("carouselStatus");
+    var carouselSlides = document.querySelectorAll("[data-carousel-slide]");
+    if (carouselStatus && carouselSlides.length && dict["shots.status"]) {
+      var activeSlide = document.querySelector("[data-carousel-slide].is-active");
+      var currentSlide = Array.prototype.indexOf.call(carouselSlides, activeSlide) + 1;
+      carouselStatus.textContent = dict["shots.status"]
+        .replace("{current}", currentSlide)
+        .replace("{total}", carouselSlides.length);
+    }
 
     var toggle = document.getElementById("langToggle");
     if (toggle) toggle.textContent = lang === "zh" ? "EN" : "中文";
@@ -260,6 +317,180 @@
       applyLang(lang);
     });
   }
+
+  /* ---------------- 四项核心功能轮播 ---------------- */
+
+  (function setupProductCarousel() {
+    var carousel = document.getElementById("productCarousel");
+    if (!carousel) return;
+
+    var slides = Array.prototype.slice.call(carousel.querySelectorAll("[data-carousel-slide]"));
+    var dots = Array.prototype.slice.call(carousel.querySelectorAll("[data-carousel-to]"));
+    var previous = carousel.querySelector("[data-carousel-prev]");
+    var next = carousel.querySelector("[data-carousel-next]");
+    var status = document.getElementById("carouselStatus");
+    var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var active = 0;
+    var animating = false;
+    var queuedIndex = null;
+    var queuedDirection = null;
+    var transitionTimer = null;
+    var timer = null;
+
+    function updateStatus() {
+      var dict = I18N[lang] || I18N.zh;
+      if (!status || !dict["shots.status"]) return;
+      status.textContent = dict["shots.status"]
+        .replace("{current}", active + 1)
+        .replace("{total}", slides.length);
+    }
+
+    function updateIndicators() {
+      dots.forEach(function (dot, dotIndex) {
+        var selected = dotIndex === active;
+        dot.classList.toggle("is-active", selected);
+        if (selected) dot.setAttribute("aria-current", "true");
+        else dot.removeAttribute("aria-current");
+      });
+      updateStatus();
+    }
+
+    function showImmediately(index) {
+      active = (index + slides.length) % slides.length;
+      slides.forEach(function (slide, slideIndex) {
+        var selected = slideIndex === active;
+        slide.classList.remove(
+          "is-entering",
+          "is-leaving",
+          "from-right",
+          "from-left",
+          "to-left",
+          "to-right",
+        );
+        slide.classList.toggle("is-active", selected);
+        slide.setAttribute("aria-hidden", selected ? "false" : "true");
+      });
+      updateIndicators();
+    }
+
+    function show(index, direction) {
+      var targetIndex = (index + slides.length) % slides.length;
+      if (animating) {
+        if (targetIndex !== active) {
+          queuedIndex = targetIndex;
+          queuedDirection = direction;
+        }
+        return;
+      }
+      if (targetIndex === active) return;
+      if (reduceMotion) {
+        showImmediately(targetIndex);
+        return;
+      }
+
+      var currentSlide = slides[active];
+      var targetSlide = slides[targetIndex];
+      var forward = direction !== "backward";
+      var startClass = forward ? "from-right" : "from-left";
+      var exitClass = forward ? "to-left" : "to-right";
+      animating = true;
+
+      targetSlide.classList.add("is-entering", startClass);
+      targetSlide.setAttribute("aria-hidden", "false");
+      void targetSlide.offsetWidth;
+
+      active = targetIndex;
+      updateIndicators();
+
+      function finishTransition() {
+        currentSlide.removeEventListener("transitionend", handleTransitionEnd);
+        if (!animating) return;
+        animating = false;
+        if (transitionTimer !== null) window.clearTimeout(transitionTimer);
+        transitionTimer = null;
+        currentSlide.classList.remove("is-leaving", exitClass);
+        currentSlide.setAttribute("aria-hidden", "true");
+        targetSlide.classList.remove("is-entering", startClass);
+        if (queuedIndex !== null) {
+          var nextIndex = queuedIndex;
+          var nextDirection = queuedDirection;
+          queuedIndex = null;
+          queuedDirection = null;
+          window.requestAnimationFrame(function () {
+            show(nextIndex, nextDirection);
+          });
+        }
+      }
+
+      function handleTransitionEnd(event) {
+        if (event.target === currentSlide && event.propertyName === "transform") {
+          finishTransition();
+        }
+      }
+
+      currentSlide.addEventListener("transitionend", handleTransitionEnd);
+      window.requestAnimationFrame(function () {
+        currentSlide.classList.add("is-leaving", exitClass);
+        currentSlide.classList.remove("is-active");
+        targetSlide.classList.add("is-active");
+        targetSlide.classList.remove(startClass);
+        transitionTimer = window.setTimeout(finishTransition, 700);
+      });
+    }
+
+    function stopAutoplay() {
+      if (timer !== null) window.clearInterval(timer);
+      timer = null;
+    }
+
+    function startAutoplay() {
+      stopAutoplay();
+      if (reduceMotion || document.hidden) return;
+      timer = window.setInterval(function () { select(active + 1, "forward"); }, 5500);
+    }
+
+    function select(index, direction) {
+      show(index, direction);
+      startAutoplay();
+    }
+
+    function step(delta) {
+      var base = queuedIndex === null ? active : queuedIndex;
+      select(base + delta, delta > 0 ? "forward" : "backward");
+    }
+
+    if (previous) previous.addEventListener("click", function () { step(-1); });
+    if (next) next.addEventListener("click", function () { step(1); });
+    dots.forEach(function (dot) {
+      dot.addEventListener("click", function () {
+        var target = Number(dot.getAttribute("data-carousel-to"));
+        select(target, target > active ? "forward" : "backward");
+      });
+    });
+
+    carousel.addEventListener("keydown", function (event) {
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        step(-1);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        step(1);
+      }
+    });
+    carousel.addEventListener("mouseenter", stopAutoplay);
+    carousel.addEventListener("mouseleave", startAutoplay);
+    carousel.addEventListener("focusin", stopAutoplay);
+    carousel.addEventListener("focusout", function (event) {
+      if (!carousel.contains(event.relatedTarget)) startAutoplay();
+    });
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) stopAutoplay();
+      else startAutoplay();
+    });
+
+    showImmediately(0);
+    startAutoplay();
+  })();
 
   /* ---------------- 平台检测：高亮推荐下载 ---------------- */
 

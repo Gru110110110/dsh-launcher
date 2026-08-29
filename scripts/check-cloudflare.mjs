@@ -170,6 +170,28 @@ if (!/publicDir\s*:\s*false/u.test(vite)) {
 const html = await read("public/index.html");
 const css = await read("public/style.css");
 const main = await read("public/main.js");
+
+if (
+  (html.match(/<figure\b[^>]*\bdata-carousel-slide\b/gu) ?? []).length !== 4 ||
+  (html.match(/<button\b[^>]*\bdata-carousel-to=/gu) ?? []).length !== 4
+) {
+  throw new Error("Website feature carousel must contain exactly four slides");
+}
+for (const screenshot of [
+  "ScreenShot",
+  "ScreenShot_plugin",
+  "ScreenShot_remote",
+  "ScreenShot_settings",
+]) {
+  for (const language of ["zh", "en"]) {
+    if (!html.includes(`screenshots/${screenshot}_${language}.png`)) {
+      throw new Error(
+        `Website feature carousel is missing ${screenshot}_${language}.png`,
+      );
+    }
+  }
+}
+
 const references = [
   ...html.matchAll(/\b(?:href|src)="([^"]+)"/gu),
   ...html.matchAll(/\bdata-screenshot-(?:zh|en)="([^"]+)"/gu),

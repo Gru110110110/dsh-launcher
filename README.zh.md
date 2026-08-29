@@ -6,6 +6,32 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 
 应用以 React 负责表现层，以窄接口的 Tauri 适配层负责系统能力，以可复用的 Rust 核心负责业务规则。它不 fork、也不内嵌 Harness Web UI。
 
+## 核心功能
+
+### 启动与管理 DeepSeek Harness
+
+主页负责准备并校验独立的 Node.js/Harness 运行环境，启动或停止官方服务，显示服务实际发布的地址和运行时长，并用你选择的浏览器打开官方 Web UI。Harness 更新与桌面端更新分开呈现，每次变更都清清楚楚。
+
+![DSH Launcher 主页](screenshots/ScreenShot_zh.png)
+
+### 从插件市场安装扩展
+
+可以在经过校验的市场快照中搜索、筛选、查看、安装和卸载 Cordis 与 Skill 插件。安装前会展示确切来源、版本、目标位置、兼容性结论和执行风险；卸载时保留可恢复备份。
+
+![DSH Launcher 插件市场](screenshots/ScreenShot_plugin_zh.png)
+
+### 在手机上使用 Harness
+
+远程访问通过启动器自带的认证代理开放仅监听回环地址的 Harness Web UI。同一局域网内可扫描二维码并输入可轮换的 8 位密码；需要公网访问时，也可以明确开启临时的 Cloudflare 快速隧道。刷新密码会立即吊销已有会话。
+
+![DSH Launcher 远程访问](screenshots/ScreenShot_remote_zh.png)
+
+### 集中管理启动器设置
+
+设置页集中管理语言、浅色/深色/跟随系统主题、余额卡片、代理模式与连接测试、桌面端更新检查和项目链接。网络设置会一致地作用于启动器下载、插件市场请求、子进程和桌面更新。
+
+![DSH Launcher 设置](screenshots/ScreenShot_settings_zh.png)
+
 ## 当前产品范围
 
 - macOS arm64 与 x64 DMG 安装包

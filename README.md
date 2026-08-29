@@ -6,6 +6,32 @@ DSH Launcher is an unofficial desktop launcher for the published `@deepseek-ai/d
 
 The application uses React for presentation, a narrow Tauri command/event adapter, and a reusable Rust core. It does not fork or embed the Harness Web UI.
 
+## Core features
+
+### Launch and manage DeepSeek Harness
+
+The home page prepares and verifies the private Node.js/Harness runtime, starts or stops the official service, shows its real address and uptime, and opens the official Web UI in the browser you choose. Harness and desktop updates are surfaced separately so you always know what is changing.
+
+![DSH Launcher home page](screenshots/ScreenShot_en.png)
+
+### Install plugins from the marketplace
+
+Search, filter, inspect, install, and uninstall Cordis and Skill plugins from a validated marketplace snapshot. Before installation, the launcher shows the exact source, version, target, compatibility result, and execution risk; uninstall keeps a recoverable backup.
+
+![DSH Launcher plugin marketplace](screenshots/ScreenShot_plugin_en.png)
+
+### Use Harness from your phone
+
+Remote access exposes the loopback-only Harness Web UI through the launcher's authenticated proxy. Use a QR code and rotatable 8-digit password on the same LAN, or explicitly enable a temporary Cloudflare quick tunnel for public access; rotating the password immediately revokes existing sessions.
+
+![DSH Launcher remote access](screenshots/ScreenShot_remote_en.png)
+
+### Configure the launcher in one place
+
+Settings keeps language, light/dark/system theme, the optional balance card, proxy mode and connectivity testing, desktop update checks, and project links together. Network settings apply consistently to launcher downloads, marketplace requests, subprocesses, and desktop updates.
+
+![DSH Launcher settings](screenshots/ScreenShot_settings_en.png)
+
 ## Current product scope
 
 - macOS arm64 and x64 DMG installers

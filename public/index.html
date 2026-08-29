@@ -73,23 +73,56 @@
         </div>
         <p class="hero-note reveal" data-i18n="hero.note">macOS（Apple Silicon / Intel）与 Windows x64 · 界面支持中文与 English</p>
 
-        <!-- 产品截图：复制一个 hero-shot-card 即可继续扩展 -->
+        <!-- 四项核心功能轮播 -->
         <div class="hero-shot reveal" id="heroShot">
-          <div class="hero-shot-grid">
-            <figure class="shot-frame hero-shot-card">
-              <div class="shot-bar">
-                <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
-                <span class="shot-title" data-i18n="shots.main">启动器</span>
-              </div>
-              <img src="screenshots/ScreenShot_zh.png" data-screenshot-zh="screenshots/ScreenShot_zh.png" data-screenshot-en="screenshots/ScreenShot_en.png" data-i18n-alt="shots.mainAlt" alt="DSH Launcher 主界面截图" width="2360" height="1464" decoding="async" fetchpriority="high" />
-            </figure>
-            <figure class="shot-frame hero-shot-card">
-              <div class="shot-bar">
-                <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
-                <span class="shot-title" data-i18n="shots.plugin">插件市场</span>
-              </div>
-              <img src="screenshots/ScreenShot_plugin_zh.png" data-screenshot-zh="screenshots/ScreenShot_plugin_zh.png" data-screenshot-en="screenshots/ScreenShot_plugin_en.png" data-i18n-alt="shots.pluginAlt" alt="DSH Launcher 插件市场页面截图" width="2360" height="1462" decoding="async" fetchpriority="high" />
-            </figure>
+          <div class="product-carousel" id="productCarousel" data-i18n-aria="shots.carouselLabel" aria-label="产品功能截图">
+            <div class="carousel-viewport">
+              <figure class="shot-frame carousel-slide is-active" data-carousel-slide aria-hidden="false">
+                <div class="shot-bar">
+                  <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
+                  <span class="shot-title" data-i18n="shots.main">启动器</span>
+                </div>
+                <img src="screenshots/ScreenShot_zh.png" data-screenshot-zh="screenshots/ScreenShot_zh.png" data-screenshot-en="screenshots/ScreenShot_en.png" data-i18n-alt="shots.mainAlt" alt="DSH Launcher 主界面截图" width="2360" height="1462" decoding="async" fetchpriority="high" />
+                <figcaption><strong data-i18n="shots.mainFeature">启动与管理 Harness</strong><span data-i18n="shots.mainDesc">安装并校验独立运行环境，一键启动官方服务、查看运行状态并打开 Web UI。</span></figcaption>
+              </figure>
+              <figure class="shot-frame carousel-slide" data-carousel-slide aria-hidden="true">
+                <div class="shot-bar">
+                  <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
+                  <span class="shot-title" data-i18n="shots.plugin">插件市场</span>
+                </div>
+                <img src="screenshots/ScreenShot_plugin_zh.png" data-screenshot-zh="screenshots/ScreenShot_plugin_zh.png" data-screenshot-en="screenshots/ScreenShot_plugin_en.png" data-i18n-alt="shots.pluginAlt" alt="DSH Launcher 插件市场页面截图" width="2360" height="1462" loading="lazy" decoding="async" />
+                <figcaption><strong data-i18n="shots.pluginFeature">发现与安装插件</strong><span data-i18n="shots.pluginDesc">搜索、筛选并查看插件详情，在来源与兼容性检查后安全安装或卸载。</span></figcaption>
+              </figure>
+              <figure class="shot-frame carousel-slide" data-carousel-slide aria-hidden="true">
+                <div class="shot-bar">
+                  <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
+                  <span class="shot-title" data-i18n="shots.remote">远程访问</span>
+                </div>
+                <img src="screenshots/ScreenShot_remote_zh.png" data-screenshot-zh="screenshots/ScreenShot_remote_zh.png" data-screenshot-en="screenshots/ScreenShot_remote_en.png" data-i18n-alt="shots.remoteAlt" alt="DSH Launcher 远程访问页面截图" width="2360" height="1462" loading="lazy" decoding="async" />
+                <figcaption><strong data-i18n="shots.remoteFeature">在手机上使用 Harness</strong><span data-i18n="shots.remoteDesc">通过二维码和可轮换密码从局域网访问，也可明确开启临时公网隧道。</span></figcaption>
+              </figure>
+              <figure class="shot-frame carousel-slide" data-carousel-slide aria-hidden="true">
+                <div class="shot-bar">
+                  <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
+                  <span class="shot-title" data-i18n="shots.settings">设置</span>
+                </div>
+                <img src="screenshots/ScreenShot_settings_zh.png" data-screenshot-zh="screenshots/ScreenShot_settings_zh.png" data-screenshot-en="screenshots/ScreenShot_settings_en.png" data-i18n-alt="shots.settingsAlt" alt="DSH Launcher 设置页面截图" width="2360" height="1462" loading="lazy" decoding="async" />
+                <figcaption><strong data-i18n="shots.settingsFeature">集中管理桌面体验</strong><span data-i18n="shots.settingsDesc">切换语言与主题，配置代理并测试连接，管理余额卡片和桌面端更新。</span></figcaption>
+              </figure>
+            </div>
+            <button class="carousel-arrow carousel-prev" type="button" data-carousel-prev data-i18n-aria="shots.previous" aria-label="上一张截图">
+              <span aria-hidden="true">‹</span>
+            </button>
+            <button class="carousel-arrow carousel-next" type="button" data-carousel-next data-i18n-aria="shots.next" aria-label="下一张截图">
+              <span aria-hidden="true">›</span>
+            </button>
+            <div class="carousel-dots" data-i18n-aria="shots.pagination" aria-label="选择功能截图">
+              <button class="carousel-dot is-active" type="button" data-carousel-to="0" data-i18n-aria="shots.go1" aria-label="查看启动器截图" aria-current="true"></button>
+              <button class="carousel-dot" type="button" data-carousel-to="1" data-i18n-aria="shots.go2" aria-label="查看插件市场截图"></button>
+              <button class="carousel-dot" type="button" data-carousel-to="2" data-i18n-aria="shots.go3" aria-label="查看远程访问截图"></button>
+              <button class="carousel-dot" type="button" data-carousel-to="3" data-i18n-aria="shots.go4" aria-label="查看设置截图"></button>
+            </div>
+            <p class="sr-only" id="carouselStatus" aria-live="polite" aria-atomic="true"></p>
           </div>
         </div>
       </div>
