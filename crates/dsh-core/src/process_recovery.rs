@@ -31,6 +31,8 @@ const RECOVERY_TERM_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(any(unix, windows))]
 const RECOVERY_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const RECOVERY_SCAN_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(target_os = "macos")]
+const RECOVERY_IDENTITY_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) fn recover_owned_services(paths: &ApplicationPaths) -> AppResult<usize> {
     let mut recovered = BTreeSet::new();
@@ -212,7 +214,11 @@ fn owned_service_groups(paths: &ApplicationPaths) -> AppResult<BTreeSet<u32>> {
             );
         }
         if identity.group != identity.pid {
-            match guard_group_leader_state(identity.group, &current_executable, &expected_home) {
+            match settled_guard_group_leader_state(
+                identity.group,
+                &current_executable,
+                &expected_home,
+            ) {
                 GuardLeaderState::Owned | GuardLeaderState::Gone => {}
                 GuardLeaderState::Unverifiable => {
                     return Err(AppError::new("serviceOwnershipUnverifiable")
@@ -233,10 +239,27 @@ fn managed_dsh_arguments(arguments: &[OsString], expected_dsh: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
 enum GuardLeaderState {
     Owned,
     Gone,
     Unverifiable,
+}
+
+#[cfg(target_os = "macos")]
+fn settled_guard_group_leader_state(
+    group: u32,
+    current_executable: &Path,
+    expected_home: &Path,
+) -> GuardLeaderState {
+    let deadline = Instant::now() + RECOVERY_IDENTITY_SETTLE_TIMEOUT;
+    loop {
+        let state = guard_group_leader_state(group, current_executable, expected_home);
+        if !matches!(state, GuardLeaderState::Unverifiable) || Instant::now() >= deadline {
+            return state;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(target_os = "macos")]

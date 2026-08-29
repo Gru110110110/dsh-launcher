@@ -18,7 +18,7 @@
       "nav.download": "下载",
       "nav.faq": "FAQ",
 
-      "hero.badge": "v0.3.6 · React + Tauri · MIT 开源",
+      "hero.badge": "v0.4.0 · React + Tauri · MIT 开源",
       "hero.badge2": "非官方启动器 · 不改动官方 Harness",
       "hero.title": "双击启动，打开即用。<br /><span class=\"grad\">浏览器里，就是官方 Web UI。</span>",
       "hero.sub": "DSH Launcher 是 DeepSeek Harness 的非官方桌面启动器。它不做二次包装、不改交互逻辑——只负责把官方服务稳稳地跑起来，然后把服务发布的 Web UI 地址交给你，在你喜欢的浏览器里打开。",
@@ -101,7 +101,7 @@
 
       "dl.kicker": "下载",
       "dl.title": "选择你的平台<span class=\"grad\">开始</span>",
-      "dl.sub": "当前版本 v0.3.6。下载页提供 macOS 双架构 DMG 与 Windows x64 安装程序。",
+      "dl.sub": "当前版本 v0.4.0。下载页提供 macOS 双架构 DMG 与 Windows x64 安装程序。",
       "dl.rec": "推荐",
       "dl.macArm": "Apple Silicon（M 系列芯片）",
       "dl.macIntel": "Intel 芯片",
@@ -132,7 +132,7 @@
       "nav.download": "Download",
       "nav.faq": "FAQ",
 
-      "hero.badge": "v0.3.6 · React + Tauri · MIT open source",
+      "hero.badge": "v0.4.0 · React + Tauri · MIT open source",
       "hero.badge2": "Unofficial launcher · Harness stays untouched",
       "hero.title": "Double-click. It just runs.<br /><span class=\"grad\">The official Web UI, in your browser.</span>",
       "hero.sub": "DSH Launcher is an unofficial desktop launcher for DeepSeek Harness. No repackaging, no altered interaction — it simply gets the official service running reliably, then hands you the Web UI address the service publishes, opened in the browser you prefer.",
@@ -215,7 +215,7 @@
 
       "dl.kicker": "Download",
       "dl.title": "Pick your platform <span class=\"grad\">and start</span>",
-      "dl.sub": "Current version v0.3.6. The download page provides dual-architecture macOS DMGs and a Windows x64 installer.",
+      "dl.sub": "Current version v0.4.0. The download page provides dual-architecture macOS DMGs and a Windows x64 installer.",
       "dl.rec": "Recommended",
       "dl.macArm": "Apple Silicon (M-series)",
       "dl.macIntel": "Intel",

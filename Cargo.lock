@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-core"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-launcher"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "dsh-core",
  "fs2",
