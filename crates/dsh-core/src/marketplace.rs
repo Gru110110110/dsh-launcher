@@ -36,9 +36,9 @@ use sha2::{Digest, Sha256};
 use ts_rs::TS;
 
 use crate::{
+    child_process::{configure_process_group, new_command},
     error::{AppError, AppResult},
     paths::ApplicationPaths,
-    runtime::configure_process_group,
 };
 
 const MARKET_REPOSITORY: &str = "2BingLing/dsh-market";
@@ -1777,7 +1777,7 @@ impl Marketplace {
         }
         fs::create_dir_all(&install_dir)
             .map_err(|error| AppError::io("createDirectory", &error))?;
-        let mut command = Command::new(&self.paths.node_bin);
+        let mut command = new_command(&self.paths.node_bin);
         command
             .arg(npm_cli(&self.paths.node_dir))
             .args(["install", "-g", &format!("pnpm@{PNPM_VERSION}")])
@@ -1823,7 +1823,7 @@ impl Marketplace {
         let profile_dir = self.profile_dir(profile);
         fs::create_dir_all(&profile_dir)
             .map_err(|error| AppError::io("createDirectory", &error))?;
-        let mut command = Command::new(&executable);
+        let mut command = new_command(&executable);
         command.arg(verb).arg(pkg).args(pnpm_mutation_flags(verb));
         command
             .current_dir(&profile_dir)
@@ -4763,7 +4763,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = ApplicationPaths::from_home(temp.path().join("home"));
         let pnpm_bin = paths.cache_dir.join("pnpm-bin");
-        let mut command = Command::new("true");
+        let mut command = new_command("true");
         market_command_env(&mut command, &paths, std::slice::from_ref(&pnpm_bin));
         let mut path_value = None;
         for (key, value) in command.get_envs() {
@@ -5896,7 +5896,7 @@ mod tests {
 
     #[test]
     fn child_output_reader_drains_stdout_and_stderr_concurrently() {
-        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        let mut command = new_command(std::env::current_exe().expect("test executable"));
         command
             .args([
                 "--ignored",

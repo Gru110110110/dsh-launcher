@@ -6,6 +6,7 @@
 
 pub mod balance;
 pub mod browser;
+pub mod child_process;
 pub mod error;
 pub mod import;
 mod log_file;

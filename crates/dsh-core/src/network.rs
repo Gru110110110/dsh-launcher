@@ -846,7 +846,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
-        process::{Command, Stdio},
+        process::Stdio,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, Ordering},
@@ -854,6 +854,8 @@ mod tests {
         thread::{self, JoinHandle},
         time::Duration,
     };
+
+    use crate::child_process::new_command;
 
     fn settings(mode: ProxyMode, url: &str, bypass: &str) -> ProxySettings {
         ProxySettings {
@@ -1684,7 +1686,7 @@ mod tests {
         extra: &[(&str, String)],
     ) -> std::process::Output {
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",

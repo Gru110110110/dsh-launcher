@@ -7,8 +7,8 @@ use std::thread;
 use std::{collections::HashSet, path::PathBuf, process::Command};
 
 #[cfg(windows)]
-use crate::runtime::configure_process_group;
-use crate::{AppError, AppResult, model::BrowserChoice};
+use crate::child_process::configure_process_group;
+use crate::{AppError, AppResult, child_process::new_command, model::BrowserChoice};
 
 #[derive(Debug, Clone)]
 pub struct BrowserCatalog {
@@ -60,11 +60,11 @@ impl BrowserCatalog {
             .ok_or_else(|| AppError::new("browserUnavailable"))?;
         match &entry.executable {
             #[cfg(target_os = "macos")]
-            Some(app) => spawn(Command::new("open").arg("-a").arg(app).arg(url)),
+            Some(app) => spawn(new_command("open").arg("-a").arg(app).arg(url)),
             #[cfg(windows)]
-            Some(executable) => spawn(Command::new(executable).arg(url)),
+            Some(executable) => spawn(new_command(executable).arg(url)),
             #[cfg(not(any(target_os = "macos", windows)))]
-            Some(executable) => spawn(Command::new(executable).arg(url)),
+            Some(executable) => spawn(new_command(executable).arg(url)),
             None => open_default(url),
         }
     }
@@ -94,13 +94,13 @@ fn spawn(command: &mut Command) -> AppResult<()> {
 
 #[cfg(target_os = "macos")]
 fn open_default(url: &str) -> AppResult<()> {
-    spawn(Command::new("open").arg(url))
+    spawn(new_command("open").arg(url))
 }
 
 #[cfg(windows)]
 fn open_default(url: &str) -> AppResult<()> {
     spawn(
-        Command::new("rundll32.exe")
+        new_command("rundll32.exe")
             .arg("url.dll,FileProtocolHandler")
             .arg(url),
     )
@@ -108,7 +108,7 @@ fn open_default(url: &str) -> AppResult<()> {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 fn open_default(url: &str) -> AppResult<()> {
-    spawn(Command::new("xdg-open").arg(url))
+    spawn(new_command("xdg-open").arg(url))
 }
 
 #[cfg(target_os = "macos")]

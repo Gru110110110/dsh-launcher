@@ -3,13 +3,16 @@ use std::{
     io::{BufRead, BufReader},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use std::{io::Read, process::ChildStdin};
+
+#[cfg(windows)]
+use std::process::Command;
 
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,10 +29,11 @@ use crate::{
     balance::{
         BALANCE_OVERLAY_ENV, BalanceBridgeEndpoint, BalanceLaunchPlan, prepare_balance_launch,
     },
+    child_process::{configure_process_group, new_command},
     log_file::{BoundedLog, SERVER_LOG_MAX_BYTES},
     paths::atomic_write,
     process_recovery::recover_owned_services,
-    runtime::{configure_process_group, terminate_tree},
+    runtime::terminate_tree,
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -152,7 +156,7 @@ impl ServerManager {
             let mut command = {
                 let executable = std::env::current_exe()
                     .map_err(|error| AppError::io("serviceGuardFailed", &error))?;
-                let mut command = Command::new(executable);
+                let mut command = new_command(executable);
                 command
                     .arg(SERVICE_GUARD_ARGUMENT)
                     .arg(SERVICE_GUARD_HOME_ARGUMENT)
@@ -466,7 +470,7 @@ fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult
     if unsafe { libc::getpgrp() } != i32::try_from(group).unwrap_or_default() {
         return Err(AppError::new("serviceGuardInvalidGroup"));
     }
-    let mut command = Command::new(&paths.node_bin);
+    let mut command = new_command(&paths.node_bin);
     command
         .arg(&paths.dsh_bin)
         .args(guard_web_args(
@@ -525,7 +529,7 @@ fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult
 
 #[cfg(windows)]
 fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult<()> {
-    let mut command = Command::new(&paths.node_bin);
+    let mut command = new_command(&paths.node_bin);
     command
         .arg(&paths.dsh_bin)
         .args(guard_web_args(
@@ -914,7 +918,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -966,7 +970,7 @@ mod tests {
         .unwrap();
 
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1028,7 +1032,7 @@ mod tests {
         .unwrap();
 
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(&executable);
+        let mut command = new_command(&executable);
         command
             .args([
                 "--ignored",
@@ -1076,7 +1080,7 @@ mod tests {
         .unwrap();
 
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1128,7 +1132,7 @@ mod tests {
         .unwrap();
 
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1182,7 +1186,7 @@ mod tests {
     #[ignore]
     fn unix_process_group_parent_waits() {
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1223,7 +1227,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let signal = temp.path().join("guard-child-ready");
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1274,7 +1278,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let signal = temp.path().join("orphan-descendant-ready");
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1307,7 +1311,7 @@ mod tests {
     #[ignore]
     fn windows_service_guard_helper() {
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1351,7 +1355,7 @@ mod tests {
     #[ignore]
     fn windows_service_guard_root_exit_helper() {
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1378,7 +1382,7 @@ mod tests {
     #[ignore]
     fn windows_service_root_exits_with_descendant() {
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1415,7 +1419,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let signal = temp.path().join("attached");
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -1460,7 +1464,7 @@ mod tests {
         }
         assert!(signal.exists());
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",

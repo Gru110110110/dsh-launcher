@@ -19,7 +19,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -33,7 +33,10 @@ use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
 use crate::runtime::WindowsProcessGuard;
-use crate::{AppError, AppResult, network, paths::ApplicationPaths, paths::atomic_write};
+use crate::{
+    AppError, AppResult, child_process::new_command, network, paths::ApplicationPaths,
+    paths::atomic_write,
+};
 
 /// Pinned cloudflared release. Bumping requires refreshing every hash below.
 const CLOUDFLARED_VERSION: &str = "2026.8.2";
@@ -319,7 +322,7 @@ impl TunnelProcess {
         local_port: u16,
         events: Arc<dyn TunnelEvents>,
     ) -> AppResult<Arc<Self>> {
-        let mut command = Command::new(binary);
+        let mut command = new_command(binary);
         command
             .args([
                 "tunnel",
@@ -332,11 +335,6 @@ impl TunnelProcess {
             .stderr(Stdio::piped())
             .env_clear();
         network::apply_to_command(&mut command);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-        }
         let mut child = command
             .spawn()
             .map_err(|error| AppError::io("remoteTunnelFailed", &error))?;

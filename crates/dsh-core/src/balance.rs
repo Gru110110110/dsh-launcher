@@ -22,7 +22,9 @@ use sha2::{Digest, Sha256};
 use ts_rs::TS;
 use uuid::Uuid;
 
-use crate::{AppError, AppResult, ApplicationPaths, paths::atomic_write};
+use crate::{
+    AppError, AppResult, ApplicationPaths, child_process::new_command, paths::atomic_write,
+};
 
 const BRIDGE_SOURCE: &str = include_str!("../bridge/balance-bridge.mjs");
 
@@ -173,7 +175,7 @@ fn stage_bridge_module(paths: &ApplicationPaths) -> AppResult<()> {
 }
 
 fn syntax_check_module(paths: &ApplicationPaths) -> AppResult<()> {
-    let mut command = Command::new(&paths.node_bin);
+    let mut command = new_command(&paths.node_bin);
     command.arg("--check").arg(&paths.balance_bridge_module);
     run_quiet(&mut command, SYNTAX_CHECK_TIMEOUT)
         .map_err(|error| AppError::new("balanceBridgeSyntaxInvalid").detail(error.to_string()))
@@ -211,7 +213,7 @@ fn overlay_preflight(paths: &ApplicationPaths, overlay: &Path) -> AppResult<bool
     {
         return Ok(true);
     }
-    let mut command = Command::new(&paths.node_bin);
+    let mut command = new_command(&paths.node_bin);
     command
         .arg(&paths.dsh_bin)
         .arg("web")

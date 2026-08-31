@@ -498,10 +498,10 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    use std::{
-        os::unix::fs::{PermissionsExt, symlink},
-        process::Command,
-    };
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[cfg(unix)]
+    use crate::child_process::new_command;
 
     #[test]
     fn windows_path_append_is_case_insensitive_and_preserves_existing_order() {
@@ -559,7 +559,7 @@ mod tests {
         fake_runtime(&paths);
 
         ensure_terminal_command(&paths, false).unwrap();
-        let output = Command::new(&paths.terminal_dsh_bin)
+        let output = new_command(&paths.terminal_dsh_bin)
             .args(["--version", "extra"])
             .env_remove("DSH_HOME")
             .output()
@@ -592,7 +592,7 @@ mod tests {
         fake_runtime(&paths);
         ensure_terminal_command(&paths, false).unwrap();
 
-        let output = Command::new(&paths.terminal_dsh_bin)
+        let output = new_command(&paths.terminal_dsh_bin)
             .arg("--version")
             .env("DSH_HOME", "explicit-home")
             .output()
@@ -702,7 +702,7 @@ mod tests {
         let bin = temp.path().join("desktop home's bin");
         update_unix_profile(&profile, &bin).unwrap();
 
-        let output = Command::new("/bin/sh")
+        let output = new_command("/bin/sh")
             .arg("-c")
             .arg(". ./.profile; . ./.profile; printf '%s' \"$PATH\"")
             .current_dir(temp.path())

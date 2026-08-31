@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     ActivityCode, AppError, AppResult, ApplicationPaths,
+    child_process::{configure_process_group, new_command},
     log_file::{INSTALL_LOG_MAX_BYTES, trim_log_tail},
     model::{NetworkErrorKind, ProxySettings, ProxyTestFailure, ProxyTestReport, ProxyTestSource},
     network,
@@ -1226,7 +1227,7 @@ fn harness_npm_install_command(
     staging: &Path,
 ) -> Command {
     let npm = npm_cli(&paths.node_dir);
-    let mut command = Command::new(&paths.node_bin);
+    let mut command = new_command(&paths.node_bin);
     command
         .arg(npm)
         .arg("install")
@@ -2084,7 +2085,7 @@ fn remove_owned(path: &Path) -> AppResult<()> {
 
 fn node_version(paths: &ApplicationPaths, node_dir: &Path) -> Option<String> {
     let executable = node_executable(node_dir);
-    let mut command = Command::new(executable);
+    let mut command = new_command(executable);
     command.arg("--version");
     isolated_command(&mut command, paths);
     configure_process_group(&mut command);
@@ -2105,7 +2106,7 @@ fn dsh_valid(paths: &ApplicationPaths, node_dir: &Path, dsh_dir: &Path, version:
         return false;
     }
     let binary = dsh_dir.join("node_modules/@deepseek-ai/dsh/lib/bin.js");
-    let mut command = Command::new(node_executable(node_dir));
+    let mut command = new_command(node_executable(node_dir));
     command.arg(binary).arg("--version");
     isolated_command(&mut command, paths);
     configure_process_group(&mut command);
@@ -2316,18 +2317,6 @@ fn isolated_command(command: &mut Command, paths: &ApplicationPaths) {
 }
 
 #[cfg(unix)]
-pub(crate) fn configure_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-#[cfg(windows)]
-pub(crate) fn configure_process_group(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-}
-#[cfg(unix)]
 pub(crate) fn terminate_tree(pid: u32, force: bool) {
     unsafe {
         libc::kill(
@@ -2346,7 +2335,7 @@ pub(crate) fn process_tree_alive(pid: u32) -> bool {
 }
 #[cfg(windows)]
 pub(crate) fn terminate_tree(pid: u32, _force: bool) {
-    let mut command = Command::new("taskkill");
+    let mut command = new_command("taskkill");
     command.args(["/PID", &pid.to_string(), "/T", "/F"]);
     configure_process_group(&mut command);
     let _ = command.output();
@@ -3573,7 +3562,7 @@ mod tests {
             .unwrap()
             .set_len(INSTALL_LOG_MAX_BYTES + 1024)
             .unwrap();
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        let mut command = new_command(std::env::current_exe().unwrap());
         command
             .args([
                 "--exact",
@@ -4038,7 +4027,7 @@ mod tests {
         extra: &[(&str, String)],
     ) -> std::process::Output {
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",
@@ -4137,7 +4126,7 @@ mod tests {
         let (good, good_server) = serve_responses(vec![harness_packument("0.1.0-rc.7")]);
         let bad = closed_loopback_registry();
         let executable = std::env::current_exe().unwrap();
-        let mut command = Command::new(executable);
+        let mut command = new_command(executable);
         command
             .args([
                 "--ignored",

@@ -1164,14 +1164,17 @@ mod tests {
     use std::{
         io::Write,
         os::unix::fs::{PermissionsExt, symlink},
-        process::{Child, Command, Stdio},
+        process::{Child, Stdio},
         sync::{Mutex, MutexGuard},
     };
 
     use tempfile::TempDir;
 
     use super::*;
-    use crate::runtime::{configure_process_group, terminate_tree};
+    use crate::{
+        child_process::{configure_process_group, new_command},
+        runtime::terminate_tree,
+    };
 
     struct TestChild(Child);
 
@@ -1232,7 +1235,7 @@ mod tests {
     }
 
     fn spawn_service(node: &Path, dsh: &Path) -> TestChild {
-        let mut command = Command::new(node);
+        let mut command = new_command(node);
         command
             .arg(dsh)
             .arg("web")
@@ -1290,7 +1293,7 @@ mod tests {
         let _serial = recovery_test_lock();
         let (temp, paths) = fixture();
         let child_pid_file = temp.path().join("orphan.pid");
-        let mut command = Command::new("/bin/bash");
+        let mut command = new_command("/bin/bash");
         command
             .arg("-c")
             .arg("\"$1\" \"$2\" web </dev/null >/dev/null 2>&1 & echo $! > \"$3\"; while :; do sleep 1; done")
