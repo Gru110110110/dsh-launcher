@@ -69,6 +69,8 @@ jobs:
           shared-key: build-${{ matrix.target }}
           cache-on-failure: true
       - run: pnpm install --frozen-lockfile
+      # macOS process-recovery stress tests run locally before tagging. Keep
+      # hosted macOS release runners focused on signing and packaging.
       - name: Verify Windows-specific regressions
         if: runner.os == 'Windows'
         shell: pwsh
@@ -85,11 +87,6 @@ jobs:
             Write-Host "::error title=Windows-specific regression test failed::$detail"
             exit $exitCode
           }
-      - name: Verify macOS-specific regressions
-        if: matrix.target == 'aarch64-apple-darwin'
-        run: |
-          cargo test -p dsh-core --lib --target ${{ matrix.target }} \
-            process_recovery::tests:: -- --nocapture
       - name: Require the Tauri updater trust root
         shell: bash
         env:

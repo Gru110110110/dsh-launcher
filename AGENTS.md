@@ -23,6 +23,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Run every Rust test, Tauri build, and package check with isolated temporary desktop, Harness, source, and CC Switch homes. `pnpm tauri build` is the packaging entry point; release CI produces macOS DMGs and a Windows per-user NSIS installer.
 
+Run the macOS `process_recovery` / startup-recovery stress checks locally before tagging. Do not run them in `.github/workflows/desktop.yml`; hosted macOS release runners are reserved for target compilation, signing, packaging, installed-package smoke checks, and publication.
+
 ## Conventions
 
 - Keep business behavior in `dsh-core` without a Tauri dependency. Tauri commands adapt OS capabilities; React features own their route and navigation metadata.
