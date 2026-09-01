@@ -4,6 +4,8 @@ export type Language = "zh" | "en";
 
 export type ThemePreference = "system" | "light" | "dark";
 
+export type HarnessUpdateChannel = "latest" | "alpha";
+
 export type LauncherPhase =
   | "preparing"
   | "awaitingMigration"
@@ -32,6 +34,7 @@ export type ActivityCode =
   | "validatingHarness"
   | "activatingHarness"
   | "migratingData"
+  | "repairingStartup"
   | "startingService";
 
 export type ActivityState = {
@@ -102,13 +105,41 @@ export type LauncherSnapshot = {
   theme: ThemePreference;
   desktopVersion: string;
   harnessVersion: string | null;
+  /**
+   * Last validated runtime retained beside the active Harness. Exposed so
+   * a failed service start can offer an explicit, version-bound rollback.
+   */
+  previousHarnessVersion: string | null;
+  /**
+   * Third-party profile packages removed transactionally after they were
+   * identified in startup output as incompatible. The UI acknowledges the
+   * recovery in a modal; an empty list means no recovery was committed.
+   */
+  removedIncompatiblePlugins: Array<string>;
+  /**
+   * True after the launcher isolated version-incompatible projection cache
+   * records and verified that Harness rebuilt them from authoritative logs.
+   */
+  repairedProjectionCache: boolean;
   desktopUpdate: DesktopUpdateState;
   harnessUpdate: HarnessUpdateState;
   migration: MigrationState;
   trayAvailable: boolean;
   showBalanceCard: boolean;
+  harnessUpdateChannel: HarnessUpdateChannel;
   proxy: ProxySettings;
   remote: RemoteSnapshot;
+};
+
+export type StartupRepairBackupSummary = {
+  count: number;
+  totalBytes: number;
+  nextExpiryAtMs: number | null;
+  /**
+   * In-progress, malformed, or unsafe repair directories are preserved and
+   * reported separately instead of being silently deleted.
+   */
+  protectedCount: number;
 };
 
 export type PluginKind = "cordisPlugin" | "skill";

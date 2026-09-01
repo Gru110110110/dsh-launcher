@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   BalanceSnapshot,
+  HarnessUpdateChannel,
   HarnessUpdateMode,
   Language,
   LauncherSnapshot,
@@ -9,6 +10,7 @@ import type {
   ProxyTestReport,
   RemoteScope,
   ThemePreference,
+  StartupRepairBackupSummary,
 } from "./generated/bindings";
 
 const command = <T>(name: string, args?: Record<string, unknown>): Promise<T> =>
@@ -19,6 +21,16 @@ const action = (name: string, args?: Record<string, unknown>): Promise<void> =>
 export const launcherApi = {
   snapshot: () => command<LauncherSnapshot>("launcher_get_snapshot"),
   retry: () => action("launcher_retry"),
+  rollbackHarness: (expectedVersion: string) =>
+    command<string>("launcher_rollback_harness", { expectedVersion }),
+  repairAndStart: () => action("launcher_repair_and_start"),
+  acknowledgeStartupRepair: () => action("launcher_acknowledge_startup_repair"),
+  startupRepairBackups: () =>
+    command<StartupRepairBackupSummary>("launcher_startup_repair_backups"),
+  clearStartupRepairBackups: () =>
+    command<StartupRepairBackupSummary>(
+      "launcher_clear_startup_repair_backups",
+    ),
   stop: () => action("launcher_stop"),
   restart: () => action("launcher_restart"),
   checkHarnessUpdate: () =>
@@ -42,6 +54,8 @@ export const launcherApi = {
     action("preferences_set_theme", { theme }),
   setShowBalanceCard: (show: boolean) =>
     action("preferences_set_show_balance_card", { show }),
+  setHarnessUpdateChannel: (channel: HarnessUpdateChannel) =>
+    action("preferences_set_harness_update_channel", { channel }),
   setProxy: (proxy: ProxySettings) =>
     command<boolean>("preferences_set_proxy", { proxy }),
   testProxy: (proxy: ProxySettings) =>

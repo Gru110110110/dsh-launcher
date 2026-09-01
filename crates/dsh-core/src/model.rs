@@ -22,6 +22,26 @@ pub enum ThemePreference {
     Dark,
 }
 
+/// npm dist-tag used when resolving Harness updates. `Latest` preserves the
+/// existing conservative behavior, while `Alpha` opts into official preview
+/// builds explicitly published on the alpha channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+pub enum HarnessUpdateChannel {
+    #[default]
+    Latest,
+    Alpha,
+}
+
+impl HarnessUpdateChannel {
+    pub fn dist_tag(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Alpha => "alpha",
+        }
+    }
+}
+
 /// Proxy mode for every Launcher-owned network operation. `System` is the
 /// default so installations and configurations written before proxy support
 /// keep their previous behavior.
@@ -192,6 +212,7 @@ pub enum ActivityCode {
     ValidatingHarness,
     ActivatingHarness,
     MigratingData,
+    RepairingStartup,
     StartingService,
 }
 
@@ -352,11 +373,22 @@ pub struct LauncherSnapshot {
     pub theme: ThemePreference,
     pub desktop_version: String,
     pub harness_version: Option<String>,
+    /// Last validated runtime retained beside the active Harness. Exposed so
+    /// a failed service start can offer an explicit, version-bound rollback.
+    pub previous_harness_version: Option<String>,
+    /// Third-party profile packages removed transactionally after they were
+    /// identified in startup output as incompatible. The UI acknowledges the
+    /// recovery in a modal; an empty list means no recovery was committed.
+    pub removed_incompatible_plugins: Vec<String>,
+    /// True after the launcher isolated version-incompatible projection cache
+    /// records and verified that Harness rebuilt them from authoritative logs.
+    pub repaired_projection_cache: bool,
     pub desktop_update: DesktopUpdateState,
     pub harness_update: HarnessUpdateState,
     pub migration: MigrationState,
     pub tray_available: bool,
     pub show_balance_card: bool,
+    pub harness_update_channel: HarnessUpdateChannel,
     pub proxy: ProxySettings,
     pub remote: RemoteSnapshot,
 }
@@ -381,11 +413,15 @@ impl LauncherSnapshot {
             theme: ThemePreference::default(),
             desktop_version: desktop_version.into(),
             harness_version: None,
+            previous_harness_version: None,
+            removed_incompatible_plugins: Vec::new(),
+            repaired_projection_cache: false,
             desktop_update: DesktopUpdateState::default(),
             harness_update: HarnessUpdateState::default(),
             migration: MigrationState::default(),
             tray_available: false,
             show_balance_card: true,
+            harness_update_channel: HarnessUpdateChannel::default(),
             proxy: ProxySettings::default(),
             remote: RemoteSnapshot::default(),
         }

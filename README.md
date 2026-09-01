@@ -12,19 +12,19 @@ Implementation and operations details live in [docs/IMPLEMENTATION.md](docs/IMPL
 
 ### Launch and manage DeepSeek Harness
 
-The home page prepares and verifies the private Node.js/Harness runtime, starts or stops the official service, shows its real address and uptime, and opens the official Web UI in the browser you choose. Harness and desktop updates are surfaced separately so you always know what is changing.
+The home page prepares and verifies the private Node.js/Harness runtime, starts or stops the official service, shows its real address and uptime, and opens the official Web UI in the browser you choose. Harness and desktop updates are surfaced separately so you always know what is changing. If an update leaves an incompatible derived session index or third-party plugin, **Repair and start** rebuilds the index from retained session logs and removes only identified incompatible plugins through recoverable transactions. Finalized repair backups are automatically bounded by age, count, and total size and can be reviewed or cleaned in Settings.
 
 ![DSH Launcher home page](screenshots/ScreenShot_en.png)
 
 ### Install plugins from the marketplace
 
-Search, filter, inspect, install, and uninstall Cordis and Skill plugins from a validated marketplace snapshot. Before installation, the launcher shows the exact source, version, target, compatibility result, and execution risk; uninstall keeps a recoverable backup.
+Search, filter, inspect, install, and uninstall Cordis and Skill plugins from a validated marketplace snapshot. Before installation, the launcher shows the exact source, version, target, compatibility result, and execution risk; uninstall keeps a recoverable backup. If a Harness update makes an installed plugin fail during startup, the launcher retries through a reversible uninstall and tells you exactly which plugin was removed.
 
 ![DSH Launcher plugin marketplace](screenshots/ScreenShot_plugin_en.png)
 
 ### Use Harness from your phone
 
-Remote access exposes the loopback-only Harness Web UI through the launcher's authenticated proxy. Use a QR code and a rotatable 8-digit password on the same LAN, or explicitly enable a temporary Cloudflare quick tunnel for public access; rotating the password immediately revokes existing sessions.
+Remote access exposes the loopback-only Harness Web UI through the launcher's authenticated proxy. It supports both older bare `dsh web` URLs and newer launch-token URLs without putting Harness's private token into a remote link. Use a QR code and a rotatable 8-digit password on the same LAN, or explicitly enable a temporary Cloudflare quick tunnel for public access; rotating the password immediately revokes existing sessions.
 
 ![DSH Launcher remote access](screenshots/ScreenShot_remote_en.png)
 
@@ -43,7 +43,7 @@ Settings keeps language, light/dark/system theme, the optional balance card, pro
 - A stable terminal `dsh` command backed by the launcher's private runtime
 - Browser selection, system tray lifecycle, English/Simplified Chinese, and light/dark/system themes
 - Plugin marketplace backed by the validated [dsh-market](https://github.com/2BingLing/dsh-market) snapshot
-- Separate Harness updates and cryptographically signed desktop updates
+- Separate Harness updates and cryptographically signed desktop updates, with Default and Alpha Harness update channels and an explicit rollback action when the retained previous runtime is available
 - Remote access with QR codes, rotatable passwords, and an optional Cloudflare quick tunnel
 
 ## Architecture

@@ -25,7 +25,10 @@ use crate::{
     ActivityCode, AppError, AppResult, ApplicationPaths,
     child_process::{configure_process_group, new_command},
     log_file::{INSTALL_LOG_MAX_BYTES, trim_log_tail},
-    model::{NetworkErrorKind, ProxySettings, ProxyTestFailure, ProxyTestReport, ProxyTestSource},
+    model::{
+        HarnessUpdateChannel, NetworkErrorKind, ProxySettings, ProxyTestFailure, ProxyTestReport,
+        ProxyTestSource,
+    },
     network,
     paths::atomic_write,
 };
@@ -127,6 +130,94 @@ pub fn installed_version(paths: &ApplicationPaths) -> Option<String> {
     (marker.trim() == manifest).then_some(manifest)
 }
 
+/// Version of the validated Harness runtime retained for an explicit user
+/// rollback. Validation runs with the same isolated home as normal runtime
+/// checks and never loads the user's profile or credential data.
+pub fn previous_harness_version(paths: &ApplicationPaths) -> Option<String> {
+    let previous_dsh = paths.runtime_dir.join("dsh.previous");
+    let version = dsh_manifest_version(&previous_dsh)?;
+    let previous_node = paths.runtime_dir.join("node.previous");
+    (runtime_pair_valid(paths, &paths.node_dir, &previous_dsh, &version)
+        || runtime_pair_valid(paths, &previous_node, &previous_dsh, &version))
+    .then_some(version)
+}
+
+/// Swap the active validated runtime with the retained previous runtime.
+/// Neither side is deleted: after a successful rollback the rejected runtime
+/// becomes the new `.previous`, making the operation reversible.
+pub fn rollback_harness_runtime(
+    paths: &ApplicationPaths,
+    expected_version: &str,
+) -> AppResult<String> {
+    paths.ensure_dirs()?;
+    let controller = DeploymentController::default();
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.deployment_lock)?;
+    acquire_lock(&lock_file, &controller)?;
+    let result = (|| {
+        recover_interrupted(paths)?;
+        let previous_dsh = paths.runtime_dir.join("dsh.previous");
+        let previous_node = paths.runtime_dir.join("node.previous");
+        let version = dsh_manifest_version(&previous_dsh)
+            .ok_or_else(|| AppError::new("previousHarnessRuntimeUnavailable"))?;
+        if version != expected_version {
+            return Err(AppError::new("previousHarnessVersionChanged")
+                .value("expected", expected_version)
+                .value("actual", &version));
+        }
+        let swap_node = if runtime_pair_valid(paths, &paths.node_dir, &previous_dsh, &version) {
+            false
+        } else if runtime_pair_valid(paths, &previous_node, &previous_dsh, &version) {
+            true
+        } else {
+            return Err(AppError::new("previousHarnessRuntimeInvalid"));
+        };
+
+        if swap_node {
+            swap_runtime_directories(&paths.node_dir, &previous_node)?;
+        }
+        if let Err(error) = swap_runtime_directories(&paths.dsh_dir, &previous_dsh) {
+            if swap_node
+                && let Err(restore_error) =
+                    swap_runtime_directories(&paths.node_dir, &previous_node)
+            {
+                return Err(AppError::new("harnessRollbackRecoveryFailed")
+                    .detail(format!("{}; restore: {}", error.code, restore_error.code)));
+            }
+            return Err(error);
+        }
+        let commit = if runtime_pair_valid(paths, &paths.node_dir, &paths.dsh_dir, &version) {
+            atomic_write(&paths.version_file, format!("{version}\n").as_bytes())
+        } else {
+            Err(AppError::new("previousHarnessRuntimeInvalid"))
+        };
+        if let Err(error) = commit {
+            let restore_dsh = swap_runtime_directories(&paths.dsh_dir, &previous_dsh);
+            let restore_node = if swap_node {
+                swap_runtime_directories(&paths.node_dir, &previous_node)
+            } else {
+                Ok(())
+            };
+            if restore_dsh.is_err() || restore_node.is_err() {
+                let restore_error = restore_dsh
+                    .err()
+                    .or_else(|| restore_node.err())
+                    .expect("failed restore has an error");
+                return Err(AppError::new("harnessRollbackRecoveryFailed")
+                    .detail(format!("{}; restore: {}", error.code, restore_error.code)));
+            }
+            return Err(error);
+        }
+        Ok(version)
+    })();
+    let _ = FileExt::unlock(&lock_file);
+    result
+}
+
 pub fn is_runtime_ready(paths: &ApplicationPaths) -> bool {
     let Some(version) = installed_version(paths) else {
         return false;
@@ -138,19 +229,22 @@ pub fn is_runtime_ready(paths: &ApplicationPaths) -> bool {
         && dsh_valid(paths, &paths.node_dir, &paths.dsh_dir, &version)
 }
 
-pub fn latest_harness_version(controller: &DeploymentController) -> AppResult<String> {
+pub fn latest_harness_version(
+    controller: &DeploymentController,
+    channel: HarnessUpdateChannel,
+) -> AppResult<String> {
     controller.check()?;
     let client = http_client()?;
     let registries = npm_registries();
     // Probe every registry instead of trusting the first one: a blocked or
     // stale authority must not hide a newer release available on a mirror,
-    // and the newest observed latest version wins.
+    // and the newest observed version for the selected channel wins.
     let mut latest = None;
     let mut failures = Vec::new();
     let mut failure_kinds = Vec::new();
     for registry in registries {
         controller.check()?;
-        match query_registry_version(&client, &registry) {
+        match query_registry_channel_version(&client, &registry, channel) {
             Ok(version) => {
                 latest = Some(match latest {
                     Some(current) if current >= version => current,
@@ -285,16 +379,25 @@ fn retry_release_source<T>(mut operation: impl FnMut() -> AppResult<T>) -> AppRe
 }
 
 fn query_registry_version(client: &Client, registry: &str) -> AppResult<Version> {
+    query_registry_channel_version(client, registry, HarnessUpdateChannel::Latest)
+}
+
+fn query_registry_channel_version(
+    client: &Client,
+    registry: &str,
+    channel: HarnessUpdateChannel,
+) -> AppResult<Version> {
     let value = query_registry_packument(client, registry)?;
     let version = value
         .get("dist-tags")
-        .and_then(|tags| tags.get("latest"))
+        .and_then(|tags| tags.get(channel.dist_tag()))
         .and_then(Value::as_str)
         .and_then(|raw| Version::parse(raw).ok())
         .ok_or_else(|| {
             AppError::new("versionQueryFailed").detail(format!(
-                "{}: invalid latest version metadata",
-                display_source(registry)
+                "{}: invalid {} version metadata",
+                display_source(registry),
+                channel.dist_tag(),
             ))
         })?;
     release_from_packument(registry, &value, &version)?;
@@ -665,6 +768,7 @@ pub fn deploy_runtime(
     paths: &ApplicationPaths,
     force: bool,
     target_version: Option<&str>,
+    update_channel: HarnessUpdateChannel,
     controller: &DeploymentController,
     notify: impl Fn(DeploymentEvent),
 ) -> AppResult<String> {
@@ -695,7 +799,7 @@ pub fn deploy_runtime(
                 .to_string(),
             None => {
                 activity(&notify, ActivityCode::ResolvingVersion, []);
-                latest_harness_version(controller)?
+                latest_harness_version(controller, update_channel)?
             }
         };
         let node_previous = ensure_node(paths, controller, &notify)?;
@@ -2071,6 +2175,38 @@ fn rollback_directory(active: &Path, previous: Option<&Path>) -> AppResult<()> {
     remove_owned(&failed)
 }
 
+fn swap_runtime_directories(active: &Path, previous: &Path) -> AppResult<()> {
+    if !active.is_dir() || active.is_symlink() || !previous.is_dir() || previous.is_symlink() {
+        return Err(AppError::new("previousHarnessRuntimeInvalid"));
+    }
+    let exchanging = active.with_file_name(format!(
+        ".{}-rollback-{}",
+        active
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("runtime"),
+        Uuid::new_v4()
+    ));
+    fs::rename(previous, &exchanging)?;
+    if let Err(error) = fs::rename(active, previous) {
+        if fs::rename(&exchanging, previous).is_err() {
+            return Err(AppError::new("harnessRollbackRecoveryFailed")
+                .detail("the previous runtime could not be restored after a failed swap"));
+        }
+        return Err(error.into());
+    }
+    if let Err(error) = fs::rename(&exchanging, active) {
+        let restore_active = fs::rename(previous, active);
+        let restore_previous = fs::rename(&exchanging, previous);
+        if restore_active.is_err() || restore_previous.is_err() {
+            return Err(AppError::new("harnessRollbackRecoveryFailed")
+                .detail("runtime directories could not be restored after a failed swap"));
+        }
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn remove_owned(path: &Path) -> AppResult<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -3034,6 +3170,50 @@ mod tests {
     }
 
     #[test]
+    fn registry_alpha_channel_uses_the_alpha_dist_tag() {
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode([0_u8; 64])
+        );
+        let metadata = json_response(
+            &serde_json::json!({
+                "dist-tags": {
+                    "latest": "0.1.1-rc.2",
+                    "alpha": "0.1.2-alpha.3"
+                },
+                "versions": {
+                    "0.1.1-rc.2": {
+                        "version": "0.1.1-rc.2",
+                        "dist": {
+                            "tarball": "https://registry.example.test/dsh-0.1.1-rc.2.tgz",
+                            "integrity": integrity,
+                        },
+                    },
+                    "0.1.2-alpha.3": {
+                        "version": "0.1.2-alpha.3",
+                        "dist": {
+                            "tarball": "https://registry.example.test/dsh-0.1.2-alpha.3.tgz",
+                            "integrity": integrity,
+                        },
+                    },
+                },
+            })
+            .to_string(),
+        );
+        let (registry, server) = serve_responses(vec![metadata]);
+
+        let version = query_registry_channel_version(
+            &http_client().unwrap(),
+            &registry,
+            HarnessUpdateChannel::Alpha,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(version, Version::parse("0.1.2-alpha.3").unwrap());
+    }
+
+    #[test]
     fn harness_tarball_must_match_the_published_integrity() {
         let body = b"verified-harness-archive";
         let integrity = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(body));
@@ -3766,6 +3946,26 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn explicit_runtime_rollback_is_validated_and_reversible() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        write_fake_runtime(&paths, &paths.dsh_dir, "0.2.0");
+        write_fake_runtime(&paths, &paths.runtime_dir.join("dsh.previous"), "0.1.0");
+        fs::write(&paths.version_file, b"0.2.0\n").unwrap();
+
+        assert_eq!(previous_harness_version(&paths).as_deref(), Some("0.1.0"));
+        assert_eq!(rollback_harness_runtime(&paths, "0.1.0").unwrap(), "0.1.0");
+        assert_eq!(installed_version(&paths).as_deref(), Some("0.1.0"));
+        assert_eq!(previous_harness_version(&paths).as_deref(), Some("0.2.0"));
+
+        assert_eq!(rollback_harness_runtime(&paths, "0.2.0").unwrap(), "0.2.0");
+        assert_eq!(installed_version(&paths).as_deref(), Some("0.2.0"));
+        assert_eq!(previous_harness_version(&paths).as_deref(), Some("0.1.0"));
+    }
+
     #[test]
     fn incomplete_prepared_harness_update_is_never_reported_as_ready() {
         let temp = tempfile::tempdir().unwrap();
@@ -4048,7 +4248,10 @@ mod tests {
     #[test]
     #[ignore]
     fn latest_harness_version_child() {
-        match latest_harness_version(&DeploymentController::default()) {
+        match latest_harness_version(
+            &DeploymentController::default(),
+            HarnessUpdateChannel::Latest,
+        ) {
             Ok(version) => println!("VERSION={version}"),
             Err(error) => {
                 println!("ERROR_CODE={}", error.code);

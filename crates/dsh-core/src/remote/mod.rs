@@ -127,9 +127,13 @@ impl RemoteInner {
 pub struct RemoteService {
     paths: ApplicationPaths,
     inner: std::sync::Mutex<RemoteInner>,
-    /// Current Harness web authority (`127.0.0.1:port`), resolved per
-    /// proxied connection so Harness restarts are transparent.
-    upstream: Arc<RwLock<Option<String>>>,
+    /// Current Harness web endpoint, including the private bootstrap target
+    /// printed by newer `dsh web` versions. Resolved per proxied connection
+    /// so Harness restarts are transparent.
+    upstream: Arc<RwLock<Option<Upstream>>>,
+    /// Bumped whenever the complete published URL changes. Remote browser
+    /// sessions use it to perform a new upstream auth exchange exactly once.
+    upstream_generation: AtomicU64,
     lan_auth: Arc<AuthState>,
     public_auth: Arc<AuthState>,
     listener: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -152,6 +156,7 @@ impl RemoteService {
             public_auth: AuthState::new(RemoteScope::Public, settings.public_password.clone()),
             inner: std::sync::Mutex::new(RemoteInner::new(settings)),
             upstream: Arc::new(RwLock::new(None)),
+            upstream_generation: AtomicU64::new(0),
             listener: RwLock::new(None),
             public_generation: Arc::new(AtomicU64::new(0)),
             self_weak: RwLock::new(std::sync::Weak::new()),
@@ -183,14 +188,19 @@ impl RemoteService {
         }
     }
 
-    /// Updates the Harness web authority the proxies forward to. Called by
-    /// the application shell whenever the published web URL changes.
+    /// Updates the Harness endpoint the proxies forward to. Newer Harness
+    /// versions append a launch token to the printed URL; retain its request
+    /// target privately so a remote browser can exchange it for Harness's
+    /// own auth cookie after passing the launcher's password gate.
     pub fn set_upstream(&self, web_url: Option<&str>) -> AppResult<()> {
-        let authority = web_url.map(upstream_authority).transpose()?;
+        let endpoint = web_url.map(parse_upstream).transpose()?;
         let changed = {
             let mut upstream = self.upstream.write().expect("upstream poisoned");
-            let changed = *upstream != authority;
-            *upstream = authority;
+            let changed = upstream.as_ref().map(Upstream::endpoint) != endpoint.as_ref();
+            if changed {
+                let generation = self.upstream_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                *upstream = endpoint.map(|endpoint| Upstream::new(endpoint, generation));
+            }
             changed
         };
         if changed {
@@ -565,22 +575,63 @@ pub fn ensure_cloudflared(paths: &ApplicationPaths) -> AppResult<std::path::Path
 #[cfg(test)]
 static TUNNEL_WORKER_DISABLED: AtomicBool = AtomicBool::new(false);
 
-/// Extracts the `host:port` authority from the published web URL. IPv6
-/// hosts keep their brackets so the result always parses as a SocketAddr.
-fn upstream_authority(web_url: &str) -> AppResult<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpstreamEndpoint {
+    authority: String,
+    bootstrap_target: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Upstream {
+    endpoint: UpstreamEndpoint,
+    generation: u64,
+}
+
+impl Upstream {
+    fn new(endpoint: UpstreamEndpoint, generation: u64) -> Self {
+        Self {
+            endpoint,
+            generation,
+        }
+    }
+
+    fn endpoint(&self) -> &UpstreamEndpoint {
+        &self.endpoint
+    }
+}
+
+/// Retains both the socket authority and any non-default request target from
+/// the exact URL printed by `dsh web`. Since 0.1.2-alpha.2 Harness prints a
+/// `/?token=...` launch URL that must be exchanged for its browser cookie;
+/// older versions print a bare root and therefore need no bootstrap.
+fn parse_upstream(web_url: &str) -> AppResult<UpstreamEndpoint> {
     let url = url::Url::parse(web_url).map_err(|_| AppError::new("invalidWebUrl"))?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| AppError::new("invalidWebUrl"))?;
-    match url.host() {
+    let authority = match url.host() {
         Some(url::Host::Domain(domain)) if domain.eq_ignore_ascii_case("localhost") => {
-            Ok(format!("127.0.0.1:{port}"))
+            format!("127.0.0.1:{port}")
         }
-        Some(url::Host::Domain(domain)) => Ok(format!("{domain}:{port}")),
-        Some(url::Host::Ipv4(v4)) => Ok(format!("{v4}:{port}")),
-        Some(url::Host::Ipv6(v6)) => Ok(format!("[{v6}]:{port}")),
-        None => Err(AppError::new("invalidWebUrl")),
-    }
+        Some(url::Host::Domain(domain)) => format!("{domain}:{port}"),
+        Some(url::Host::Ipv4(v4)) => format!("{v4}:{port}"),
+        Some(url::Host::Ipv6(v6)) => format!("[{v6}]:{port}"),
+        None => return Err(AppError::new("invalidWebUrl")),
+    };
+    let bootstrap_target = if url.path() != "/" || url.query().is_some() {
+        let mut target = url.path().to_owned();
+        if let Some(query) = url.query() {
+            target.push('?');
+            target.push_str(query);
+        }
+        Some(target)
+    } else {
+        None
+    };
+    Ok(UpstreamEndpoint {
+        authority,
+        bootstrap_target,
+    })
 }
 
 /// Per-bootstrap events sink. Holds the service weakly so a torn-down
@@ -893,26 +944,32 @@ mod tests {
     }
 
     #[test]
-    fn upstream_authority_handles_ipv6_brackets_and_localhost() {
-        let v6 = upstream_authority("http://[::1]:3000").unwrap();
-        assert_eq!(v6, "[::1]:3000");
+    fn upstream_parser_handles_bootstrap_targets_ipv6_and_localhost() {
+        let v6 = parse_upstream("http://[::1]:3000").unwrap();
+        assert_eq!(v6.authority, "[::1]:3000");
         assert!(
-            v6.parse::<std::net::SocketAddr>().is_ok(),
+            v6.authority.parse::<std::net::SocketAddr>().is_ok(),
             "bracketed IPv6 authority parses as a socket address"
         );
         assert_eq!(
-            upstream_authority("http://127.0.0.1:3000").unwrap(),
-            "127.0.0.1:3000"
+            parse_upstream("http://127.0.0.1:3000").unwrap(),
+            UpstreamEndpoint {
+                authority: "127.0.0.1:3000".into(),
+                bootstrap_target: None,
+            }
         );
         assert_eq!(
-            upstream_authority("http://localhost:3000").unwrap(),
-            "127.0.0.1:3000"
+            parse_upstream("http://localhost:3000/?token=launch-secret").unwrap(),
+            UpstreamEndpoint {
+                authority: "127.0.0.1:3000".into(),
+                bootstrap_target: Some("/?token=launch-secret".into()),
+            }
         );
         assert_eq!(
-            upstream_authority("http://LOCALHOST:3000").unwrap(),
+            parse_upstream("http://LOCALHOST:3000").unwrap().authority,
             "127.0.0.1:3000"
         );
-        assert!(upstream_authority("not a url").is_err());
+        assert!(parse_upstream("not a url").is_err());
     }
 
     #[test]

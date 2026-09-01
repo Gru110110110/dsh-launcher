@@ -12,6 +12,7 @@ import {
   RotateCw,
   ShieldCheck,
   Square,
+  Undo2,
 } from "lucide-react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useTranslation } from "react-i18next";
@@ -45,7 +46,12 @@ export function LauncherPage() {
   const [downloadedPromptVersion, setDownloadedPromptVersion] = useState<
     string | null
   >(null);
+  const [recoveryNotice, setRecoveryNotice] = useState<{
+    cache: boolean;
+    plugins: string[];
+  } | null>(null);
   const promptedDownload = useRef<string | null>(null);
+  const promptedRecovery = useRef<string | null>(null);
   const updateRequestPendingRef = useRef(false);
   const [updateRequestPending, setUpdateRequestPending] = useState(false);
   const marketplaceBusy = snapshot.marketBusy;
@@ -113,6 +119,22 @@ export function LauncherPage() {
   }, [snapshot.harnessUpdate]);
 
   useEffect(() => {
+    const plugins = snapshot.removedIncompatiblePlugins;
+    const cache = snapshot.repairedProjectionCache;
+    const signature = `${cache ? "cache" : ""}\n${plugins.join("\n")}`;
+    if (
+      (cache || plugins.length > 0) &&
+      promptedRecovery.current !== signature
+    ) {
+      promptedRecovery.current = signature;
+      setRecoveryNotice({ cache, plugins });
+    } else if (!cache && plugins.length === 0) {
+      promptedRecovery.current = null;
+      setRecoveryNotice(null);
+    }
+  }, [snapshot.removedIncompatiblePlugins, snapshot.repairedProjectionCache]);
+
+  useEffect(() => {
     if (!updateChoiceVersion) return;
     const current = snapshot.harnessUpdate;
     if (
@@ -154,6 +176,11 @@ export function LauncherPage() {
     selectedBrowser?.id === "system"
       ? t("browser.default")
       : (selectedBrowser?.label ?? t("browser.default"));
+  const repairAvailable =
+    failed &&
+    snapshot.error !== null &&
+    (snapshot.error.values.repairableProjectionCache === "true" ||
+      Boolean(snapshot.error.values.incompatiblePlugins));
 
   const sections = getDashboardSections(snapshot.showBalanceCard);
 
@@ -233,20 +260,60 @@ export function LauncherPage() {
                 </button>
               </>
             ) : (
-              <button
-                className="primary-button"
-                disabled={busy}
-                onClick={() => {
-                  run(launcherApi.retry());
-                }}
-              >
-                {busy ? (
-                  <LoaderCircle className="spin" size={14} />
-                ) : (
-                  <Power size={14} />
+              <>
+                {repairAvailable && (
+                  <button
+                    className="primary-button"
+                    disabled={busy || marketplaceBusy}
+                    onClick={() => {
+                      run(launcherApi.repairAndStart());
+                    }}
+                  >
+                    <ShieldCheck size={14} />
+                    {t("action.repairAndStart")}
+                  </button>
                 )}
-                {busy ? t(serviceCopy.busyAction) : t("action.start")}
-              </button>
+                {failed && snapshot.previousHarnessVersion && (
+                  <button
+                    className="outline-button"
+                    disabled={marketplaceBusy}
+                    onClick={() => {
+                      const version = snapshot.previousHarnessVersion;
+                      if (!version) return;
+                      run(
+                        launcherApi.rollbackHarness(version).then((restored) =>
+                          toast.success(
+                            t("recovery.rollback.success", {
+                              version: restored,
+                            }),
+                          ),
+                        ),
+                      );
+                    }}
+                  >
+                    <Undo2 size={14} />
+                    {t("action.rollbackHarness", {
+                      version: snapshot.previousHarnessVersion,
+                    })}
+                  </button>
+                )}
+                <button
+                  className={
+                    repairAvailable ? "outline-button" : "primary-button"
+                  }
+                  disabled={busy || marketplaceBusy}
+                  onClick={() => {
+                    run(launcherApi.retry());
+                  }}
+                >
+                  {busy ? (
+                    <LoaderCircle className="spin" size={14} />
+                  ) : (
+                    <Power size={14} />
+                  )}
+                  {busy ? t(serviceCopy.busyAction) : t("action.start")}
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -624,6 +691,48 @@ export function LauncherPage() {
                 }}
               >
                 {t("action.confirmRestartAndUpdate")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {recoveryNotice && (
+        <div className="modal-overlay" role="presentation">
+          <div
+            className="update-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="startup-recovery-title"
+            aria-describedby="startup-recovery-detail"
+          >
+            <h2 id="startup-recovery-title">{t("recovery.startup.title")}</h2>
+            <p id="startup-recovery-detail">{t("recovery.startup.detail")}</p>
+            {recoveryNotice.cache && <p>{t("recovery.startup.cache")}</p>}
+            {recoveryNotice.plugins.length > 0 && (
+              <>
+                <p>{t("recovery.startup.plugins")}</p>
+                <ul className="recovery-plugin-list">
+                  {recoveryNotice.plugins.map((plugin) => (
+                    <li key={plugin}>{plugin}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+            <p>{t("recovery.startup.result")}</p>
+            <div className="modal-actions">
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => {
+                  run(
+                    launcherApi.acknowledgeStartupRepair().then(() => {
+                      setRecoveryNotice(null);
+                    }),
+                  );
+                }}
+              >
+                {t("action.understood")}
               </button>
             </div>
           </div>

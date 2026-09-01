@@ -1,23 +1,32 @@
 import {
   ExternalLink,
   Globe2,
+  HardDrive,
   Info,
   Languages,
   MoonStar,
   Network,
   RefreshCw,
+  Trash2,
   Wallet,
 } from "lucide-react";
-import { useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { launcherApi } from "@/platform/launcherApi";
 import { shallowEqual, useLauncherSelector } from "@/platform/launcherStore";
 import type {
+  HarnessUpdateChannel,
   Language,
   ProxyMode,
   ProxySettings,
   ProxyTestReport,
+  StartupRepairBackupSummary,
   ThemePreference,
 } from "@/platform/generated/bindings";
 import { showTimedError } from "@/shared/errorToast";
@@ -41,11 +50,13 @@ function SegmentedControl<T extends string>({
   options,
   onChange,
   label,
+  disabled = false,
 }: {
   value: T;
   options: readonly { value: T; label: string }[];
   onChange: (value: T) => void;
   label: string;
+  disabled?: boolean;
 }) {
   return (
     <div className="segmented-control" role="radiogroup" aria-label={label}>
@@ -55,6 +66,7 @@ function SegmentedControl<T extends string>({
           role="radio"
           aria-checked={option.value === value}
           className={option.value === value ? "selected" : ""}
+          disabled={disabled}
           key={option.value}
           onClick={() => {
             onChange(option.value);
@@ -90,6 +102,12 @@ function revealFullTextOnTruncation(
   const element = event.currentTarget;
   // Only surface the native tooltip when the ellipsis actually hides content.
   element.title = element.scrollWidth > element.clientWidth ? fullText : "";
+}
+
+function formatBackupBytes(bytes: number): string {
+  if (bytes < 1024) return `${String(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function ProxySection({
@@ -337,6 +355,12 @@ export function SettingsPage() {
       theme: snapshot.theme,
       desktopVersion: snapshot.desktopVersion,
       showBalanceCard: snapshot.showBalanceCard,
+      harnessUpdateChannel: snapshot.harnessUpdateChannel,
+      harnessUpdateChannelLocked: [
+        "downloading",
+        "downloaded",
+        "installing",
+      ].includes(snapshot.harnessUpdate.kind),
     }),
     shallowEqual,
   );
@@ -348,11 +372,81 @@ export function SettingsPage() {
   const { t } = useTranslation(undefined, { lng: state.language });
   const desktopUpdateDetail = getDesktopUpdateDetail(desktopUpdate);
   const desktopUpdateAction = getDesktopUpdateAction(desktopUpdate);
+  const [repairBackups, setRepairBackups] =
+    useState<StartupRepairBackupSummary | null>(null);
+  const [repairBackupsLoading, setRepairBackupsLoading] = useState(true);
+  const [repairBackupsClearing, setRepairBackupsClearing] = useState(false);
+  const [repairBackupsConfirming, setRepairBackupsConfirming] = useState(false);
+  const repairBackupsCancelButton = useRef<HTMLButtonElement>(null);
   const run = (task: Promise<unknown>) => {
     void task.catch((error: unknown) => {
       showTimedError(error, (key, values) => t(key, values));
     });
   };
+
+  useEffect(() => {
+    let current = true;
+    setRepairBackupsLoading(true);
+    void launcherApi
+      .startupRepairBackups()
+      .then((summary) => {
+        if (current) setRepairBackups(summary);
+      })
+      .catch((error: unknown) => {
+        if (current) {
+          showTimedError(error, (key, values) => t(key, values));
+        }
+      })
+      .finally(() => {
+        if (current) setRepairBackupsLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [t]);
+
+  useEffect(() => {
+    if (!repairBackupsConfirming) return;
+    repairBackupsCancelButton.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setRepairBackupsConfirming(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [repairBackupsConfirming]);
+
+  const clearRepairBackups = () => {
+    setRepairBackupsConfirming(false);
+    setRepairBackupsClearing(true);
+    void launcherApi
+      .clearStartupRepairBackups()
+      .then((summary) => {
+        setRepairBackups(summary);
+        toast.success(t("settings.repairBackupsCleared"));
+      })
+      .catch((error: unknown) => {
+        showTimedError(error, (key, values) => t(key, values));
+      })
+      .finally(() => {
+        setRepairBackupsClearing(false);
+      });
+  };
+
+  const repairBackupDetail = repairBackupsLoading
+    ? t("settings.repairBackupsLoading")
+    : repairBackups && repairBackups.count > 0
+      ? t("settings.repairBackupsDetail", {
+          count: repairBackups.count,
+          size: formatBackupBytes(repairBackups.totalBytes),
+          date: repairBackups.nextExpiryAtMs
+            ? new Date(repairBackups.nextExpiryAtMs).toLocaleDateString(
+                state.language === "zh" ? "zh-CN" : "en-US",
+              )
+            : t("settings.repairBackupsUnknownExpiry"),
+        })
+      : t("settings.repairBackupsEmpty");
 
   return (
     <section className="content-page">
@@ -379,6 +473,37 @@ export function SettingsPage() {
               ]}
               onChange={(language) => {
                 run(launcherApi.setLanguage(language));
+              }}
+            />
+          </div>
+          <div className="info-row settings-row">
+            <RefreshCw className="row-icon" size={18} aria-hidden />
+            <div className="row-copy">
+              <strong>{t("settings.harnessUpdateChannel")}</strong>
+              <span>
+                {t(
+                  state.harnessUpdateChannel === "alpha"
+                    ? "settings.harnessUpdateChannelAlphaDetail"
+                    : "settings.harnessUpdateChannelLatestDetail",
+                )}
+              </span>
+            </div>
+            <SegmentedControl<HarnessUpdateChannel>
+              label={t("settings.harnessUpdateChannel")}
+              value={state.harnessUpdateChannel}
+              disabled={state.harnessUpdateChannelLocked}
+              options={[
+                {
+                  value: "latest",
+                  label: t("settings.harnessUpdateChannelLatest"),
+                },
+                {
+                  value: "alpha",
+                  label: t("settings.harnessUpdateChannelAlpha"),
+                },
+              ]}
+              onChange={(channel) => {
+                run(launcherApi.setHarnessUpdateChannel(channel));
               }}
             />
           </div>
@@ -423,6 +548,44 @@ export function SettingsPage() {
       </section>
 
       <ProxySection proxy={proxy} run={run} t={t} />
+
+      <section className="page-section settings-storage">
+        <h2 className="section-label">{t("settings.storage")}</h2>
+        <div className="panel rows-panel">
+          <div className="info-row settings-row">
+            <HardDrive className="row-icon" size={18} aria-hidden />
+            <div className="row-copy">
+              <strong>{t("settings.repairBackups")}</strong>
+              <span>{repairBackupDetail}</span>
+              {repairBackups && repairBackups.protectedCount > 0 && (
+                <span className="settings-backup-warning">
+                  {t("settings.repairBackupsProtected", {
+                    count: repairBackups.protectedCount,
+                  })}
+                </span>
+              )}
+            </div>
+            <button
+              className="outline-button danger"
+              type="button"
+              disabled={
+                repairBackupsLoading ||
+                repairBackupsClearing ||
+                !repairBackups ||
+                repairBackups.count === 0
+              }
+              onClick={() => {
+                setRepairBackupsConfirming(true);
+              }}
+            >
+              <Trash2 size={14} />
+              {repairBackupsClearing
+                ? t("settings.repairBackupsClearing")
+                : t("settings.repairBackupsClear")}
+            </button>
+          </div>
+        </div>
+      </section>
 
       <section className="page-section settings-about">
         <h2 className="section-label">{t("settings.about")}</h2>
@@ -509,6 +672,53 @@ export function SettingsPage() {
           </button>
         </div>
       </section>
+
+      {repairBackupsConfirming && (
+        <div
+          className="modal-overlay"
+          role="presentation"
+          onClick={() => {
+            setRepairBackupsConfirming(false);
+          }}
+        >
+          <div
+            className="update-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="repair-backups-clear-title"
+            aria-describedby="repair-backups-clear-detail"
+            onClick={(event) => {
+              event.stopPropagation();
+            }}
+          >
+            <h2 id="repair-backups-clear-title">
+              {t("settings.repairBackupsClearTitle")}
+            </h2>
+            <p id="repair-backups-clear-detail">
+              {t("settings.repairBackupsClearConfirm")}
+            </p>
+            <div className="modal-actions">
+              <button
+                ref={repairBackupsCancelButton}
+                className="outline-button"
+                type="button"
+                onClick={() => {
+                  setRepairBackupsConfirming(false);
+                }}
+              >
+                {t("action.cancel")}
+              </button>
+              <button
+                className="primary-button danger-button"
+                type="button"
+                onClick={clearRepairBackups}
+              >
+                {t("settings.repairBackupsClear")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

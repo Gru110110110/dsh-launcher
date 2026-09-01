@@ -19,6 +19,9 @@ function snapshot(
     serviceStartedAtMs: null,
     desktopVersion: "0.2.0",
     harnessVersion: null,
+    previousHarnessVersion: null,
+    removedIncompatiblePlugins: [],
+    repairedProjectionCache: false,
     desktopUpdate: { kind: "idle" },
     harnessUpdate: { kind: "none" },
     migration: { kind: "notRequired" },
@@ -28,6 +31,7 @@ function snapshot(
     theme: "system",
     trayAvailable: false,
     showBalanceCard: true,
+    harnessUpdateChannel: "latest",
     proxy: { mode: "system", url: "", bypass: "" },
     remote: {
       master: false,

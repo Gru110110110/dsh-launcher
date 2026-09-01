@@ -1031,6 +1031,62 @@ impl Marketplace {
         })
     }
 
+    /// Transactionally remove direct profile dependencies that the Harness
+    /// loader named as incompatible during startup. The caller already owns
+    /// the marketplace operation guard. Each publication joins the normal
+    /// pending-verification batch, so a failed retry can restore the exact
+    /// pre-recovery profiles instead of leaving a partial uninstall behind.
+    pub fn remove_incompatible_profile_packages_while_guarded(
+        &self,
+        candidates: &[String],
+    ) -> AppResult<Vec<String>> {
+        self.initialize();
+        let candidates = candidates
+            .iter()
+            .filter_map(|candidate| recoverable_incompatible_package(candidate))
+            .collect::<HashSet<_>>();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let entries = match fs::read_dir(self.profiles_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(AppError::io("readDirectoryFailed", &error)),
+        };
+        let mut targets = Vec::new();
+        for entry in entries.flatten() {
+            let profile_dir = entry.path();
+            if !profile_dir.is_dir() {
+                continue;
+            }
+            let profile = entry.file_name().to_string_lossy().into_owned();
+            if profile.starts_with('.') || !valid_profile_dir_name(&profile) {
+                continue;
+            }
+            let Ok(manifest) = read_manifest(&profile_dir.join("package.json")) else {
+                continue;
+            };
+            for package in manifest.dependencies.keys() {
+                if candidates.contains(&package.to_lowercase()) {
+                    targets.push((profile.clone(), package.clone()));
+                }
+            }
+        }
+        targets.sort_unstable();
+        targets.dedup();
+
+        let mut removed = Vec::new();
+        for (profile, package) in targets {
+            self.remove_profile_package(&profile, &package, &package, &package)?;
+            removed.push(package);
+        }
+        removed.sort_unstable();
+        removed.dedup();
+        self.invalidate_installed_cache();
+        Ok(removed)
+    }
+
     pub fn pending_verification(&self) -> AppResult<Option<PendingVerification>> {
         let bytes = match fs::read(self.pending_file()) {
             Ok(bytes) => bytes,
@@ -2652,6 +2708,14 @@ fn pnpm_mutation_flags(verb: &str) -> &'static [&'static str] {
 /// (`pkg@latest`, `@scope/pkg@^1.0.0`), and reject local paths, git specs,
 /// shell substitutions and uppercase names (npm names are lowercase; an
 /// uppercase one would 404 on the registry).
+fn recoverable_incompatible_package(spec: &str) -> Option<String> {
+    let package = normalize_package_spec(spec)?;
+    // Loader failures can name Harness's own built-in packages. Those are
+    // part of the validated runtime, not user-installed plugins, and must be
+    // handled by runtime rollback instead of profile mutation.
+    (!package.starts_with("@deepseek-ai/")).then_some(package)
+}
+
 fn normalize_package_spec(spec: &str) -> Option<String> {
     let spec = spec.trim().trim_matches(['"', '\'', '`']);
     if let Some(rest) = spec.strip_prefix('@') {
@@ -2753,6 +2817,14 @@ fn copy_profile_entry(source: &Path, dest: &Path) -> AppResult<()> {
         fs::create_dir_all(dest).map_err(|error| AppError::io("createDirectory", &error))?;
         for entry in fs::read_dir(source).map_err(|error| AppError::io("io", &error))? {
             let entry = entry.map_err(|error| AppError::io("io", &error))?;
+            // Harness may materialize nested fallback dependency views as
+            // symlinks into the profile's root node_modules. They are derived
+            // install output just like the root dependency tree: copying them
+            // would either escape the candidate or retain old-version links.
+            // The pinned pnpm/reconciliation pass rebuilds dependency output.
+            if entry.file_name() == "node_modules" {
+                continue;
+            }
             copy_profile_entry(&entry.path(), &dest.join(entry.file_name()))?;
         }
     } else if metadata.is_file() {
@@ -4492,6 +4564,22 @@ mod tests {
     }
 
     #[test]
+    fn automatic_recovery_never_removes_harness_runtime_packages() {
+        assert_eq!(
+            recoverable_incompatible_package("dsh-better-sidebar"),
+            Some("dsh-better-sidebar".into())
+        );
+        assert_eq!(
+            recoverable_incompatible_package("@vendor/sidebar"),
+            Some("@vendor/sidebar".into())
+        );
+        assert_eq!(
+            recoverable_incompatible_package("@deepseek-ai/dsh-session-projection-cache"),
+            None
+        );
+    }
+
+    #[test]
     fn skill_directory_names_split_versions() {
         assert_eq!(
             split_name_version("url-manager"),
@@ -5379,6 +5467,8 @@ mod tests {
         let candidate = temp.path().join("candidate");
         fs::create_dir_all(source.join("config")).expect("config");
         fs::create_dir_all(source.join("node_modules/alpha")).expect("modules");
+        fs::create_dir_all(source.join(".dsh-module-fallback/node_modules/alpha"))
+            .expect("nested modules");
         fs::write(source.join("package.json"), "{}").expect("manifest");
         fs::write(source.join("config/settings.json"), "settings").expect("settings");
         fs::write(source.join("node_modules/alpha/index.js"), "old").expect("module");
@@ -5389,6 +5479,31 @@ mod tests {
             "settings"
         );
         assert!(!candidate.join("node_modules").exists());
+        assert!(candidate.join(".dsh-module-fallback").is_dir());
+        assert!(!candidate.join(".dsh-module-fallback/node_modules").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_candidate_skips_nested_dependency_symlinks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let candidate = temp.path().join("candidate");
+        fs::create_dir_all(source.join("node_modules/alpha")).expect("root dependency");
+        fs::create_dir_all(source.join(".dsh-module-fallback/node_modules"))
+            .expect("fallback dependency view");
+        fs::write(source.join("package.json"), "{}").expect("manifest");
+        std::os::unix::fs::symlink(
+            source.join("node_modules/alpha"),
+            source.join(".dsh-module-fallback/node_modules/alpha"),
+        )
+        .expect("fallback symlink");
+
+        copy_profile_candidate(&source, &candidate).expect("copy candidate");
+
+        assert!(candidate.join("package.json").is_file());
+        assert!(!candidate.join("node_modules").exists());
+        assert!(!candidate.join(".dsh-module-fallback/node_modules").exists());
     }
 
     #[test]

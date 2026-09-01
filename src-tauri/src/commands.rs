@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use dsh_core::{
-    AppError, HarnessUpdateMode, Language, LauncherSnapshot, ProxySettings, ProxyTestReport,
-    ThemePreference,
+    AppError, HarnessUpdateChannel, HarnessUpdateMode, Language, LauncherSnapshot, ProxySettings,
+    ProxyTestReport, StartupRepairBackupSummary, ThemePreference,
     balance::BalanceSnapshot,
     marketplace::{
         CompatibilityInfo, InstalledPlugin, MarketCatalogState, MarketOperationResult, MarketPage,
@@ -22,6 +22,51 @@ pub fn launcher_get_snapshot(state: State<'_, Arc<AppState>>) -> LauncherSnapsho
 #[tauri::command]
 pub fn launcher_retry(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
     state.inner().start(false, None)
+}
+
+#[tauri::command]
+pub async fn launcher_rollback_harness(
+    expected_version: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.rollback_harness(expected_version))
+            .await,
+    )
+}
+
+#[tauri::command]
+pub async fn launcher_repair_and_start(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.repair_and_start()).await,
+    )
+}
+
+#[tauri::command]
+pub fn launcher_acknowledge_startup_repair(state: State<'_, Arc<AppState>>) {
+    state.acknowledge_startup_repair();
+}
+
+#[tauri::command]
+pub async fn launcher_startup_repair_backups(
+    state: State<'_, Arc<AppState>>,
+) -> Result<StartupRepairBackupSummary, AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.startup_repair_backup_summary()).await,
+    )
+}
+
+#[tauri::command]
+pub async fn launcher_clear_startup_repair_backups(
+    state: State<'_, Arc<AppState>>,
+) -> Result<StartupRepairBackupSummary, AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.clear_startup_repair_backups()).await,
+    )
 }
 
 #[tauri::command]
@@ -132,6 +177,14 @@ pub fn preferences_set_show_balance_card(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), AppError> {
     state.set_show_balance_card(show)
+}
+
+#[tauri::command]
+pub fn preferences_set_harness_update_channel(
+    channel: HarnessUpdateChannel,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.inner().set_harness_update_channel(channel)
 }
 
 /// Validates, atomically saves, and immediately activates proxy settings.

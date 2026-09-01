@@ -20,8 +20,10 @@ mod process_recovery;
 pub mod remote;
 pub mod runtime;
 pub mod service;
+pub mod startup_repair;
 pub mod terminal;
 
 pub use error::{AppError, AppResult};
 pub use model::*;
 pub use paths::ApplicationPaths;
+pub use startup_repair::StartupRepairBackupSummary;

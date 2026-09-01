@@ -1,11 +1,11 @@
 use std::{env, fs, path::PathBuf};
 
 use dsh_core::{
-    ActivityCode, ActivityState, AppError, BrowserChoice, DesktopUpdateState, HarnessUpdateMode,
-    HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep, MigrationPlan,
-    MigrationState, NetworkErrorKind, ProgressState, ProxyMode, ProxySettings, ProxyTestFailure,
-    ProxyTestReport, ProxyTestSource, RemoteLanSnapshot, RemotePublicSnapshot, RemoteScope,
-    RemoteSnapshot, RemoteTunnelState, ThemePreference,
+    ActivityCode, ActivityState, AppError, BrowserChoice, DesktopUpdateState, HarnessUpdateChannel,
+    HarnessUpdateMode, HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep,
+    MigrationPlan, MigrationState, NetworkErrorKind, ProgressState, ProxyMode, ProxySettings,
+    ProxyTestFailure, ProxyTestReport, ProxyTestSource, RemoteLanSnapshot, RemotePublicSnapshot,
+    RemoteScope, RemoteSnapshot, RemoteTunnelState, StartupRepairBackupSummary, ThemePreference,
     balance::{BalanceSnapshot, BalanceStatus},
     marketplace::{
         CompatibilityInfo, CompatibilityStatus, InstalledPlugin, MarketCatalogState,
@@ -24,6 +24,7 @@ fn main() {
     let declarations = [
         Language::decl(),
         ThemePreference::decl(),
+        HarnessUpdateChannel::decl(),
         LauncherPhase::decl(),
         LauncherStep::decl(),
         BrowserChoice::decl(),
@@ -37,6 +38,7 @@ fn main() {
         MigrationPlan::decl(),
         MigrationState::decl(),
         LauncherSnapshot::decl(),
+        StartupRepairBackupSummary::decl(),
         PluginKind::decl(),
         PluginSource::decl(),
         CompatibilityStatus::decl(),

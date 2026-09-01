@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AppResult,
-    model::{Language, ProxySettings, ThemePreference},
+    model::{HarnessUpdateChannel, Language, ProxySettings, ThemePreference},
     paths::atomic_write,
 };
 
@@ -21,6 +21,10 @@ pub struct Preferences {
     /// configurations written before this field existed keep the card visible.
     #[serde(default = "default_show_balance_card")]
     pub show_balance_card: bool,
+    /// Harness npm dist-tag followed by update checks. Existing preference
+    /// files default to the conservative `latest` channel.
+    #[serde(default)]
+    pub harness_update_channel: HarnessUpdateChannel,
     /// Proxy configuration. Defaults to `system` so configurations written
     /// before proxy support existed keep following the system.
     #[serde(default)]
@@ -42,6 +46,7 @@ impl Default for Preferences {
             theme: ThemePreference::System,
             browser_id: default_browser(),
             show_balance_card: default_show_balance_card(),
+            harness_update_channel: HarnessUpdateChannel::default(),
             proxy: ProxySettings::default(),
         }
     }
@@ -124,6 +129,31 @@ mod tests {
         let prefs = Preferences::load(&file, &temp.path().join("language"));
         assert_eq!(prefs.proxy, ProxySettings::default());
         assert_eq!(prefs.proxy.mode, crate::model::ProxyMode::System);
+    }
+
+    #[test]
+    fn legacy_preferences_default_to_latest_harness_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("preferences.json");
+        fs::write(&file, "{\"language\":\"en\",\"theme\":\"dark\"}\n").unwrap();
+        let prefs = Preferences::load(&file, &temp.path().join("language"));
+        assert_eq!(prefs.harness_update_channel, HarnessUpdateChannel::Latest);
+    }
+
+    #[test]
+    fn harness_update_channel_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("preferences.json");
+        let legacy = temp.path().join("language");
+        let prefs = Preferences {
+            harness_update_channel: HarnessUpdateChannel::Alpha,
+            ..Preferences::default()
+        };
+        prefs.save(&file).unwrap();
+        assert_eq!(
+            Preferences::load(&file, &legacy).harness_update_channel,
+            HarnessUpdateChannel::Alpha
+        );
     }
 
     #[test]

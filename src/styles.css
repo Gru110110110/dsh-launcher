@@ -613,6 +613,11 @@ button:disabled {
   min-height: 64px;
 }
 
+.settings-backup-warning {
+  color: var(--danger);
+  font-size: 12px;
+}
+
 .segmented-control {
   display: flex;
   flex: 0 0 auto;
@@ -639,6 +644,11 @@ button:disabled {
   color: var(--text);
   box-shadow: 0 1px 2px rgb(0 0 0 / 8%);
   font-weight: 650;
+}
+
+.segmented-control button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .version-text {
@@ -772,6 +782,19 @@ button:disabled {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.65;
+}
+
+.recovery-plugin-list {
+  display: grid;
+  gap: 6px;
+  margin: 14px 0 0;
+  padding: 10px 12px 10px 30px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-raised, var(--surface));
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
 }
 
 .update-mode-options {

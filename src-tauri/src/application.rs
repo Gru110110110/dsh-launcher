@@ -11,8 +11,9 @@ use std::{
 
 use dsh_core::{
     ActivityCode, ActivityState, AppError, AppResult, ApplicationPaths, DesktopUpdateState,
-    HarnessUpdateMode, HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep,
-    MigrationState, ProgressState, ProxyMode, ProxySettings, ThemePreference,
+    HarnessUpdateChannel, HarnessUpdateMode, HarnessUpdateState, Language, LauncherPhase,
+    LauncherSnapshot, LauncherStep, MigrationState, ProgressState, ProxyMode, ProxySettings,
+    ThemePreference,
     balance::{BalanceService, BalanceSnapshot},
     browser::BrowserCatalog,
     marketplace::Marketplace,
@@ -22,9 +23,14 @@ use dsh_core::{
     runtime::{
         DeploymentController, DeploymentEvent, activate_prepared_harness_update, deploy_runtime,
         discard_prepared_harness_update, installed_version, latest_harness_version,
-        prepare_harness_update, recover_prepared_harness_update,
+        prepare_harness_update, previous_harness_version, recover_prepared_harness_update,
+        rollback_harness_runtime,
     },
     service::ServerManager,
+    startup_repair::{
+        ProjectionCacheRepair, StartupRepairBackupSummary, clear_startup_repair_backups,
+        prune_startup_repair_backups, startup_repair_backup_summary,
+    },
     terminal::ensure_terminal_command,
 };
 use fs2::{FileExt, lock_contended_error};
@@ -239,6 +245,7 @@ pub(crate) struct AppState {
     desktop_update_busy: AtomicBool,
     harness_update_check_busy: AtomicBool,
     startup_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    startup_repair_backups: Mutex<()>,
     background_update_thread: Mutex<Option<thread::JoinHandle<()>>>,
     quitting: AtomicBool,
     exit_ready: AtomicBool,
@@ -257,6 +264,7 @@ impl AppState {
         snapshot.language = preferences.language;
         snapshot.theme = preferences.theme;
         snapshot.show_balance_card = preferences.show_balance_card;
+        snapshot.harness_update_channel = preferences.harness_update_channel;
         snapshot.proxy = preferences.proxy.clone();
         snapshot.browsers = browsers.choices();
         snapshot.selected_browser_id = if browsers.contains(&preferences.browser_id) {
@@ -265,6 +273,7 @@ impl AppState {
             "system".into()
         };
         snapshot.harness_version = installed_version(&paths);
+        snapshot.previous_harness_version = previous_harness_version(&paths);
         match recover_prepared_harness_update(&paths) {
             Ok(Some(version)) => {
                 snapshot.harness_update = HarnessUpdateState::Downloaded { version };
@@ -297,6 +306,7 @@ impl AppState {
             desktop_update_busy: AtomicBool::new(false),
             harness_update_check_busy: AtomicBool::new(false),
             startup_thread: Mutex::new(None),
+            startup_repair_backups: Mutex::new(()),
             background_update_thread: Mutex::new(None),
             quitting: AtomicBool::new(false),
             exit_ready: AtomicBool::new(false),
@@ -325,6 +335,42 @@ impl AppState {
 
     pub(crate) fn snapshot(&self) -> LauncherSnapshot {
         self.snapshot.lock().expect("snapshot poisoned").clone()
+    }
+
+    pub(crate) fn startup_repair_backup_summary(&self) -> AppResult<StartupRepairBackupSummary> {
+        let _guard = self
+            .startup_repair_backups
+            .lock()
+            .expect("startup repair backups poisoned");
+        startup_repair_backup_summary(&self.paths)
+    }
+
+    pub(crate) fn clear_startup_repair_backups(&self) -> AppResult<StartupRepairBackupSummary> {
+        if matches!(
+            self.snapshot().phase,
+            LauncherPhase::Preparing | LauncherPhase::Starting | LauncherPhase::Stopping
+        ) {
+            return Err(AppError::new("launcherBusy"));
+        }
+        let _guard = self
+            .startup_repair_backups
+            .lock()
+            .expect("startup repair backups poisoned");
+        clear_startup_repair_backups(&self.paths)
+    }
+
+    pub(crate) fn acknowledge_startup_repair(&self) {
+        self.mutate_if(clear_startup_repair_notice);
+    }
+
+    fn prune_startup_repair_backups_after_healthy_start(&self) {
+        let _guard = self
+            .startup_repair_backups
+            .lock()
+            .expect("startup repair backups poisoned");
+        if let Err(error) = prune_startup_repair_backups(&self.paths) {
+            log::warn!("startup repair backup retention could not be applied: {error}");
+        }
     }
 
     fn mutate(&self, update: impl FnOnce(&mut LauncherSnapshot)) {
@@ -461,6 +507,7 @@ impl AppState {
                 if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
                     log::warn!("could not clear verified marketplace rollback state: {error}");
                 }
+                self.prune_startup_repair_backups_after_healthy_start();
                 self.mutate(|snapshot| {
                     snapshot.phase = LauncherPhase::Ready;
                     snapshot.web_url = Some(url);
@@ -484,6 +531,7 @@ impl AppState {
                 }
                 match self.server.lock().expect("server poisoned").start() {
                     Ok(url) => {
+                        self.prune_startup_repair_backups_after_healthy_start();
                         let failure = AppError::new("marketVerificationFailed")
                             .value("plugins", plugins)
                             .detail(error.safe_detail.unwrap_or(error.code));
@@ -505,6 +553,254 @@ impl AppState {
             Err(error) => {
                 self.fail(error.clone());
                 Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn rollback_harness(
+        self: &Arc<Self>,
+        expected_version: String,
+    ) -> AppResult<String> {
+        if self.quitting.load(Ordering::SeqCst) {
+            return Err(AppError::new("deploymentCancelled"));
+        }
+        {
+            let mut slot = self.startup_thread.lock().expect("startup thread poisoned");
+            if slot.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                return Err(AppError::new("launcherBusy"));
+            }
+            if let Some(finished) = slot.take()
+                && finished.join().is_err()
+            {
+                return Err(AppError::new("launcherWorkerFailed"));
+            }
+        }
+        let _market_guard = self.marketplace.begin_operation()?;
+        let snapshot = self.snapshot();
+        if !matches!(
+            snapshot.phase,
+            LauncherPhase::Failed | LauncherPhase::Stopped
+        ) {
+            return Err(AppError::new("serviceNotStopped"));
+        }
+        if snapshot.previous_harness_version.as_deref() != Some(expected_version.as_str()) {
+            return Err(AppError::new("previousHarnessVersionChanged")
+                .value("expected", expected_version)
+                .value(
+                    "actual",
+                    snapshot.previous_harness_version.unwrap_or_default(),
+                ));
+        }
+        self.mutate(|snapshot| {
+            snapshot.phase = LauncherPhase::Preparing;
+            snapshot.step = LauncherStep::Prepare;
+            snapshot.activity = Some(ActivityState {
+                code: ActivityCode::CheckingRuntime,
+                values: Default::default(),
+                started_at_ms: now_ms(),
+            });
+            snapshot.progress = ProgressState::Indeterminate;
+            snapshot.error = None;
+            snapshot.removed_incompatible_plugins.clear();
+            snapshot.repaired_projection_cache = false;
+        });
+        if let Err(error) = self.server.lock().expect("server poisoned").stop() {
+            self.fail(error.clone());
+            return Err(error);
+        }
+        let version = match rollback_harness_runtime(&self.paths, &expected_version) {
+            Ok(version) => version,
+            Err(error) => {
+                self.mutate(|snapshot| {
+                    snapshot.harness_version = installed_version(&self.paths);
+                    snapshot.previous_harness_version = previous_harness_version(&self.paths);
+                });
+                self.fail(error.clone());
+                return Err(error);
+            }
+        };
+        let previous = previous_harness_version(&self.paths);
+        self.mutate(|snapshot| {
+            snapshot.phase = LauncherPhase::Starting;
+            snapshot.step = LauncherStep::Start;
+            snapshot.harness_version = Some(version.clone());
+            snapshot.previous_harness_version = previous;
+            snapshot.harness_update = HarnessUpdateState::None;
+            snapshot.activity = Some(ActivityState {
+                code: ActivityCode::StartingService,
+                values: Default::default(),
+                started_at_ms: now_ms(),
+            });
+        });
+        match self.server.lock().expect("server poisoned").start() {
+            Ok(url) => {
+                self.prune_startup_repair_backups_after_healthy_start();
+                self.mutate(|snapshot| {
+                    snapshot.phase = LauncherPhase::Ready;
+                    snapshot.web_url = Some(url);
+                    snapshot.service_started_at_ms = Some(now_ms());
+                    snapshot.activity = None;
+                    snapshot.error = None;
+                });
+                let state = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let _ = state.check_harness_update().await;
+                });
+                Ok(version)
+            }
+            Err(error) => {
+                self.fail(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// Isolate only log-derived projection cache state, transactionally remove
+    /// loader-identified third-party plugins, and retry the current runtime.
+    /// Authoritative sessions, credentials, settings, and workspace data are
+    /// never part of this repair surface.
+    pub(crate) fn repair_and_start(self: &Arc<Self>) -> AppResult<()> {
+        if self.quitting.load(Ordering::SeqCst) {
+            return Err(AppError::new("deploymentCancelled"));
+        }
+        {
+            let mut slot = self.startup_thread.lock().expect("startup thread poisoned");
+            if slot.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                return Err(AppError::new("launcherBusy"));
+            }
+            if let Some(finished) = slot.take()
+                && finished.join().is_err()
+            {
+                return Err(AppError::new("launcherWorkerFailed"));
+            }
+        }
+        let _market_guard = self.marketplace.begin_operation()?;
+        let _repair_backup_guard = self
+            .startup_repair_backups
+            .lock()
+            .expect("startup repair backups poisoned");
+        let snapshot = self.snapshot();
+        if !matches!(
+            snapshot.phase,
+            LauncherPhase::Failed | LauncherPhase::Stopped
+        ) {
+            return Err(AppError::new("serviceNotStopped"));
+        }
+        let startup_error = snapshot
+            .error
+            .clone()
+            .ok_or_else(|| AppError::new("startupRepairUnavailable"))?;
+        let plugins = incompatible_plugin_packages(&startup_error);
+        let repairable_cache = startup_error
+            .values
+            .get("repairableProjectionCache")
+            .is_some_and(|value| value == "true");
+        if plugins.is_empty() && !repairable_cache {
+            return Err(AppError::new("startupRepairUnavailable"));
+        }
+
+        self.mutate(|snapshot| {
+            snapshot.phase = LauncherPhase::Starting;
+            snapshot.step = LauncherStep::Start;
+            snapshot.web_url = None;
+            snapshot.service_started_at_ms = None;
+            snapshot.activity = Some(ActivityState {
+                code: ActivityCode::RepairingStartup,
+                values: Default::default(),
+                started_at_ms: now_ms(),
+            });
+            snapshot.progress = ProgressState::Indeterminate;
+            snapshot.error = None;
+            snapshot.removed_incompatible_plugins.clear();
+            snapshot.repaired_projection_cache = false;
+        });
+        if let Err(error) = self.server.lock().expect("server poisoned").stop() {
+            self.fail(error.clone());
+            return Err(error);
+        }
+
+        let cache_repair = match ProjectionCacheRepair::prepare(&self.paths) {
+            Ok(repair) => repair,
+            Err(error) => {
+                self.fail(error.clone());
+                return Err(error);
+            }
+        };
+        let cache_changed = cache_repair.changed();
+        let removed = if plugins.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .marketplace
+                .remove_incompatible_profile_packages_while_guarded(&plugins)
+            {
+                Ok(removed) => removed,
+                Err(error) => {
+                    let plugin_rollback = if self.marketplace.has_pending_rollback() {
+                        self.marketplace.rollback_pending_while_guarded()
+                    } else {
+                        Ok(())
+                    };
+                    let cache_rollback = cache_repair.restore();
+                    let failure = plugin_rollback
+                        .err()
+                        .or_else(|| cache_rollback.err())
+                        .unwrap_or(error);
+                    self.fail(failure.clone());
+                    return Err(failure);
+                }
+            }
+        };
+
+        self.mutate(|snapshot| {
+            snapshot.activity = Some(ActivityState {
+                code: ActivityCode::StartingService,
+                values: Default::default(),
+                started_at_ms: now_ms(),
+            });
+        });
+        match self.server.lock().expect("server poisoned").start() {
+            Ok(url) => {
+                if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
+                    log::warn!("verified startup repair left marketplace cleanup work: {error}");
+                }
+                if let Err(error) = cache_repair.verify() {
+                    // Publication already succeeded and the original cache is
+                    // still retained. A marker-write failure is cleanup work,
+                    // not grounds to take the healthy service back down.
+                    log::warn!("verified startup repair backup marker was not updated: {error}");
+                }
+                if let Err(error) = prune_startup_repair_backups(&self.paths) {
+                    log::warn!("startup repair backup retention could not be applied: {error}");
+                }
+                self.mutate(|snapshot| {
+                    snapshot.phase = LauncherPhase::Ready;
+                    snapshot.web_url = Some(url);
+                    snapshot.service_started_at_ms = Some(now_ms());
+                    snapshot.activity = None;
+                    snapshot.error = None;
+                    snapshot.removed_incompatible_plugins = removed;
+                    snapshot.repaired_projection_cache = cache_changed;
+                });
+                let state = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let _ = state.check_harness_update().await;
+                });
+                Ok(())
+            }
+            Err(error) => {
+                let plugin_rollback = if self.marketplace.has_pending_rollback() {
+                    self.marketplace.rollback_pending_while_guarded()
+                } else {
+                    Ok(())
+                };
+                let cache_rollback = cache_repair.restore();
+                let failure = plugin_rollback
+                    .err()
+                    .or_else(|| cache_rollback.err())
+                    .unwrap_or(error);
+                self.fail(failure.clone());
+                Err(failure)
             }
         }
     }
@@ -599,6 +895,8 @@ impl AppState {
             snapshot.error = None;
             snapshot.web_url = None;
             snapshot.service_started_at_ms = None;
+            snapshot.removed_incompatible_plugins.clear();
+            snapshot.repaired_projection_cache = false;
             snapshot.progress = ProgressState::Indeterminate;
             if force {
                 snapshot.harness_update = HarnessUpdateState::Installing {
@@ -721,10 +1019,12 @@ impl AppState {
         let deployed = if activate_prepared {
             activate_prepared_harness_update(&self.paths, controller, notify)
         } else {
+            let update_channel = self.snapshot().harness_update_channel;
             deploy_runtime(
                 &self.paths,
                 force,
                 target_version.as_deref(),
+                update_channel,
                 controller,
                 notify,
             )
@@ -734,7 +1034,11 @@ impl AppState {
         }
         match deployed {
             Ok(version) => {
-                self.mutate(|snapshot| complete_harness_deployment(snapshot, version, force));
+                let previous = previous_harness_version(&self.paths);
+                self.mutate(|snapshot| {
+                    complete_harness_deployment(snapshot, version, force);
+                    snapshot.previous_harness_version = previous;
+                });
                 if let Err(error) = ensure_terminal_command(
                     &self.paths,
                     std::env::var_os("DSH_DESKTOP_HOME").is_none(),
@@ -789,6 +1093,7 @@ impl AppState {
                 if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
                     log::warn!("could not clear verified marketplace rollback state: {error}");
                 }
+                self.prune_startup_repair_backups_after_healthy_start();
                 self.mutate(|snapshot| {
                     snapshot.phase = LauncherPhase::Ready;
                     snapshot.web_url = Some(url);
@@ -824,6 +1129,7 @@ impl AppState {
                         controller.is_cancelled() || self.quitting.load(Ordering::SeqCst)
                     }) {
                     Ok(url) => {
+                        self.prune_startup_repair_backups_after_healthy_start();
                         let failure = AppError::new("marketVerificationFailed")
                             .value("plugins", plugins)
                             .detail(error.safe_detail.unwrap_or(error.code));
@@ -838,7 +1144,89 @@ impl AppState {
                     Err(restore_error) => self.fail_unless_quitting(restore_error),
                 }
             }
-            Err(error) => self.fail_unless_quitting(error),
+            Err(error) => match self.try_recover_incompatible_plugins(&error, controller) {
+                Some(Ok((url, removed))) => {
+                    self.mutate(|snapshot| {
+                        snapshot.phase = LauncherPhase::Ready;
+                        snapshot.web_url = Some(url);
+                        snapshot.service_started_at_ms = Some(now_ms());
+                        snapshot.activity = None;
+                        snapshot.error = None;
+                        snapshot.removed_incompatible_plugins = removed;
+                    });
+                    let state = Arc::clone(self);
+                    tauri::async_runtime::spawn(async move {
+                        let _ = state.check_harness_update().await;
+                    });
+                }
+                Some(Err(recovery_error)) => self.fail_unless_quitting(recovery_error),
+                None => self.fail_unless_quitting(error),
+            },
+        }
+    }
+
+    /// If startup output names an installed third-party profile package as
+    /// incompatible, uninstall it through the marketplace transaction and
+    /// retry exactly once. The uninstall is committed only after the retry
+    /// publishes a Web UI address; otherwise the original profile is restored.
+    fn try_recover_incompatible_plugins(
+        &self,
+        startup_error: &AppError,
+        controller: &DeploymentController,
+    ) -> Option<AppResult<(String, Vec<String>)>> {
+        if self.marketplace.has_pending_rollback() {
+            return None;
+        }
+        let candidates = incompatible_plugin_packages(startup_error);
+        if candidates.is_empty() {
+            return None;
+        }
+        let removed = match self
+            .marketplace
+            .remove_incompatible_profile_packages_while_guarded(&candidates)
+        {
+            Ok(removed) if removed.is_empty() => return None,
+            Ok(removed) => removed,
+            Err(error) => {
+                log::warn!(
+                    "incompatible plugin recovery could not prepare a safe uninstall: {error}"
+                );
+                if self.marketplace.has_pending_rollback()
+                    && let Err(rollback_error) = self.marketplace.rollback_pending_while_guarded()
+                {
+                    return Some(Err(rollback_error));
+                }
+                return Some(Err(startup_error.clone()));
+            }
+        };
+        log::warn!(
+            "Harness startup named incompatible profile packages; retrying after transactional uninstall: {}",
+            removed.join(", ")
+        );
+        let retried = self
+            .server
+            .lock()
+            .expect("server poisoned")
+            .start_cancellable(|| {
+                controller.is_cancelled() || self.quitting.load(Ordering::SeqCst)
+            });
+        match retried {
+            Ok(url) => {
+                if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
+                    log::warn!("verified incompatible plugin recovery left cleanup work: {error}");
+                }
+                self.prune_startup_repair_backups_after_healthy_start();
+                Some(Ok((url, removed)))
+            }
+            Err(error) => {
+                log::warn!(
+                    "Harness still failed after incompatible plugin removal; restoring plugins: {error}"
+                );
+                if let Err(rollback_error) = self.marketplace.rollback_pending_while_guarded() {
+                    return Some(Err(rollback_error));
+                }
+                Some(Err(retain_incompatible_plugin_context(error, &removed)))
+            }
         }
     }
 
@@ -887,16 +1275,19 @@ impl AppState {
         }
         let restarted = self.server.lock().expect("server poisoned").start();
         match restarted {
-            Ok(url) => self.mutate(|snapshot| {
-                snapshot.phase = LauncherPhase::Ready;
-                snapshot.step = LauncherStep::Start;
-                snapshot.activity = None;
-                snapshot.error = Some(update_error);
-                snapshot.web_url = Some(url);
-                snapshot.service_started_at_ms = Some(now_ms());
-                snapshot.harness_version = installed_version(&self.paths);
-                snapshot.harness_update = HarnessUpdateState::Failed { version };
-            }),
+            Ok(url) => {
+                self.prune_startup_repair_backups_after_healthy_start();
+                self.mutate(|snapshot| {
+                    snapshot.phase = LauncherPhase::Ready;
+                    snapshot.step = LauncherStep::Start;
+                    snapshot.activity = None;
+                    snapshot.error = Some(update_error);
+                    snapshot.web_url = Some(url);
+                    snapshot.service_started_at_ms = Some(now_ms());
+                    snapshot.harness_version = installed_version(&self.paths);
+                    snapshot.harness_update = HarnessUpdateState::Failed { version };
+                });
+            }
             Err(restart_error) => {
                 log::error!("the previous Harness runtime could not be restarted: {restart_error}");
                 self.fail(restart_error);
@@ -935,10 +1326,12 @@ impl AppState {
             return Err(AppError::new("harnessUpdateBusy"));
         }
 
+        let channel = snapshot.harness_update_channel;
         let controller = DeploymentController::default();
         let query_controller = controller.clone();
-        let query =
-            tauri::async_runtime::spawn_blocking(move || latest_harness_version(&query_controller));
+        let query = tauri::async_runtime::spawn_blocking(move || {
+            latest_harness_version(&query_controller, channel)
+        });
         let result = match tokio::time::timeout(HARNESS_UPDATE_CHECK_TIMEOUT, query).await {
             Ok(joined) => joined
                 .map_err(|error| AppError::new("versionQueryFailed").detail(error.to_string()))
@@ -1237,6 +1630,40 @@ impl AppState {
             *preferences = candidate;
         }
         self.mutate(|snapshot| snapshot.show_balance_card = show);
+        Ok(())
+    }
+    pub(crate) fn set_harness_update_channel(
+        self: &Arc<Self>,
+        channel: HarnessUpdateChannel,
+    ) -> AppResult<()> {
+        // Serialize channel changes with checks so a result resolved for the
+        // old dist-tag can never be published after the new choice is saved.
+        let _operation = self.begin_harness_update_check()?;
+        let snapshot = self.snapshot();
+        if snapshot.harness_update_channel == channel {
+            return Ok(());
+        }
+        if matches!(
+            snapshot.harness_update,
+            HarnessUpdateState::Downloading { .. }
+                | HarnessUpdateState::Downloaded { .. }
+                | HarnessUpdateState::Installing { .. }
+        ) {
+            return Err(AppError::new("harnessUpdateBusy"));
+        }
+        {
+            let mut preferences = self.preferences.lock().expect("preferences poisoned");
+            let mut candidate = preferences.clone();
+            candidate.harness_update_channel = channel;
+            candidate.save(&self.paths.preferences_file)?;
+            *preferences = candidate;
+        }
+        self.mutate(|snapshot| {
+            snapshot.harness_update_channel = channel;
+            // Available and failed candidates belong to the previously
+            // selected dist-tag and must be resolved again.
+            snapshot.harness_update = HarnessUpdateState::None;
+        });
         Ok(())
     }
     /// Validates, atomically persists, and immediately activates a new proxy
@@ -2116,6 +2543,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::launcher_get_snapshot,
             commands::launcher_retry,
+            commands::launcher_rollback_harness,
+            commands::launcher_repair_and_start,
+            commands::launcher_acknowledge_startup_repair,
+            commands::launcher_startup_repair_backups,
+            commands::launcher_clear_startup_repair_backups,
             commands::launcher_stop,
             commands::launcher_restart,
             commands::launcher_check_harness_update,
@@ -2131,6 +2563,7 @@ pub fn run() {
             commands::preferences_set_language,
             commands::preferences_set_theme,
             commands::preferences_set_show_balance_card,
+            commands::preferences_set_harness_update_channel,
             commands::preferences_set_proxy,
             commands::proxy_test_connection,
             commands::balance_get_snapshot,
@@ -2227,6 +2660,42 @@ fn should_rollback_marketplace_after_start_failure(
     !runtime_replaced && error.code == "serviceNoAddress"
 }
 
+fn incompatible_plugin_packages(error: &AppError) -> Vec<String> {
+    if error.code != "serviceNoAddress" {
+        return Vec::new();
+    }
+    let mut packages = error
+        .values
+        .get("incompatiblePlugins")
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    packages.sort_unstable();
+    packages.dedup();
+    packages
+}
+
+fn retain_incompatible_plugin_context(mut error: AppError, packages: &[String]) -> AppError {
+    if !packages.is_empty() {
+        error
+            .values
+            .insert("incompatiblePlugins".into(), packages.join(","));
+    }
+    error
+}
+
+fn clear_startup_repair_notice(snapshot: &mut LauncherSnapshot) -> bool {
+    if snapshot.removed_incompatible_plugins.is_empty() && !snapshot.repaired_projection_cache {
+        return false;
+    }
+    snapshot.removed_incompatible_plugins.clear();
+    snapshot.repaired_projection_cache = false;
+    true
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2248,12 +2717,13 @@ mod tests {
         ProgressEventThrottle, UpdaterProxyPlan, WEBSITE, acquire_instance_lock,
         acquire_instance_lock_with_timeout, apply_updater_system_plan,
         classify_desktop_update_check_error, classify_desktop_update_download_error,
-        complete_harness_deployment, desktop_update_check_error, desktop_update_download_error,
-        desktop_update_start_state, external_link_url, harness_update_after_check,
-        lifecycle_decision, mark_harness_update_checking, replace_harness_update_if_checking,
-        retryable_download_http_status, should_retry_desktop_update_download,
-        should_rollback_marketplace_after_start_failure, update_market_operation_state,
-        updater_error_log, updater_manual_proxy, updater_proxy_plan,
+        clear_startup_repair_notice, complete_harness_deployment, desktop_update_check_error,
+        desktop_update_download_error, desktop_update_start_state, external_link_url,
+        harness_update_after_check, incompatible_plugin_packages, lifecycle_decision,
+        mark_harness_update_checking, replace_harness_update_if_checking,
+        retain_incompatible_plugin_context, retryable_download_http_status,
+        should_retry_desktop_update_download, should_rollback_marketplace_after_start_failure,
+        update_market_operation_state, updater_error_log, updater_manual_proxy, updater_proxy_plan,
     };
     use dsh_core::{
         AppError, ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherSnapshot,
@@ -2448,6 +2918,54 @@ mod tests {
             &AppError::new("serviceNoAddress"),
             true
         ));
+    }
+
+    #[test]
+    fn incompatible_plugin_recovery_uses_only_sanitized_service_values() {
+        let error = AppError::new("serviceNoAddress")
+            .value("incompatiblePlugins", "dsh-zeta,@scope/alpha,dsh-zeta");
+        assert_eq!(
+            incompatible_plugin_packages(&error),
+            ["@scope/alpha", "dsh-zeta"]
+        );
+        assert!(incompatible_plugin_packages(&AppError::new("freePortFailed")).is_empty());
+    }
+
+    #[test]
+    fn failed_plugin_retry_retains_sanitized_candidates_for_combined_repair() {
+        let error = AppError::new("serviceNoAddress").value("repairableProjectionCache", true);
+        let packages = vec!["dsh-better-sidebar".into()];
+
+        let retained = retain_incompatible_plugin_context(error, &packages);
+
+        assert_eq!(
+            retained
+                .values
+                .get("incompatiblePlugins")
+                .map(String::as_str),
+            Some("dsh-better-sidebar")
+        );
+        assert_eq!(
+            retained
+                .values
+                .get("repairableProjectionCache")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn acknowledging_startup_repair_consumes_the_snapshot_notice() {
+        let mut snapshot = LauncherSnapshot {
+            removed_incompatible_plugins: vec!["dsh-better-sidebar".into()],
+            repaired_projection_cache: true,
+            ..LauncherSnapshot::initial("test")
+        };
+
+        assert!(clear_startup_repair_notice(&mut snapshot));
+        assert!(snapshot.removed_incompatible_plugins.is_empty());
+        assert!(!snapshot.repaired_projection_cache);
+        assert!(!clear_startup_repair_notice(&mut snapshot));
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! Authenticating reverse proxy in front of the loopback-only Harness web UI.
 //!
-//! The Harness web server binds 127.0.0.1 and has no access control of its
-//! own. This proxy is the single guarded door: one listener per scope (LAN on
-//! the wildcard address, tunnel on loopback for cloudflared), an 8-digit
-//! password login that issues an opaque session cookie, and rate limiting.
+//! The Harness web server binds 127.0.0.1. This proxy adds the remote-facing
+//! guarded door: one listener per scope (LAN on the wildcard address, tunnel
+//! on loopback for cloudflared), an 8-digit password login that issues an
+//! opaque session cookie, and rate limiting. Newer Harness versions also
+//! require their own launch-token exchange, which the proxy performs only on
+//! the private loopback hop after its password check.
 //!
 //! Implementation notes:
 //! - Plain `std` threads and blocking streams; no async runtime or web
@@ -23,6 +25,7 @@
 //!   interims and the upgrade path, not for upstream keep-alive.
 
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -36,8 +39,14 @@ use std::{
 use crate::{
     AppError, AppResult,
     model::RemoteScope,
-    remote::auth::{RateLimiter, SessionStore, password_matches},
+    remote::{
+        Upstream,
+        auth::{RateLimiter, SessionStore, password_matches},
+    },
 };
+
+#[cfg(test)]
+use crate::remote::UpstreamEndpoint;
 
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
@@ -47,6 +56,7 @@ const MAX_CONNECTIONS: usize = 128;
 
 const LOGIN_PATH: &str = "/__dsh-remote/login";
 const LOGOUT_PATH: &str = "/__dsh-remote/logout";
+const BOOTSTRAP_PATH: &str = "/__dsh-remote/bootstrap";
 
 /// Shared authentication state for one scope. Held by the owning
 /// `RemoteService` and every live server of the scope, so password rotation
@@ -55,6 +65,10 @@ pub(crate) struct AuthState {
     pub(crate) scope: RemoteScope,
     pub(crate) password: RwLock<String>,
     pub(crate) sessions: Mutex<SessionStore>,
+    /// Last Harness endpoint generation bootstrapped by each remote session.
+    /// This is intentionally in memory: neither the upstream launch token nor
+    /// its derived state is persisted by the launcher.
+    bootstrapped: Mutex<HashMap<String, u64>>,
     pub(crate) limiter: Mutex<RateLimiter>,
     /// Weak handles to the live connection registries of this scope's
     /// servers, so revoking access also drops already-established
@@ -68,6 +82,7 @@ impl AuthState {
             scope,
             password: RwLock::new(password),
             sessions: Mutex::new(SessionStore::default()),
+            bootstrapped: Mutex::new(HashMap::new()),
             limiter: Mutex::new(RateLimiter::default()),
             registries: Mutex::new(Vec::new()),
         })
@@ -87,6 +102,28 @@ impl AuthState {
             .validate(token)
     }
 
+    fn is_bootstrapped(&self, token: &str, generation: u64) -> bool {
+        self.bootstrapped
+            .lock()
+            .expect("bootstrap sessions poisoned")
+            .get(token)
+            .is_some_and(|existing| *existing == generation)
+    }
+
+    fn mark_bootstrapped(&self, token: &str, generation: u64) {
+        self.bootstrapped
+            .lock()
+            .expect("bootstrap sessions poisoned")
+            .insert(token.to_owned(), generation);
+    }
+
+    fn clear_bootstrapped(&self, token: &str) {
+        self.bootstrapped
+            .lock()
+            .expect("bootstrap sessions poisoned")
+            .remove(token);
+    }
+
     /// Registers a server's connection registry for scope-wide revocation.
     fn track_registry(&self, registry: &Arc<StreamRegistry>) {
         self.registries
@@ -100,6 +137,10 @@ impl AuthState {
     /// actually signed out — an open WebSocket must not survive it.
     pub(crate) fn revoke_all_connections(&self) {
         self.sessions.lock().expect("sessions poisoned").clear();
+        self.bootstrapped
+            .lock()
+            .expect("bootstrap sessions poisoned")
+            .clear();
         let mut registries = self.registries.lock().expect("registries poisoned");
         registries.retain(|weak| {
             if let Some(registry) = weak.upgrade() {
@@ -191,7 +232,7 @@ impl ProxyServer {
     pub(crate) fn bind(
         host: IpAddr,
         auth: Arc<AuthState>,
-        upstream: Arc<RwLock<Option<String>>>,
+        upstream: Arc<RwLock<Option<Upstream>>>,
     ) -> AppResult<Self> {
         let listener = TcpListener::bind(SocketAddr::new(host, 0))
             .map_err(|error| AppError::io("remoteListenFailed", &error))?;
@@ -251,7 +292,7 @@ impl RemoteScope {
 fn accept_loop(
     listener: TcpListener,
     auth: Arc<AuthState>,
-    upstream: Arc<RwLock<Option<String>>>,
+    upstream: Arc<RwLock<Option<Upstream>>>,
     stop: Arc<AtomicBool>,
     registry: Arc<StreamRegistry>,
 ) {
@@ -285,7 +326,7 @@ fn accept_loop(
 
 struct ConnectionContext {
     auth: Arc<AuthState>,
-    upstream: Arc<RwLock<Option<String>>>,
+    upstream: Arc<RwLock<Option<Upstream>>>,
     registry: Arc<StreamRegistry>,
 }
 
@@ -406,12 +447,37 @@ fn handle_connection_inner(
                     .lock()
                     .expect("sessions poisoned")
                     .revoke(&token);
+                context.auth.clear_bootstrapped(&token);
             }
             let cookie = expired_cookie(context.auth.cookie_name());
             redirect_with_cookie(client, LOGIN_PATH, &cookie)
         }
+        ("GET", BOOTSTRAP_PATH) => {
+            let Some(session) = authenticated_session(&head, &context.auth) else {
+                return redirect(client, LOGIN_PATH);
+            };
+            let upstream = context.upstream.read().expect("upstream poisoned").clone();
+            let Some(upstream) = upstream else {
+                return proxy(client, head, context);
+            };
+            let Some(target) = upstream.endpoint.bootstrap_target.clone() else {
+                return redirect(client, "/");
+            };
+            // The private launch token is substituted only on the loopback
+            // hop. It never appears in the remote URL, redirect, or QR code.
+            context
+                .auth
+                .mark_bootstrapped(&session, upstream.generation);
+            let result = proxy_to(client, head, context, upstream, Some(target));
+            if result.is_err() {
+                // A connection failure must remain retryable on the next
+                // navigation instead of pinning this session to a dead hop.
+                context.auth.clear_bootstrapped(&session);
+            }
+            result
+        }
         _ => {
-            if !authenticated(&head, &context.auth) {
+            let Some(session) = authenticated_session(&head, &context.auth) else {
                 if head.method == "GET" {
                     return redirect(client, LOGIN_PATH);
                 }
@@ -423,6 +489,25 @@ fn handle_connection_inner(
                     b"authentication required",
                     &[],
                 );
+            };
+            if head.method == "GET" {
+                let bootstrap_generation = context
+                    .upstream
+                    .read()
+                    .expect("upstream poisoned")
+                    .as_ref()
+                    .and_then(|upstream| {
+                        upstream
+                            .endpoint
+                            .bootstrap_target
+                            .as_ref()
+                            .map(|_| upstream.generation)
+                    });
+                if bootstrap_generation
+                    .is_some_and(|generation| !context.auth.is_bootstrapped(&session, generation))
+                {
+                    return redirect(client, BOOTSTRAP_PATH);
+                }
             }
             proxy(client, head, context)
         }
@@ -444,8 +529,12 @@ fn login_source_ip(head: &RequestHead, peer_ip: IpAddr, scope: RemoteScope) -> I
 }
 
 fn authenticated(head: &RequestHead, auth: &AuthState) -> bool {
+    authenticated_session(head, auth).is_some()
+}
+
+fn authenticated_session(head: &RequestHead, auth: &AuthState) -> Option<String> {
     head.session_token(auth.cookie_name())
-        .is_some_and(|token| auth.has_session(&token))
+        .filter(|token| auth.has_session(token))
 }
 
 fn handle_login(
@@ -545,8 +634,8 @@ fn proxy(
     head: RequestHead,
     context: &ConnectionContext,
 ) -> std::io::Result<()> {
-    let authority = context.upstream.read().expect("upstream poisoned").clone();
-    let Some(authority) = authority else {
+    let upstream = context.upstream.read().expect("upstream poisoned").clone();
+    let Some(upstream) = upstream else {
         return write_response(
             client,
             503,
@@ -556,6 +645,20 @@ fn proxy(
             &[],
         );
     };
+    proxy_to(client, head, context, upstream, None)
+}
+
+fn proxy_to(
+    client: &mut TcpStream,
+    mut head: RequestHead,
+    context: &ConnectionContext,
+    upstream_endpoint: Upstream,
+    target: Option<String>,
+) -> std::io::Result<()> {
+    if let Some(target) = target {
+        head.target = target;
+    }
+    let authority = upstream_endpoint.endpoint.authority;
     let mut upstream = TcpStream::connect_timeout(
         &authority
             .parse::<SocketAddr>()
@@ -1298,6 +1401,20 @@ mod tests {
         _upstream: FakeUpstream,
     }
 
+    fn upstream_config(
+        authority: String,
+        bootstrap_target: Option<&str>,
+        generation: u64,
+    ) -> Arc<RwLock<Option<Upstream>>> {
+        Arc::new(RwLock::new(Some(Upstream::new(
+            UpstreamEndpoint {
+                authority,
+                bootstrap_target: bootstrap_target.map(str::to_owned),
+            },
+            generation,
+        ))))
+    }
+
     fn start_proxy(password: &str, seen: &Arc<Mutex<Vec<String>>>) -> TestProxy {
         start_proxy_for(RemoteScope::Lan, password, seen)
     }
@@ -1308,7 +1425,7 @@ mod tests {
         seen: &Arc<Mutex<Vec<String>>>,
     ) -> TestProxy {
         let upstream = FakeUpstream::spawn(Arc::clone(seen));
-        let authority = Arc::new(RwLock::new(Some(upstream.authority())));
+        let authority = upstream_config(upstream.authority(), None, 1);
         let auth = AuthState::new(scope, password.to_owned());
         let server = ProxyServer::bind(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -1456,6 +1573,69 @@ mod tests {
             !forwarded.contains("accept-encoding"),
             "accept-encoding must be stripped: {forwarded}"
         );
+    }
+
+    #[test]
+    fn authenticated_remote_session_privately_bootstraps_new_harness_auth() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let upstream = FakeUpstream::spawn(Arc::clone(&seen));
+        let authority = upstream_config(
+            upstream.authority(),
+            Some("/?token=launch-secret&mode=web"),
+            7,
+        );
+        let auth = AuthState::new(RemoteScope::Lan, "12345678".to_owned());
+        let server = ProxyServer::bind(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Arc::clone(&auth),
+            authority,
+        )
+        .expect("proxy binds");
+        let proxy = TestProxy {
+            server,
+            auth,
+            _upstream: upstream,
+        };
+        let token = session_cookie_from(&login(&proxy, "12345678"));
+
+        let first = request(
+            &proxy,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: phone\r\nCookie: dsh_remote_lan={token}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(first.starts_with("HTTP/1.1 302"), "{first}");
+        assert!(
+            first.contains("location: /__dsh-remote/bootstrap"),
+            "{first}"
+        );
+        assert!(!first.contains("launch-secret"), "{first}");
+        assert!(seen.lock().expect("seen").is_empty());
+
+        let bootstrap = request(
+            &proxy,
+            &format!(
+                "GET /__dsh-remote/bootstrap HTTP/1.1\r\nHost: phone\r\nCookie: dsh_remote_lan={token}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(bootstrap.ends_with("proxied"), "{bootstrap}");
+        assert!(!bootstrap.contains("launch-secret"), "{bootstrap}");
+        let forwarded = seen.lock().expect("seen").pop().expect("bootstrap request");
+        assert!(
+            forwarded.starts_with("GET /?token=launch-secret&mode=web HTTP/1.1"),
+            "{forwarded}"
+        );
+
+        let after = request(
+            &proxy,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: phone\r\nCookie: dsh_remote_lan={token}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(after.ends_with("proxied"), "{after}");
+        let forwarded = seen.lock().expect("seen").pop().expect("ordinary request");
+        assert!(forwarded.starts_with("GET / HTTP/1.1"), "{forwarded}");
+        assert!(!forwarded.contains("launch-secret"), "{forwarded}");
     }
 
     #[test]
@@ -1660,7 +1840,7 @@ mod tests {
     }
 
     fn start_proxy_to(authority: String) -> (TestProxy, String) {
-        let upstream = Arc::new(RwLock::new(Some(authority)));
+        let upstream = upstream_config(authority, None, 1);
         let auth = AuthState::new(RemoteScope::Lan, "12345678".to_owned());
         let token = auth.sessions.lock().expect("sessions").create();
         let server =

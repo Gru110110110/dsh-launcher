@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::{BufRead, BufReader},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
@@ -140,6 +141,8 @@ impl ServerManager {
     ) -> AppResult<String> {
         let environment = self.service_environment(&plan.env)?;
         let mut default_address_in_use = false;
+        let mut incompatible_plugins = BTreeSet::new();
+        let mut repairable_projection_cache = false;
         for use_free_port in [false, true] {
             if cancelled() {
                 self.stop()?;
@@ -244,6 +247,10 @@ impl ServerManager {
                 match receiver.recv_timeout(Duration::from_millis(200)) {
                     Ok(line) => {
                         address_in_use |= line.contains("EADDRINUSE");
+                        if let Some(package) = incompatible_loader_package(&line) {
+                            incompatible_plugins.insert(package);
+                        }
+                        repairable_projection_cache |= projection_cache_schema_failure(&line);
                         if let Some(url) = parse_web_url(&line) {
                             if self.is_running() {
                                 self.web_url = Some(url.clone());
@@ -261,11 +268,24 @@ impl ServerManager {
                 default_address_in_use = address_in_use;
             }
         }
-        Err(AppError::new(if default_address_in_use {
+        let mut error = AppError::new(if default_address_in_use {
             "freePortFailed"
         } else {
             "serviceNoAddress"
-        }))
+        });
+        if !incompatible_plugins.is_empty() {
+            error = error.value(
+                "incompatiblePlugins",
+                incompatible_plugins
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        if repairable_projection_cache {
+            error = error.value("repairableProjectionCache", true);
+        }
+        Err(error)
     }
 
     pub fn stop(&mut self) -> AppResult<()> {
@@ -720,6 +740,55 @@ fn parse_web_url(line: &str) -> Option<String> {
     .then(|| candidate.to_owned())
 }
 
+/// Extract only the registry package named by a loader import/apply failure.
+/// The full service line can contain session content, paths, or other user
+/// data, so it never crosses the core/UI boundary. A strict npm-name check
+/// also excludes loader aliases such as `cordis:include`.
+fn incompatible_loader_package(line: &str) -> Option<String> {
+    const MARKERS: [&str; 2] = [
+        "failed to import loader entry ",
+        "failed to apply loader entry ",
+    ];
+    let suffix = MARKERS
+        .iter()
+        .find_map(|marker| line.find(marker).map(|index| &line[index + marker.len()..]))?;
+    let open = suffix.find('(')?;
+    let close = suffix[open + 1..].find(')')? + open + 1;
+    let package = suffix[open + 1..close].trim();
+    valid_npm_package_name(package).then(|| package.to_owned())
+}
+
+/// Recognize only the durable projection-cache boundary and reduce the result
+/// to a boolean. Raw service output can contain user paths or session content
+/// and must never be copied into the launcher snapshot.
+fn projection_cache_schema_failure(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("session_projcache")
+        && (lower.contains("invalid-record")
+            || lower.contains("invalid record")
+            || lower.contains("schema"))
+}
+
+fn valid_npm_package_name(value: &str) -> bool {
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 214
+            && part.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, '-' | '_' | '.')
+            })
+    };
+    if let Some(scoped) = value.strip_prefix('@') {
+        let Some((scope, name)) = scoped.split_once('/') else {
+            return false;
+        };
+        !name.contains('/') && valid_part(scope) && valid_part(name)
+    } else {
+        !value.contains('/') && valid_part(value)
+    }
+}
+
 fn local_addresses(url: &url::Url) -> Option<Vec<SocketAddr>> {
     let port = url.port_or_known_default()?;
     match url.host()? {
@@ -845,6 +914,52 @@ mod tests {
         assert_eq!(parse_web_url("http://127.0.0.1:3000"), None);
         assert_eq!(parse_web_url("dsh web: file:///tmp/a"), None);
         assert_eq!(parse_web_url("dsh web: http://example.com:3000"), None);
+    }
+
+    #[test]
+    fn loader_failures_expose_only_valid_package_names() {
+        assert_eq!(
+            incompatible_loader_package(
+                "Error: failed to import loader entry better-sidebar (dsh-better-sidebar): missing export"
+            )
+            .as_deref(),
+            Some("dsh-better-sidebar")
+        );
+        assert_eq!(
+            incompatible_loader_package(
+                "failed to apply loader entry cache (@deepseek-ai/dsh-session-projection-cache): invalid record"
+            )
+            .as_deref(),
+            Some("@deepseek-ai/dsh-session-projection-cache")
+        );
+        assert_eq!(
+            incompatible_loader_package(
+                "failed to apply loader entry include (cordis:include): nested failure"
+            ),
+            None
+        );
+        assert_eq!(
+            incompatible_loader_package(
+                "failed to import loader entry unsafe (../../user-data): invalid"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn projection_cache_schema_failures_are_reduced_to_a_safe_repair_flag() {
+        assert!(projection_cache_schema_failure(
+            "storage-domain session_projcache invalid-record: expected boolean"
+        ));
+        assert!(projection_cache_schema_failure(
+            "session_projcache row failed schema validation"
+        ));
+        assert!(!projection_cache_schema_failure(
+            "session content failed schema validation"
+        ));
+        assert!(!projection_cache_schema_failure(
+            "session_projcache checkpoint write delayed"
+        ));
     }
 
     #[test]
