@@ -7,7 +7,7 @@ import {
   initializeLauncherPreview,
   initializeLauncherStore,
 } from "@/platform/launcherStore";
-import { startRemoteLanMonitor } from "@/platform/remoteLanMonitor";
+import { startRemoteLanMonitorWhenReady } from "@/platform/remoteLanMonitor";
 import type { LauncherSnapshot } from "@/platform/generated/bindings";
 import packageJson from "../package.json";
 
@@ -59,9 +59,7 @@ if (import.meta.env.DEV && !isTauri) {
   };
   initializeLauncherPreview(previewSnapshot);
 } else {
-  void initializeLauncherStore().then(() => {
-    startRemoteLanMonitor();
-  });
+  startRemoteLanMonitorWhenReady(initializeLauncherStore());
 }
 
 const root = document.getElementById("root");

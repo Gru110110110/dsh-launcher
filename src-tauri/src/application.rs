@@ -867,8 +867,7 @@ impl AppState {
                 *self.deployment.lock().expect("deployment poisoned") = None;
                 let failure = AppError::new("launcherWorkerFailed").detail(error.to_string());
                 self.mutate(|snapshot| {
-                    snapshot.harness_update = previous_update;
-                    snapshot.error = Some(failure.clone());
+                    fail_start_worker_spawn(snapshot, previous_update, failure.clone());
                 });
                 return Err(failure);
             }
@@ -2252,6 +2251,17 @@ fn complete_harness_deployment(snapshot: &mut LauncherSnapshot, version: String,
     }
 }
 
+fn fail_start_worker_spawn(
+    snapshot: &mut LauncherSnapshot,
+    previous_update: HarnessUpdateState,
+    failure: AppError,
+) {
+    snapshot.phase = LauncherPhase::Failed;
+    snapshot.activity = None;
+    snapshot.harness_update = previous_update;
+    snapshot.error = Some(failure);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DesktopUpdateCheckFailure {
     Network,
@@ -2446,8 +2456,7 @@ fn show_main_window(app: &AppHandle) {
 fn install_tray(app: &tauri::App, state: &Arc<AppState>) -> tauri::Result<()> {
     let menu = tray_menu(app.handle(), state.snapshot().language)?;
     let weak_menu = Arc::downgrade(state);
-    let tray = TrayIconBuilder::with_id("main")
-        .icon(app.default_window_icon().expect("bundle icon").clone())
+    let mut builder = TrayIconBuilder::with_id("main")
         .tooltip("DSH Launcher")
         .menu(&menu)
         .on_tray_icon_event(move |tray, event| {
@@ -2466,8 +2475,17 @@ fn install_tray(app: &tauri::App, state: &Arc<AppState>) -> tauri::Result<()> {
                     _ => {}
                 }
             }
-        })
-        .build(app)?;
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    } else {
+        // A missing bundle icon must not panic the Tauri setup thread. Some
+        // development or damaged installations may not expose one; building
+        // without it lets the platform return an ordinary, recoverable tray
+        // error while the main window and Harness startup continue.
+        log::warn!("bundle icon unavailable; attempting tray creation without an icon");
+    }
+    let tray = builder.build(app)?;
     *state.tray.lock().expect("tray poisoned") = Some(tray);
     state.mutate(|snapshot| snapshot.tray_available = true);
     Ok(())
@@ -2516,9 +2534,16 @@ pub fn run() {
                 log::warn!("system tray unavailable; closing the window will exit: {error}");
             }
             app.manage(Arc::clone(&state));
-            state
-                .start(false, None)
-                .map_err(|error| error.to_string())?;
+            if let Err(error) = state.start(false, None) {
+                // The desktop shell is the recovery surface for deployment
+                // and service failures. Worker-spawn failures already record
+                // a Failed snapshot; preserve that state and adapt any other
+                // synchronous failure before continuing Tauri setup.
+                if state.snapshot().phase != LauncherPhase::Failed {
+                    state.fail(error.clone());
+                }
+                log::error!("automatic Harness startup could not begin: {error:?}");
+            }
             tauri::async_runtime::spawn(check_desktop_update_after_startup(state));
             Ok(())
         })
@@ -2724,15 +2749,15 @@ mod tests {
         classify_desktop_update_check_error, classify_desktop_update_download_error,
         clear_startup_repair_notice, complete_harness_deployment, desktop_update_check_error,
         desktop_update_download_error, desktop_update_start_state, external_link_url,
-        harness_update_after_check, incompatible_plugin_packages, lifecycle_decision,
-        mark_harness_update_checking, replace_harness_update_if_checking,
+        fail_start_worker_spawn, harness_update_after_check, incompatible_plugin_packages,
+        lifecycle_decision, mark_harness_update_checking, replace_harness_update_if_checking,
         retain_incompatible_plugin_context, retryable_download_http_status,
         should_retry_desktop_update_download, should_rollback_marketplace_after_start_failure,
         update_market_operation_state, updater_error_log, updater_manual_proxy, updater_proxy_plan,
     };
     use dsh_core::{
-        AppError, ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherSnapshot,
-        ProxyMode, ProxySettings,
+        AppError, ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherPhase,
+        LauncherSnapshot, ProxyMode, ProxySettings,
     };
     use semver::Version;
 
@@ -2859,6 +2884,25 @@ mod tests {
         assert_eq!(snapshot.market_revision, 1);
         assert!(!update_market_operation_state(&mut snapshot, false));
         assert_eq!(snapshot.market_revision, 1);
+    }
+
+    #[test]
+    fn startup_worker_spawn_failure_keeps_the_shell_recoverable() {
+        let mut snapshot = LauncherSnapshot::initial("test");
+        let downloaded = HarnessUpdateState::Downloaded {
+            version: "1.2.3".into(),
+        };
+        snapshot.harness_update = HarnessUpdateState::Installing {
+            version: "1.2.3".into(),
+        };
+        let failure = AppError::new("launcherWorkerFailed");
+
+        fail_start_worker_spawn(&mut snapshot, downloaded.clone(), failure.clone());
+
+        assert_eq!(snapshot.phase, LauncherPhase::Failed);
+        assert_eq!(snapshot.harness_update, downloaded);
+        assert_eq!(snapshot.error, Some(failure));
+        assert!(snapshot.activity.is_none());
     }
 
     #[test]

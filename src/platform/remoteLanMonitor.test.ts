@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { startRemoteLanMonitor } from "./remoteLanMonitor";
+import {
+  startRemoteLanMonitor,
+  startRemoteLanMonitorWhenReady,
+} from "./remoteLanMonitor";
 
 describe("remote LAN monitor", () => {
   afterEach(() => {
@@ -39,5 +42,22 @@ describe("remote LAN monitor", () => {
     stop();
     await vi.advanceTimersByTimeAsync(10_000);
     expect(refresh).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not leave an unhandled rejection when launcher bootstrap fails", async () => {
+    const failure = new Error("IPC unavailable");
+    const startMonitor = vi.fn();
+    const reportError = vi.fn();
+
+    startRemoteLanMonitorWhenReady(
+      Promise.reject(failure),
+      startMonitor,
+      reportError,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(startMonitor).not.toHaveBeenCalled();
+    expect(reportError).toHaveBeenCalledWith(failure);
   });
 });

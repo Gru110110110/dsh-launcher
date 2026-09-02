@@ -41,3 +41,19 @@ export function startRemoteLanMonitor(
     document.removeEventListener("visibilitychange", refreshWhenVisible);
   };
 }
+
+/** Starts LAN monitoring only after IPC bootstrap and consumes bootstrap errors. */
+export function startRemoteLanMonitorWhenReady(
+  initialization: Promise<void>,
+  startMonitor: () => void = () => {
+    startRemoteLanMonitor();
+  },
+  reportError: (error: unknown) => void = (error) => {
+    // The launcher store retains this error and the React error boundary shows
+    // the fatal UI. Consume this branch here as well so the eager bootstrap in
+    // main.tsx cannot create a global unhandled Promise rejection.
+    console.error("Launcher IPC initialization failed", error);
+  },
+): void {
+  void initialization.then(startMonitor).catch(reportError);
+}
