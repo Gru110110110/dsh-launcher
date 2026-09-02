@@ -22,6 +22,10 @@ Search, filter, inspect, install, and uninstall Cordis and Skill plugins from a 
 
 ![DSH Launcher plugin marketplace](screenshots/ScreenShot_plugin_en.png)
 
+### Keep a desktop pet beside your work
+
+The first-class Desktop Pet page lets you choose a companion, preview its five states, and control its size, speech bubble, motion, and mouse click-through behavior. The separate transparent always-on-top pet window follows top-level Harness work in real time: idle, thinking, working, waiting for you, or error. Its position and preferences persist across launches, and the tray menu can show or hide it without reopening the main window.
+
 ### Use Harness from your phone
 
 Remote access exposes the loopback-only Harness Web UI through the launcher's authenticated proxy. It supports both older bare `dsh web` URLs and newer launch-token URLs without putting Harness's private token into a remote link. Use a QR code and a rotatable 8-digit password on the same LAN (the computer may use Ethernet or Wi-Fi), or explicitly enable a temporary Cloudflare quick tunnel for public access; rotating the password immediately revokes existing sessions.
@@ -45,6 +49,7 @@ Settings keeps language, light/dark/system theme, the optional balance card, pro
 - Plugin marketplace backed by the validated [dsh-market](https://github.com/2BingLing/dsh-market) snapshot
 - Separate Harness updates and cryptographically signed desktop updates, with Default and Alpha Harness update channels and an explicit rollback action when the retained previous runtime is available
 - Remote access with QR codes, rotatable passwords, and an optional Cloudflare quick tunnel
+- A bilingual, catalog-driven desktop pet with five live Harness states and a transparent draggable window
 
 ## Architecture
 
@@ -58,6 +63,7 @@ React feature registry + HashRouter
               ├─ managed dsh web process tree
               ├─ plugin marketplace
               ├─ remote access proxies and cloudflared tunnel
+              ├─ desktop pet state bridge and event service
               └─ browser and preferences ports
                   └─ pinned Node.js → published @deepseek-ai/dsh
 ```
@@ -103,4 +109,4 @@ pnpm tauri dev
 
 ## License
 
-The launcher source is MIT-licensed. `@deepseek-ai/dsh`, Node.js, Tauri, React, and other dependencies retain their own licenses and terms.
+The launcher source is MIT-licensed except where a more specific notice applies. Desktop pet visual assets are copyright Gru and licensed for non-commercial use only under [`pets/ASSET-LICENSE.md`](pets/ASSET-LICENSE.md). `@deepseek-ai/dsh`, Node.js, Tauri, React, and other dependencies retain their own licenses and terms.

@@ -394,6 +394,7 @@ pub struct LauncherSnapshot {
     pub harness_update_channel: HarnessUpdateChannel,
     pub proxy: ProxySettings,
     pub remote: RemoteSnapshot,
+    pub pet: crate::pet::PetPreferences,
 }
 
 impl LauncherSnapshot {
@@ -427,6 +428,7 @@ impl LauncherSnapshot {
             harness_update_channel: HarnessUpdateChannel::default(),
             proxy: ProxySettings::default(),
             remote: RemoteSnapshot::default(),
+            pet: crate::pet::PetPreferences::default(),
         }
     }
 }

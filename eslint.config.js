@@ -41,7 +41,7 @@ export default tseslint.config(
     }
   },
   {
-    files: ["src/platform/launcherStore.ts"],
+    files: ["src/platform/launcherStore.ts", "src/platform/petStore.ts"],
     rules: { "@typescript-eslint/only-throw-error": "off" }
   }
 );

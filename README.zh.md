@@ -22,6 +22,10 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 
 ![DSH Launcher 插件市场](screenshots/ScreenShot_plugin_zh.png)
 
+### 让桌面宠物陪你工作
+
+「桌面宠物」是一项完整内置功能：可以选择伙伴、预览五种状态，并调整大小、气泡、动态效果和鼠标穿透。独立的透明置顶窗口会实时跟随顶层 Harness 任务，在空闲、思考、工作、等待用户和错误之间切换。宠物位置与偏好会跨启动保存，也可以直接从托盘菜单显示或隐藏。
+
 ### 在手机上使用 Harness
 
 远程访问通过启动器自带的认证代理开放仅监听回环地址的 Harness Web UI，既兼容旧版 `dsh web` 的裸地址，也兼容新版带启动令牌的地址，且不会把 Harness 私有令牌放进远程链接。同一局域网内可扫描二维码并输入可轮换的 8 位密码，电脑端使用网线或 Wi-Fi 均可；需要公网访问时，也可以明确开启临时的 Cloudflare 快速隧道。刷新密码会立即吊销已有会话。
@@ -45,6 +49,7 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 - 基于校验过的 [dsh-market](https://github.com/2BingLing/dsh-market) 快照的插件市场
 - Harness 更新与带密码学签名的桌面应用更新相互独立，可选择默认或 Alpha 更新通道；保留上一版运行时时会提供明确的回滚操作
 - 带二维码、可轮换密码和可选 Cloudflare 快速隧道的远程访问
+- 目录配置驱动、中英双语、可跟随 Harness 五态变化的桌面宠物
 
 ## 架构
 
@@ -58,6 +63,7 @@ React 功能注册表 + HashRouter
               ├─ 托管 dsh web 进程树
               ├─ 插件市场
               ├─ 远程访问代理与 cloudflared 隧道
+              ├─ 桌面宠物状态桥与事件服务
               └─ 浏览器与偏好设置端口
                   └─ 固定 Node.js → 已发布 @deepseek-ai/dsh
 ```
@@ -103,4 +109,4 @@ pnpm tauri dev
 
 ## 许可
 
-启动器源码使用 MIT 许可。`@deepseek-ai/dsh`、Node.js、Tauri、React 及其他依赖继续适用各自的许可与条款。
+除另有专门声明的部分外，启动器源码使用 MIT 许可。桌面宠物视觉素材版权归 Gru 所有，仅可依据 [`pets/ASSET-LICENSE.md`](pets/ASSET-LICENSE.md) 用于非商业用途。`@deepseek-ai/dsh`、Node.js、Tauri、React 及其他依赖继续适用各自的许可与条款。

@@ -45,6 +45,15 @@ function snapshot(
         error: null,
       },
     },
+    pet: {
+      enabled: false,
+      selectedPetId: "marmot",
+      scale: 1,
+      bubbleEnabled: true,
+      clickThrough: false,
+      reducedMotion: false,
+      position: null,
+    },
     error: null,
   };
 }

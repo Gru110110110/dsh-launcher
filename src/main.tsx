@@ -8,6 +8,7 @@ import {
   initializeLauncherStore,
 } from "@/platform/launcherStore";
 import { startRemoteLanMonitorWhenReady } from "@/platform/remoteLanMonitor";
+import { initializePetPreview, initializePetStore } from "@/platform/petStore";
 import type { LauncherSnapshot } from "@/platform/generated/bindings";
 import packageJson from "../package.json";
 
@@ -56,10 +57,32 @@ if (import.meta.env.DEV && !isTauri) {
         error: null,
       },
     },
+    pet: {
+      enabled: true,
+      selectedPetId: "marmot",
+      scale: 1,
+      bubbleEnabled: true,
+      clickThrough: false,
+      reducedMotion: false,
+      position: null,
+    },
   };
   initializeLauncherPreview(previewSnapshot);
+  initializePetPreview({
+    bridgeStatus: "connected",
+    state: "idle",
+    phase: "preview",
+    activity: null,
+    toolName: null,
+    project: null,
+    task: null,
+    progress: null,
+    sequence: 1,
+    updatedAtMs: Date.now(),
+  });
 } else {
   startRemoteLanMonitorWhenReady(initializeLauncherStore());
+  void initializePetStore();
 }
 
 const root = document.getElementById("root");

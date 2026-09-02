@@ -6,6 +6,7 @@ use crate::{
     AppResult,
     model::{HarnessUpdateChannel, Language, ProxySettings, ThemePreference},
     paths::atomic_write,
+    pet::PetPreferences,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,10 @@ pub struct Preferences {
     /// before proxy support existed keep following the system.
     #[serde(default)]
     pub proxy: ProxySettings,
+    /// First-class desktop pet preferences. Existing installations remain
+    /// opt-in and therefore do not receive a surprise always-on-top window.
+    #[serde(default)]
+    pub pet: PetPreferences,
 }
 
 fn default_browser() -> String {
@@ -48,6 +53,7 @@ impl Default for Preferences {
             show_balance_card: default_show_balance_card(),
             harness_update_channel: HarnessUpdateChannel::default(),
             proxy: ProxySettings::default(),
+            pet: PetPreferences::default(),
         }
     }
 }
@@ -138,6 +144,35 @@ mod tests {
         fs::write(&file, "{\"language\":\"en\",\"theme\":\"dark\"}\n").unwrap();
         let prefs = Preferences::load(&file, &temp.path().join("language"));
         assert_eq!(prefs.harness_update_channel, HarnessUpdateChannel::Latest);
+    }
+
+    #[test]
+    fn legacy_preferences_keep_the_desktop_pet_opt_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("preferences.json");
+        fs::write(&file, "{\"language\":\"en\",\"theme\":\"dark\"}\n").unwrap();
+        let prefs = Preferences::load(&file, &temp.path().join("language"));
+        assert_eq!(prefs.pet, PetPreferences::default());
+        assert!(!prefs.pet.enabled);
+    }
+
+    #[test]
+    fn desktop_pet_preferences_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("preferences.json");
+        let legacy = temp.path().join("language");
+        let prefs = Preferences {
+            pet: PetPreferences {
+                enabled: true,
+                scale: 1.2,
+                click_through: true,
+                position: Some(crate::pet::PetPosition { x: 80, y: 120 }),
+                ..PetPreferences::default()
+            },
+            ..Preferences::default()
+        };
+        prefs.save(&file).unwrap();
+        assert_eq!(Preferences::load(&file, &legacy).pet, prefs.pet);
     }
 
     #[test]

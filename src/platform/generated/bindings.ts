@@ -87,6 +87,47 @@ export type MigrationState =
   | { kind: "completedWithWarning"; warning: LauncherError }
   | { kind: "skipped" };
 
+export type PetState = "waiting" | "error" | "working" | "thinking" | "idle";
+
+export type PetBridgeStatus = "connected" | "stale" | "unavailable";
+
+export type PetProgress = { completed: number; total: number };
+
+export type PetSnapshot = {
+  bridgeStatus: PetBridgeStatus;
+  state: PetState;
+  phase: string;
+  activity: string | null;
+  toolName: string | null;
+  project: string | null;
+  task: string | null;
+  progress: PetProgress | null;
+  sequence: number;
+  updatedAtMs: number | null;
+};
+
+export type PetPosition = { x: number; y: number };
+
+export type PetPreferences = {
+  enabled: boolean;
+  selectedPetId: string;
+  scale: number;
+  bubbleEnabled: boolean;
+  clickThrough: boolean;
+  reducedMotion: boolean;
+  position: PetPosition | null;
+};
+
+export type PetPreferencesPatch = {
+  enabled: boolean | null;
+  selectedPetId: string | null;
+  scale: number | null;
+  bubbleEnabled: boolean | null;
+  clickThrough: boolean | null;
+  reducedMotion: boolean | null;
+  position: PetPosition | null;
+};
+
 export type LauncherSnapshot = {
   revision: number;
   marketBusy: boolean;
@@ -129,6 +170,7 @@ export type LauncherSnapshot = {
   harnessUpdateChannel: HarnessUpdateChannel;
   proxy: ProxySettings;
   remote: RemoteSnapshot;
+  pet: PetPreferences;
 };
 
 export type StartupRepairBackupSummary = {

@@ -23,10 +23,14 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::{
-    AppError, AppResult, ApplicationPaths, child_process::new_command, paths::atomic_write,
+    AppError, AppResult, ApplicationPaths,
+    child_process::new_command,
+    paths::atomic_write,
+    pet::{PET_LISTEN_ENV, PET_TOKEN_ENV, PetBridgeEndpoint},
 };
 
-const BRIDGE_SOURCE: &str = include_str!("../bridge/balance-bridge.mjs");
+const BALANCE_BRIDGE_SOURCE: &str = include_str!("../bridge/balance-bridge.mjs");
+const PET_BRIDGE_SOURCE: &str = include_str!("../bridge/pet-bridge.mjs");
 
 pub const BALANCE_LISTEN_ENV: &str = "DSH_DESKTOP_BALANCE_LISTEN";
 pub const BALANCE_TOKEN_ENV: &str = "DSH_DESKTOP_BALANCE_TOKEN";
@@ -98,7 +102,9 @@ fn generate_bridge_token() -> String {
 #[derive(Debug, Clone, Default)]
 pub struct BalanceLaunchPlan {
     pub overlay: Option<std::path::PathBuf>,
+    pub balance_only_overlay: Option<std::path::PathBuf>,
     pub endpoint: Option<BalanceBridgeEndpoint>,
+    pub pet_endpoint: Option<PetBridgeEndpoint>,
     pub env: Vec<(String, OsString)>,
     pub unavailable_reason: Option<&'static str>,
 }
@@ -115,6 +121,35 @@ impl BalanceLaunchPlan {
         self.overlay.is_some()
     }
 
+    pub fn pet_active(&self) -> bool {
+        self.pet_endpoint.is_some()
+    }
+
+    pub fn without_pet(&self) -> Self {
+        let Some(overlay) = self.balance_only_overlay.clone() else {
+            return self.without_overlay();
+        };
+        let mut env = self
+            .env
+            .iter()
+            .filter(|(key, _)| key != PET_LISTEN_ENV && key != PET_TOKEN_ENV)
+            .cloned()
+            .collect::<Vec<_>>();
+        env.retain(|(key, _)| key != BALANCE_OVERLAY_ENV);
+        env.push((
+            BALANCE_OVERLAY_ENV.to_owned(),
+            overlay.clone().into_os_string(),
+        ));
+        Self {
+            overlay: Some(overlay),
+            balance_only_overlay: None,
+            endpoint: self.endpoint.clone(),
+            pet_endpoint: None,
+            env,
+            unavailable_reason: Some("petBridgeStartFailed"),
+        }
+    }
+
     pub fn without_overlay(&self) -> Self {
         Self::disabled("balanceBridgeStartFailed")
     }
@@ -124,7 +159,8 @@ impl BalanceLaunchPlan {
 #[serde(rename_all = "camelCase")]
 struct PreflightCache {
     harness_version: String,
-    module_sha256: String,
+    balance_module_sha256: String,
+    pet_module_sha256: Option<String>,
     overlay_sha256: String,
 }
 
@@ -141,16 +177,61 @@ pub fn prepare_balance_launch(paths: &ApplicationPaths) -> BalanceLaunchPlan {
 }
 
 fn prepare_balance_launch_inner(paths: &ApplicationPaths) -> AppResult<BalanceLaunchPlan> {
-    stage_bridge_module(paths)?;
-    syntax_check_module(paths)?;
-    let overlay = stage_overlay(paths)?;
+    stage_module(&paths.balance_bridge_module, BALANCE_BRIDGE_SOURCE)?;
+    syntax_check_module(
+        paths,
+        &paths.balance_bridge_module,
+        "balanceBridgeSyntaxInvalid",
+    )?;
+    let balance_only_overlay = stage_overlay(paths, false)?;
+    let pet_supported =
+        match stage_module(&paths.pet_bridge_module, PET_BRIDGE_SOURCE).and_then(|()| {
+            syntax_check_module(paths, &paths.pet_bridge_module, "petBridgeSyntaxInvalid")
+        }) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("pet bridge staging failed; continuing with balance only: {error}");
+                false
+            }
+        };
+    let mut overlay = if pet_supported {
+        match stage_overlay(paths, true) {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                log::warn!(
+                    "pet bridge overlay could not be staged; continuing with balance only: {error}"
+                );
+                balance_only_overlay.clone()
+            }
+        }
+    } else {
+        balance_only_overlay.clone()
+    };
     if !overlay_preflight(paths, &overlay)? {
-        return Ok(BalanceLaunchPlan::disabled(
-            "balanceBridgeOverlayUnsupported",
-        ));
+        if overlay != balance_only_overlay && overlay_preflight(paths, &balance_only_overlay)? {
+            overlay = balance_only_overlay.clone();
+        } else {
+            return Ok(BalanceLaunchPlan::disabled(
+                "balanceBridgeOverlayUnsupported",
+            ));
+        }
     }
     let endpoint = BalanceBridgeEndpoint::new(allocate_loopback_port()?, generate_bridge_token());
-    let env = vec![
+    let pet_endpoint = if overlay != balance_only_overlay {
+        match PetBridgeEndpoint::allocate() {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                log::warn!(
+                    "pet bridge endpoint could not be allocated; continuing with balance only: {error}"
+                );
+                overlay = balance_only_overlay.clone();
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut env = vec![
         (BALANCE_LISTEN_ENV.to_owned(), endpoint.listen_addr().into()),
         (BALANCE_TOKEN_ENV.to_owned(), endpoint.token.clone().into()),
         (
@@ -158,56 +239,83 @@ fn prepare_balance_launch_inner(paths: &ApplicationPaths) -> AppResult<BalanceLa
             overlay.clone().into_os_string(),
         ),
     ];
+    if let Some(pet_endpoint) = &pet_endpoint {
+        env.push((PET_LISTEN_ENV.to_owned(), pet_endpoint.listen_addr().into()));
+        env.push((PET_TOKEN_ENV.to_owned(), pet_endpoint.token().into()));
+    }
     Ok(BalanceLaunchPlan {
         overlay: Some(overlay),
+        balance_only_overlay: (pet_endpoint.is_some()).then_some(balance_only_overlay),
         endpoint: Some(endpoint),
+        pet_endpoint,
         env,
         unavailable_reason: None,
     })
 }
 
-fn stage_bridge_module(paths: &ApplicationPaths) -> AppResult<()> {
-    let current = fs::read(&paths.balance_bridge_module).unwrap_or_default();
-    if current != BRIDGE_SOURCE.as_bytes() {
-        atomic_write(&paths.balance_bridge_module, BRIDGE_SOURCE.as_bytes())?;
+fn stage_module(path: &Path, source: &str) -> AppResult<()> {
+    let current = fs::read(path).unwrap_or_default();
+    if current != source.as_bytes() {
+        atomic_write(path, source.as_bytes())?;
     }
     Ok(())
 }
 
-fn syntax_check_module(paths: &ApplicationPaths) -> AppResult<()> {
+fn syntax_check_module(
+    paths: &ApplicationPaths,
+    module: &Path,
+    code: &'static str,
+) -> AppResult<()> {
     let mut command = new_command(&paths.node_bin);
-    command.arg("--check").arg(&paths.balance_bridge_module);
+    command.arg("--check").arg(module);
     run_quiet(&mut command, SYNTAX_CHECK_TIMEOUT)
-        .map_err(|error| AppError::new("balanceBridgeSyntaxInvalid").detail(error.to_string()))
+        .map_err(|error| AppError::new(code).detail(error.to_string()))
 }
 
-fn stage_overlay(paths: &ApplicationPaths) -> AppResult<std::path::PathBuf> {
-    let module_url = url::Url::from_file_path(&paths.balance_bridge_module)
+fn stage_overlay(paths: &ApplicationPaths, include_pet: bool) -> AppResult<std::path::PathBuf> {
+    let balance_url = url::Url::from_file_path(&paths.balance_bridge_module)
         .map_err(|_| AppError::new("invalidPath"))?;
-    let overlay = format!(
-        "# DSH Launcher balance bridge overlay. Generated on service start; do not edit.\n\
+    let mut overlay = format!(
+        "# DSH Launcher bridge overlay. Generated on service start; do not edit.\n\
          # Injected through `dsh web --patch`; it never changes the user's Harness profile.\n\
          - insert:\n\
          \x20   - id: dsh-desktop-balance-bridge\n\
-         \x20     name: \"{module_url}\"\n"
+         \x20     name: \"{balance_url}\"\n"
     );
-    let current = fs::read(&paths.balance_bridge_overlay).unwrap_or_default();
-    if current != overlay.as_bytes() {
-        atomic_write(&paths.balance_bridge_overlay, overlay.as_bytes())?;
+    if include_pet {
+        let pet_url = url::Url::from_file_path(&paths.pet_bridge_module)
+            .map_err(|_| AppError::new("invalidPath"))?;
+        overlay.push_str(&format!(
+            "\x20   - id: dsh-desktop-pet-bridge\n\x20     name: \"{pet_url}\"\n"
+        ));
     }
-    Ok(paths.balance_bridge_overlay.clone())
+    let path = if include_pet {
+        &paths.balance_bridge_overlay
+    } else {
+        &paths.balance_only_overlay
+    };
+    let current = fs::read(path).unwrap_or_default();
+    if current != overlay.as_bytes() {
+        atomic_write(path, overlay.as_bytes())?;
+    }
+    Ok(path.clone())
 }
 
 fn overlay_preflight(paths: &ApplicationPaths, overlay: &Path) -> AppResult<bool> {
     let cache_key = PreflightCache {
         harness_version: crate::runtime::installed_version(paths).unwrap_or_default(),
-        module_sha256: hex::encode(Sha256::digest(BRIDGE_SOURCE.as_bytes())),
+        balance_module_sha256: hex::encode(Sha256::digest(BALANCE_BRIDGE_SOURCE.as_bytes())),
+        pet_module_sha256: fs::read_to_string(overlay)
+            .ok()
+            .filter(|value| value.contains("dsh-desktop-pet-bridge"))
+            .map(|_| hex::encode(Sha256::digest(PET_BRIDGE_SOURCE.as_bytes()))),
         overlay_sha256: hex::encode(Sha256::digest(fs::read(overlay)?)),
     };
     if let Ok(bytes) = fs::read(&paths.balance_bridge_preflight)
         && serde_json::from_slice::<PreflightCache>(&bytes).is_ok_and(|cached| {
             cached.harness_version == cache_key.harness_version
-                && cached.module_sha256 == cache_key.module_sha256
+                && cached.balance_module_sha256 == cache_key.balance_module_sha256
+                && cached.pet_module_sha256 == cache_key.pet_module_sha256
                 && cached.overlay_sha256 == cache_key.overlay_sha256
         })
     {

@@ -19,6 +19,7 @@ use dsh_core::{
     marketplace::Marketplace,
     migration::MigrationService,
     network,
+    pet::{PetListener, PetPreferencesPatch, PetSnapshot},
     preferences::Preferences,
     runtime::{
         DeploymentController, DeploymentEvent, activate_prepared_harness_update, deploy_runtime,
@@ -236,6 +237,7 @@ pub(crate) struct AppState {
     proxy_update: Mutex<()>,
     browsers: BrowserCatalog,
     server: Mutex<ServerManager>,
+    pet_snapshot: Arc<Mutex<PetSnapshot>>,
     balance: BalanceService,
     deployment: Mutex<Option<DeploymentController>>,
     background_update: Mutex<Option<DeploymentController>>,
@@ -266,6 +268,7 @@ impl AppState {
         snapshot.show_balance_card = preferences.show_balance_card;
         snapshot.harness_update_channel = preferences.harness_update_channel;
         snapshot.proxy = preferences.proxy.clone();
+        snapshot.pet = preferences.pet.clone();
         snapshot.browsers = browsers.choices();
         snapshot.selected_browser_id = if browsers.contains(&preferences.browser_id) {
             preferences.browser_id.clone()
@@ -288,10 +291,23 @@ impl AppState {
         marketplace.initialize();
         let remote = dsh_core::remote::RemoteService::new(paths.clone())?;
         snapshot.remote = remote.snapshot();
+        let pet_snapshot = Arc::new(Mutex::new(PetSnapshot::default()));
+        let pet_snapshot_for_listener = Arc::clone(&pet_snapshot);
+        let pet_app = app.clone();
+        let pet_listener: PetListener = Arc::new(move |value| {
+            *pet_snapshot_for_listener
+                .lock()
+                .expect("pet snapshot poisoned") = value.clone();
+            let _ = pet_app.emit("pet://state", value);
+        });
         let state = Arc::new(Self {
             app,
             _instance_lock: instance_lock,
-            server: Mutex::new(ServerManager::new(paths.clone())),
+            server: Mutex::new(ServerManager::with_pet_listener(
+                paths.clone(),
+                pet_listener,
+            )),
+            pet_snapshot,
             balance: BalanceService::new(),
             paths,
             snapshot: Mutex::new(snapshot),
@@ -335,6 +351,13 @@ impl AppState {
 
     pub(crate) fn snapshot(&self) -> LauncherSnapshot {
         self.snapshot.lock().expect("snapshot poisoned").clone()
+    }
+
+    pub(crate) fn pet_snapshot(&self) -> PetSnapshot {
+        self.pet_snapshot
+            .lock()
+            .expect("pet snapshot poisoned")
+            .clone()
     }
 
     pub(crate) fn startup_repair_backup_summary(&self) -> AppResult<StartupRepairBackupSummary> {
@@ -1631,6 +1654,23 @@ impl AppState {
         self.mutate(|snapshot| snapshot.show_balance_card = show);
         Ok(())
     }
+
+    pub(crate) fn patch_pet_preferences(&self, patch: PetPreferencesPatch) -> AppResult<()> {
+        let pet = {
+            let mut preferences = self.preferences.lock().expect("preferences poisoned");
+            let mut candidate = preferences.clone();
+            candidate.pet.apply_patch(patch)?;
+            candidate.save(&self.paths.preferences_file)?;
+            let pet = candidate.pet.clone();
+            *preferences = candidate;
+            pet
+        };
+        self.mutate(|snapshot| snapshot.pet = pet);
+        if let Err(error) = self.refresh_tray_menu(self.snapshot().language) {
+            log::warn!("tray pet refresh failed: {error}");
+        }
+        Ok(())
+    }
     pub(crate) fn set_harness_update_channel(
         self: &Arc<Self>,
         channel: HarnessUpdateChannel,
@@ -2210,7 +2250,7 @@ impl AppState {
     }
 
     fn refresh_tray_menu(&self, language: Language) -> tauri::Result<()> {
-        let menu = tray_menu(&self.app, language)?;
+        let menu = tray_menu(&self.app, language, self.snapshot().pet.enabled)?;
         if let Some(tray) = self.tray.lock().expect("tray poisoned").as_ref() {
             tray.set_menu(Some(menu))?;
         }
@@ -2430,15 +2470,42 @@ impl Drop for DesktopUpdateOperation {
     }
 }
 
-fn tray_menu(app: &AppHandle, language: Language) -> tauri::Result<Menu<tauri::Wry>> {
-    let (show, open_web, quit) = match language {
-        Language::Zh => ("打开启动主页面", "打开 DeepSeek Harness 工作台", "退出"),
-        Language::En => ("Open launcher", "Open DeepSeek Harness Workspace", "Quit"),
+fn tray_menu(
+    app: &AppHandle,
+    language: Language,
+    pet_enabled: bool,
+) -> tauri::Result<Menu<tauri::Wry>> {
+    let (show, open_web, pet, quit) = match (language, pet_enabled) {
+        (Language::Zh, true) => (
+            "打开启动主页面",
+            "打开 DeepSeek Harness 工作台",
+            "隐藏桌面宠物",
+            "退出",
+        ),
+        (Language::Zh, false) => (
+            "打开启动主页面",
+            "打开 DeepSeek Harness 工作台",
+            "显示桌面宠物",
+            "退出",
+        ),
+        (Language::En, true) => (
+            "Open launcher",
+            "Open DeepSeek Harness Workspace",
+            "Hide desktop pet",
+            "Quit",
+        ),
+        (Language::En, false) => (
+            "Open launcher",
+            "Open DeepSeek Harness Workspace",
+            "Show desktop pet",
+            "Quit",
+        ),
     };
     let show = MenuItem::with_id(app, "open", show, true, None::<&str>)?;
     let open_web = MenuItem::with_id(app, "web", open_web, true, None::<&str>)?;
+    let pet = MenuItem::with_id(app, "pet", pet, true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", quit, true, None::<&str>)?;
-    Menu::with_items(app, &[&show, &open_web, &quit])
+    Menu::with_items(app, &[&show, &open_web, &pet, &quit])
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -2454,7 +2521,8 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn install_tray(app: &tauri::App, state: &Arc<AppState>) -> tauri::Result<()> {
-    let menu = tray_menu(app.handle(), state.snapshot().language)?;
+    let current = state.snapshot();
+    let menu = tray_menu(app.handle(), current.language, current.pet.enabled)?;
     let weak_menu = Arc::downgrade(state);
     let mut builder = TrayIconBuilder::with_id("main")
         .tooltip("DSH Launcher")
@@ -2470,6 +2538,15 @@ fn install_tray(app: &tauri::App, state: &Arc<AppState>) -> tauri::Result<()> {
                     "open" => show_main_window(app),
                     "web" => {
                         let _ = state.open_web_ui();
+                    }
+                    "pet" => {
+                        let enabled = !state.snapshot().pet.enabled;
+                        if let Err(error) = state.patch_pet_preferences(PetPreferencesPatch {
+                            enabled: Some(enabled),
+                            ..PetPreferencesPatch::default()
+                        }) {
+                            log::warn!("desktop pet toggle failed: {error}");
+                        }
                     }
                     "quit" => state.quit(),
                     _ => {}
@@ -2551,6 +2628,13 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event
                 && let Some(state) = window.app_handle().try_state::<Arc<AppState>>()
             {
+                if window.label() == "pet" && !state.exit_ready.load(Ordering::SeqCst) {
+                    api.prevent_close();
+                    if let Err(error) = window.hide() {
+                        log::warn!("pet window could not be hidden: {error}");
+                    }
+                    return;
+                }
                 match lifecycle_decision(
                     state.exit_ready.load(Ordering::SeqCst),
                     state.snapshot().tray_available,
@@ -2592,6 +2676,8 @@ pub fn run() {
             commands::preferences_set_language,
             commands::preferences_set_theme,
             commands::preferences_set_show_balance_card,
+            commands::preferences_patch_pet,
+            commands::pet_get_snapshot,
             commands::preferences_set_harness_update_channel,
             commands::preferences_set_proxy,
             commands::proxy_test_connection,

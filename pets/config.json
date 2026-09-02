@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "count": 1,
+  "pets": [
+    {
+      "id": "marmot",
+      "nickname": { "zh": "麻薯", "en": "Mochi" },
+      "name": { "zh": "土拨鼠", "en": "Marmot" },
+      "folder": "marmot",
+      "tags": [
+        { "zh": "憨厚", "en": "Gentle" },
+        { "zh": "贪吃", "en": "Snack lover" },
+        { "zh": "爱好：胡萝卜", "en": "Loves carrots" }
+      ],
+      "description": {
+        "zh": "圆滚滚的土拨鼠，抱着零食不撒手。Agent 工作时它就蹲在旁边啃胡萝卜，是最忠实的监工。",
+        "en": "A round little marmot who never lets go of a snack. It keeps watch beside the Agent with a carrot while work is underway."
+      },
+      "animations": {
+        "waiting": "waiting.json",
+        "error": "error.json",
+        "working": "working.json",
+        "thinking": "thinking.json",
+        "idle": "idle.json"
+      },
+      "bubbles": {
+        "waiting": {
+          "zh": "好舒服呀……发会儿呆",
+          "en": "So comfy… time to daydream."
+        },
+        "error": {
+          "zh": "哎呀，好像出问题了！",
+          "en": "Oh no, something went wrong!"
+        },
+        "working": {
+          "zh": "努力工作中，马上就好！",
+          "en": "Working hard—almost there!"
+        },
+        "thinking": { "zh": "唔……让我想想", "en": "Hmm… let me think." },
+        "idle": {
+          "zh": "等你回来哦……",
+          "en": "I'll be here when you get back…"
+        }
+      }
+    }
+  ]
+}

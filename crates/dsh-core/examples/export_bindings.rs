@@ -13,6 +13,10 @@ use dsh_core::{
         PendingMarketChange, PendingVerification, PluginCompatibility, PluginKind, PluginSource,
         PluginSummary, SourceBindingStatus,
     },
+    pet::{
+        PetBridgeStatus, PetPosition, PetPreferences, PetPreferencesPatch, PetProgress,
+        PetSnapshot, PetState,
+    },
 };
 use ts_rs::TS;
 
@@ -37,6 +41,13 @@ fn main() {
         HarnessUpdateMode::decl(),
         MigrationPlan::decl(),
         MigrationState::decl(),
+        PetState::decl(),
+        PetBridgeStatus::decl(),
+        PetProgress::decl(),
+        PetSnapshot::decl(),
+        PetPosition::decl(),
+        PetPreferences::decl(),
+        PetPreferencesPatch::decl(),
         LauncherSnapshot::decl(),
         StartupRepairBackupSummary::decl(),
         PluginKind::decl(),

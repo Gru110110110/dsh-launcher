@@ -8,6 +8,7 @@ use dsh_core::{
         CompatibilityInfo, InstalledPlugin, MarketCatalogState, MarketOperationResult, MarketPage,
         MarketQuery, PendingVerification, PluginSummary,
     },
+    pet::{PetPreferencesPatch, PetSnapshot},
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -177,6 +178,19 @@ pub fn preferences_set_show_balance_card(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), AppError> {
     state.set_show_balance_card(show)
+}
+
+#[tauri::command]
+pub fn preferences_patch_pet(
+    patch: PetPreferencesPatch,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.patch_pet_preferences(patch)
+}
+
+#[tauri::command]
+pub fn pet_get_snapshot(state: State<'_, Arc<AppState>>) -> PetSnapshot {
+    state.pet_snapshot()
 }
 
 #[tauri::command]

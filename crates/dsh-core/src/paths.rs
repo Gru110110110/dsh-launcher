@@ -38,7 +38,9 @@ pub struct ApplicationPaths {
     /// Balance bridge staging, inside desktop-owned data and never DSH_HOME.
     pub balance_bridge_dir: PathBuf,
     pub balance_bridge_module: PathBuf,
+    pub pet_bridge_module: PathBuf,
     pub balance_bridge_overlay: PathBuf,
+    pub balance_only_overlay: PathBuf,
     pub balance_bridge_preflight: PathBuf,
     /// Remote-access state, secrets, and the managed cloudflared binary.
     /// Desktop-owned data; never inside DSH_HOME.
@@ -100,10 +102,18 @@ impl ApplicationPaths {
                 .join("balance")
                 .join("bridge")
                 .join("balance-bridge.mjs"),
+            pet_bridge_module: app_home
+                .join("balance")
+                .join("bridge")
+                .join("pet-bridge.mjs"),
             balance_bridge_overlay: app_home
                 .join("balance")
                 .join("bridge")
-                .join("balance-overlay.yml"),
+                .join("desktop-bridges-overlay.yml"),
+            balance_only_overlay: app_home
+                .join("balance")
+                .join("bridge")
+                .join("balance-only-overlay.yml"),
             balance_bridge_preflight: app_home
                 .join("balance")
                 .join("bridge")
@@ -192,6 +202,11 @@ mod tests {
             paths
                 .balance_bridge_module
                 .ends_with("balance/bridge/balance-bridge.mjs")
+        );
+        assert!(
+            paths
+                .pet_bridge_module
+                .ends_with("balance/bridge/pet-bridge.mjs")
         );
         assert!(!paths.balance_bridge_dir.starts_with(&paths.dsh_home));
         assert!(!paths.remote_dir.starts_with(&paths.dsh_home));

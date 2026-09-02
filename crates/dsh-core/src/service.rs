@@ -33,6 +33,7 @@ use crate::{
     child_process::{configure_process_group, new_command},
     log_file::{BoundedLog, SERVER_LOG_MAX_BYTES},
     paths::atomic_write,
+    pet::{PetListener, PetService, PetSnapshot},
     process_recovery::recover_owned_services,
     runtime::terminate_tree,
 };
@@ -52,6 +53,7 @@ pub struct ServerManager {
     web_url: Option<String>,
     guard_stdin: Option<ChildStdin>,
     balance_endpoint: Option<BalanceBridgeEndpoint>,
+    pet: PetService,
     #[cfg(unix)]
     shutdown_pid: Option<u32>,
     #[cfg(windows)]
@@ -67,6 +69,7 @@ impl ServerManager {
             web_url: None,
             guard_stdin: None,
             balance_endpoint: None,
+            pet: PetService::default(),
             #[cfg(unix)]
             shutdown_pid: None,
             #[cfg(windows)]
@@ -74,10 +77,20 @@ impl ServerManager {
         }
     }
 
+    pub fn with_pet_listener(paths: ApplicationPaths, listener: PetListener) -> Self {
+        let mut manager = Self::new(paths);
+        manager.pet = PetService::new(listener);
+        manager
+    }
+
     /// The loopback balance bridge endpoint of the running service, if
     /// the bridge overlay was staged and injected for this launch.
     pub fn balance_endpoint(&self) -> Option<BalanceBridgeEndpoint> {
         self.balance_endpoint.clone()
+    }
+
+    pub fn pet_snapshot(&self) -> PetSnapshot {
+        self.pet.snapshot()
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -111,8 +124,39 @@ impl ServerManager {
         }
         match self.start_attempt(&plan, &cancelled) {
             Ok(url) => {
-                self.balance_endpoint = plan.endpoint.clone();
+                self.activate_bridges(&plan);
                 Ok(url)
+            }
+            Err(error) if should_retry_without_pet(&plan, &error) => {
+                log::warn!(
+                    "Harness did not start with the pet bridge; retrying with balance only: {error}"
+                );
+                let balance_only = plan.without_pet();
+                match self.start_attempt(&balance_only, &cancelled) {
+                    Ok(url) => {
+                        self.activate_bridges(&balance_only);
+                        Ok(url)
+                    }
+                    Err(balance_error)
+                        if should_retry_without_overlay(&balance_only, &balance_error) =>
+                    {
+                        log::warn!(
+                            "Harness did not start with the balance bridge overlay; retrying without it: {balance_error}"
+                        );
+                        let bare = balance_only.without_overlay();
+                        match self.start_attempt(&bare, &cancelled) {
+                            Ok(url) => {
+                                self.activate_bridges(&bare);
+                                Ok(url)
+                            }
+                            Err(retry_error) => {
+                                log::error!("bridge-free Harness start also failed: {retry_error}");
+                                Err(retry_error)
+                            }
+                        }
+                    }
+                    Err(balance_error) => Err(balance_error),
+                }
             }
             Err(error) if should_retry_without_overlay(&plan, &error) => {
                 log::warn!(
@@ -121,7 +165,7 @@ impl ServerManager {
                 let bare = plan.without_overlay();
                 match self.start_attempt(&bare, &cancelled) {
                     Ok(url) => {
-                        self.balance_endpoint = None;
+                        self.activate_bridges(&bare);
                         Ok(url)
                     }
                     Err(retry_error) => {
@@ -132,6 +176,11 @@ impl ServerManager {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn activate_bridges(&mut self, plan: &BalanceLaunchPlan) {
+        self.balance_endpoint = plan.endpoint.clone();
+        self.pet.start(plan.pet_endpoint.clone());
     }
 
     fn start_attempt(
@@ -289,6 +338,7 @@ impl ServerManager {
     }
 
     pub fn stop(&mut self) -> AppResult<()> {
+        self.pet.stop();
         let web_url = self.web_url.clone();
         #[cfg(unix)]
         if let Some(mut child) = self.child.take() {
@@ -666,6 +716,10 @@ fn signal_guard_group(group: u32, signal: libc::c_int) -> std::io::Result<()> {
 /// with it.
 fn should_retry_without_overlay(plan: &BalanceLaunchPlan, error: &AppError) -> bool {
     plan.overlay_active() && error.code != "deploymentCancelled"
+}
+
+fn should_retry_without_pet(plan: &BalanceLaunchPlan, error: &AppError) -> bool {
+    plan.pet_active() && error.code != "deploymentCancelled"
 }
 
 /// The `dsh web` argument vector. The launcher-level `--patch` option belongs

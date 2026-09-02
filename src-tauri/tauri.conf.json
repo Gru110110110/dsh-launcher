@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -21,6 +22,26 @@
         "center": true,
         "resizable": true,
         "fullscreen": false
+      },
+      {
+        "label": "pet",
+        "title": "DSH Desktop Pet",
+        "url": "index.html#/pet-window",
+        "width": 300,
+        "height": 340,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "fullscreen": false,
+        "focus": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "shadow": false,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {

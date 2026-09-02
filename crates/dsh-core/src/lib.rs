@@ -15,6 +15,7 @@ pub mod migration;
 pub mod model;
 pub mod network;
 pub mod paths;
+pub mod pet;
 pub mod preferences;
 mod process_recovery;
 pub mod remote;

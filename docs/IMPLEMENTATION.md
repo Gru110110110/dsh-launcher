@@ -40,6 +40,19 @@ Settings → Proxy controls how the launcher itself reaches the network — Harn
 
 Saved settings apply immediately to launcher requests, Retry, and newly spawned subprocesses. Because an existing process environment cannot be changed in place, the settings page offers an explicit Harness restart when the service is already running; it never interrupts that session silently. The **Test connection** action checks the values currently in the form — saved or not — against both Harness registries and reports each source with a classified, sanitized network error (timeout, proxy authentication required — including CONNECT tunnel 407s — TLS/certificate, connection/DNS, or HTTP status). Proxy usernames and passwords in URLs are rejected and never stored, inactive manual fields are erased in System/Direct mode, and diagnostics never echo URL userinfo; PAC/WPAD auto-configuration and NTLM/Kerberos integrated proxy authentication are not supported in this version.
 
+## Desktop pet
+
+The desktop pet is a first-class Launcher feature rather than an installable Harness plugin. Its delivery is split into six completed layers:
+
+- **M0 — state contract:** one reducer maps top-level Harness session events onto exactly five public states (`waiting`, `error`, `working`, `thinking`, `idle`). User questions and approvals become waiting, tool execution becomes working, model output becomes thinking, failures become error, and completed/aborted turns become idle. Across concurrent sessions the priority is waiting → error → working → thinking → idle; subagents never replace the top-level display.
+- **M1 — Harness bridge:** the self-contained `pet-bridge.mjs` module is staged next to the existing balance bridge and injected with the generated `dsh web --patch` overlay. It publishes only bounded, sanitized activity metadata through a random-token-protected loopback SSE endpoint. The token remains in the child environment and is never placed in a URL or frontend payload.
+- **M2 — desktop service:** `dsh-core::pet` strictly parses versioned snapshots, rejects unknown fields and invalid lengths/progress, reconnects with bounded backoff, and exposes connected/stale/unavailable bridge health through typed Tauri commands and `pet://state`. A combined-overlay startup failure retries once with the balance-only overlay before falling back to unpatched Harness, so the optional pet can never prevent the workspace from starting.
+- **M3 — pet window:** Tauri creates a separate transparent, undecorated, always-on-top window. The React renderer lazy-loads Lottie, switches animation data for the five states, supports reduced motion and localized bubbles, lets the user drag the whole window, saves physical screen coordinates, clamps restored coordinates to the available monitor bounds, and hides whenever Harness is not ready. Click-through applies to the whole window and is always reversible from the main Desktop Pet page.
+- **M4 — product controls:** the feature registry owns the sidebar page and route. The page selects a catalog pet, previews every state without changing live state, toggles visibility, bubble, scale, reduced motion, and click-through, and reports bridge health. Preferences are atomically persisted in `preferences.json`; pre-feature files deserialize with the pet disabled. The tray menu mirrors the show/hide control.
+- **M5 — catalog and verification:** built-in assets live under repository-root `pets/`. `pets/config.json` declares `count` and bilingual nickname, species name, tags, description, optional per-state bubble copy, resource folder, and all five animation files. Missing bubble copy falls back to the bilingual Launcher dictionary. Catalog, reducer, stream-reset, strict payload, preference, IPC-generation, lint, build, and Rust tests cover the implementation.
+
+The initial catalog contains Gru's supplied marmot. Runtime packaging includes only its five Lottie JSON files and referenced PNG layers. Generator/QA artifacts are excluded. These visual assets are excluded from the repository MIT License and may be used and redistributed only for non-commercial purposes under `pets/ASSET-LICENSE.md`; commercial use requires Gru's prior written permission.
+
 ## Architecture
 
 ```text
@@ -52,6 +65,7 @@ React feature registry + HashRouter
               ├─ managed dsh web process tree
               ├─ plugin marketplace (catalog cache, query, install/uninstall, installed detection, compatibility checks)
               ├─ remote access proxies and cloudflared tunnel
+              ├─ desktop pet reducer, loopback SSE client, and preferences
               └─ browser and preferences ports
                   └─ pinned Node.js → published @deepseek-ai/dsh
 ```

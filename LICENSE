@@ -1,3 +1,10 @@
+License scope and exceptions
+
+This MIT License applies to the DSH Launcher source code except where a file
+or directory contains a more specific license notice. The desktop pet visual
+assets under `pets/*/` are excluded from the MIT License and are licensed
+separately under `pets/ASSET-LICENSE.md`.
+
 MIT License
 
 Copyright (c) 2026 Gru
