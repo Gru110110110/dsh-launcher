@@ -100,6 +100,7 @@ impl RemoteSettings {
 
 struct RemoteInner {
     settings: RemoteSettings,
+    lan_address: Option<Ipv4Addr>,
     lan_server: Option<ProxyServer>,
     tunnel_listener: Option<ProxyServer>,
     tunnel: Option<Arc<TunnelProcess>>,
@@ -112,6 +113,7 @@ impl RemoteInner {
     fn new(settings: RemoteSettings) -> Self {
         Self {
             settings,
+            lan_address: None,
             lan_server: None,
             tunnel_listener: None,
             tunnel: None,
@@ -136,6 +138,7 @@ pub struct RemoteService {
     upstream_generation: AtomicU64,
     lan_auth: Arc<AuthState>,
     public_auth: Arc<AuthState>,
+    lan_address: Arc<dyn Fn() -> Option<Ipv4Addr> + Send + Sync>,
     listener: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Bumped on every public-side transition; stale tunnel workers and
     /// late cloudflared callbacks discard their results against it.
@@ -150,6 +153,13 @@ pub struct RemoteService {
 
 impl RemoteService {
     pub fn new(paths: ApplicationPaths) -> AppResult<Arc<Self>> {
+        Self::new_with_lan_address(paths, Arc::new(lan::primary_lan_ipv4))
+    }
+
+    fn new_with_lan_address(
+        paths: ApplicationPaths,
+        lan_address: Arc<dyn Fn() -> Option<Ipv4Addr> + Send + Sync>,
+    ) -> AppResult<Arc<Self>> {
         let settings = RemoteSettings::load(&paths);
         let service = Arc::new(Self {
             lan_auth: AuthState::new(RemoteScope::Lan, settings.lan_password.clone()),
@@ -157,6 +167,7 @@ impl RemoteService {
             inner: std::sync::Mutex::new(RemoteInner::new(settings)),
             upstream: Arc::new(RwLock::new(None)),
             upstream_generation: AtomicU64::new(0),
+            lan_address,
             listener: RwLock::new(None),
             public_generation: Arc::new(AtomicU64::new(0)),
             self_weak: RwLock::new(std::sync::Weak::new()),
@@ -226,6 +237,12 @@ impl RemoteService {
     }
 
     pub fn set_lan_enabled(&self, enabled: bool) -> AppResult<()> {
+        if enabled {
+            let master = self.inner.lock().expect("remote poisoned").settings.master;
+            if master && (self.lan_address)().is_none() {
+                return Err(AppError::new("remoteLanUnavailable"));
+            }
+        }
         {
             let mut inner = self.inner.lock().expect("remote poisoned");
             let mut settings = inner.settings.clone();
@@ -313,30 +330,59 @@ impl RemoteService {
         Ok(())
     }
 
-    /// Starts/stops listeners and the tunnel to match the persisted switches.
-    fn apply(&self, retry_failed_tunnel: bool) -> AppResult<()> {
+    /// Re-checks the current LAN route and reconciles the wildcard listener.
+    /// The frontend calls this while the app is in the foreground so plugging
+    /// or unplugging Ethernet/Wi-Fi is reflected without a toggle dance.
+    pub fn refresh_lan(&self) -> AppResult<()> {
+        if self.reconcile_lan()? {
+            self.notify();
+        }
+        Ok(())
+    }
+
+    fn reconcile_lan(&self) -> AppResult<bool> {
         #[cfg(test)]
         if self.apply_fails.load(Ordering::SeqCst) {
             return Err(AppError::new("remoteListenFailed"));
         }
-        let mut bootstrap = None;
+        // Resolve the route outside `inner`: platform route discovery must
+        // never hold the service mutex if an OS networking provider is slow.
+        let lan_address = (self.lan_address)();
         let mut lan_to_stop = None;
-        let mut tunnel_to_stop = None;
-        let mut tunnel_listener_to_stop = None;
-        {
+        let changed = {
             let mut inner = self.inner.lock().expect("remote poisoned");
             let want_lan = inner.settings.master && inner.settings.lan_enabled;
-            let want_public = inner.settings.master && inner.settings.public_enabled;
+            let mut changed = inner.lan_address != lan_address;
+            inner.lan_address = lan_address;
 
-            if want_lan && inner.lan_server.is_none() {
+            if want_lan && lan_address.is_some() && inner.lan_server.is_none() {
                 inner.lan_server = Some(ProxyServer::bind(
                     IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                     Arc::clone(&self.lan_auth),
                     Arc::clone(&self.upstream),
                 )?);
-            } else if !want_lan {
+                changed = true;
+            } else if (!want_lan || lan_address.is_none()) && inner.lan_server.is_some() {
                 lan_to_stop = inner.lan_server.take();
+                changed = true;
             }
+            changed
+        };
+        if let Some(mut server) = lan_to_stop {
+            server.stop();
+        }
+        Ok(changed)
+    }
+
+    /// Starts/stops listeners and the tunnel to match the persisted switches.
+    fn apply(&self, retry_failed_tunnel: bool) -> AppResult<()> {
+        self.reconcile_lan()?;
+        let mut bootstrap = None;
+        let mut tunnel_to_stop = None;
+        let mut tunnel_listener_to_stop = None;
+        {
+            let mut inner = self.inner.lock().expect("remote poisoned");
+            let want_public = inner.settings.master && inner.settings.public_enabled;
 
             if want_public && inner.tunnel_listener.is_none() {
                 inner.tunnel_listener = Some(ProxyServer::bind(
@@ -373,9 +419,6 @@ impl RemoteService {
         // finishes outside the lock.
         if let Some(tunnel) = tunnel_to_stop {
             tunnel.stop();
-        }
-        if let Some(mut server) = lan_to_stop {
-            server.stop();
         }
         if let Some(mut listener) = tunnel_listener_to_stop {
             listener.stop();
@@ -498,13 +541,16 @@ impl RemoteService {
         let inner = self.inner.lock().expect("remote poisoned");
         let service_ready = self.upstream.read().expect("upstream poisoned").is_some();
         let lan_url = inner.lan_server.as_ref().and_then(|server| {
-            lan::primary_lan_ipv4().map(|ip| format!("http://{ip}:{}", server.port()))
+            inner
+                .lan_address
+                .map(|ip| format!("http://{ip}:{}", server.port()))
         });
         RemoteSnapshot {
             master: inner.settings.master,
             service_ready,
             lan: RemoteLanSnapshot {
                 enabled: inner.settings.lan_enabled,
+                available: inner.lan_address.is_some(),
                 url: lan_url,
                 password: inner.settings.lan_password.clone(),
             },
@@ -662,7 +708,18 @@ mod tests {
     fn service() -> (tempfile::TempDir, Arc<RemoteService>) {
         let temp = tempfile::tempdir().unwrap();
         let paths = ApplicationPaths::from_home(temp.path());
-        let service = RemoteService::new(paths).unwrap();
+        let service = RemoteService::new_with_lan_address(
+            paths,
+            Arc::new(|| Some(Ipv4Addr::new(192, 168, 1, 20))),
+        )
+        .unwrap();
+        (temp, service)
+    }
+
+    fn service_without_lan() -> (tempfile::TempDir, Arc<RemoteService>) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path());
+        let service = RemoteService::new_with_lan_address(paths, Arc::new(|| None)).unwrap();
         (temp, service)
     }
 
@@ -672,6 +729,7 @@ mod tests {
         let snapshot = service.snapshot();
         assert!(!snapshot.master, "remote exposure is always opt-in");
         assert!(snapshot.lan.enabled);
+        assert!(snapshot.lan.available);
         assert!(!snapshot.public.enabled);
         assert!(is_valid_password(&snapshot.lan.password));
         assert!(is_valid_password(&snapshot.public.password));
@@ -683,14 +741,15 @@ mod tests {
     fn settings_round_trip_across_restart() {
         let temp = tempfile::tempdir().unwrap();
         let paths = ApplicationPaths::from_home(temp.path());
-        let first = RemoteService::new(paths.clone()).unwrap();
+        let address = || Some(Ipv4Addr::new(192, 168, 1, 20));
+        let first = RemoteService::new_with_lan_address(paths.clone(), Arc::new(address)).unwrap();
         first.set_master(true).unwrap();
         first.set_lan_enabled(true).unwrap();
         first.rotate_password(RemoteScope::Lan).unwrap();
         let password = first.snapshot().lan.password;
         first.shutdown();
 
-        let second = RemoteService::new(paths).unwrap();
+        let second = RemoteService::new_with_lan_address(paths, Arc::new(address)).unwrap();
         let snapshot = second.snapshot();
         assert!(snapshot.master);
         assert!(snapshot.lan.enabled);
@@ -708,6 +767,75 @@ mod tests {
         assert!(service.snapshot().lan.url.is_some());
         service.set_master(false).unwrap();
         assert!(service.snapshot().lan.url.is_none());
+    }
+
+    #[test]
+    fn missing_lan_route_does_not_start_a_listener() {
+        let (_temp, service) = service_without_lan();
+        service.set_master(true).unwrap();
+        let snapshot = service.snapshot();
+        assert!(snapshot.master);
+        assert!(snapshot.lan.enabled);
+        assert!(!snapshot.lan.available);
+        assert!(snapshot.lan.url.is_none());
+        assert!(
+            service
+                .inner
+                .lock()
+                .expect("remote poisoned")
+                .lan_server
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_lan_route_rejects_enabling_only_the_lan_scope() {
+        let (_temp, service) = service_without_lan();
+        service.set_lan_enabled(false).unwrap();
+        service.set_master(true).unwrap();
+
+        let error = service.set_lan_enabled(true).unwrap_err();
+        assert_eq!(error.code, "remoteLanUnavailable");
+        assert!(!service.snapshot().lan.enabled);
+    }
+
+    #[test]
+    fn lan_refresh_recovers_after_connect_and_stops_after_disconnect() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path());
+        let available = Arc::new(AtomicBool::new(false));
+        let resolver_state = Arc::clone(&available);
+        let service = RemoteService::new_with_lan_address(
+            paths,
+            Arc::new(move || {
+                resolver_state
+                    .load(Ordering::SeqCst)
+                    .then_some(Ipv4Addr::new(192, 168, 1, 20))
+            }),
+        )
+        .unwrap();
+        service.set_master(true).unwrap();
+        assert!(service.snapshot().lan.url.is_none());
+
+        available.store(true, Ordering::SeqCst);
+        service.refresh_lan().unwrap();
+        let connected = service.snapshot();
+        assert!(connected.lan.available);
+        assert!(connected.lan.url.is_some());
+
+        available.store(false, Ordering::SeqCst);
+        service.refresh_lan().unwrap();
+        let disconnected = service.snapshot();
+        assert!(!disconnected.lan.available);
+        assert!(disconnected.lan.url.is_none());
+        assert!(
+            service
+                .inner
+                .lock()
+                .expect("remote poisoned")
+                .lan_server
+                .is_none()
+        );
     }
 
     #[test]

@@ -333,6 +333,11 @@ export type RemoteTunnelState = "off" | "starting" | "running" | "failed";
 export type RemoteLanSnapshot = {
   enabled: boolean;
   /**
+   * True when the host currently has a non-loopback IPv4 route. Ethernet
+   * and Wi-Fi are both valid LAN transports.
+   */
+  available: boolean;
+  /**
    * Listening and the upstream Harness web UI is reachable. The QR target.
    */
   url: string | null;

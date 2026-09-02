@@ -7,6 +7,7 @@ import {
   initializeLauncherPreview,
   initializeLauncherStore,
 } from "@/platform/launcherStore";
+import { startRemoteLanMonitor } from "@/platform/remoteLanMonitor";
 import type { LauncherSnapshot } from "@/platform/generated/bindings";
 import packageJson from "../package.json";
 
@@ -46,7 +47,7 @@ if (import.meta.env.DEV && !isTauri) {
     remote: {
       master: false,
       serviceReady: true,
-      lan: { enabled: false, url: null, password: "" },
+      lan: { enabled: false, available: false, url: null, password: "" },
       public: {
         enabled: false,
         state: "off",
@@ -58,7 +59,9 @@ if (import.meta.env.DEV && !isTauri) {
   };
   initializeLauncherPreview(previewSnapshot);
 } else {
-  void initializeLauncherStore();
+  void initializeLauncherStore().then(() => {
+    startRemoteLanMonitor();
+  });
 }
 
 const root = document.getElementById("root");

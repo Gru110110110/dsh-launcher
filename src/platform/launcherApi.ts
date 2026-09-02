@@ -68,6 +68,7 @@ export const launcherApi = {
     action("remote_set_master", { enabled }),
   remoteSetLanEnabled: (enabled: boolean) =>
     action("remote_set_lan_enabled", { enabled }),
+  remoteRefreshLan: () => action("remote_refresh_lan"),
   remoteSetPublicEnabled: (enabled: boolean, acknowledged: boolean) =>
     action("remote_set_public_enabled", { enabled, acknowledged }),
   remoteRotatePassword: (scope: RemoteScope) =>

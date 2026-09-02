@@ -24,7 +24,7 @@ Search, filter, inspect, install, and uninstall Cordis and Skill plugins from a 
 
 ### Use Harness from your phone
 
-Remote access exposes the loopback-only Harness Web UI through the launcher's authenticated proxy. It supports both older bare `dsh web` URLs and newer launch-token URLs without putting Harness's private token into a remote link. Use a QR code and a rotatable 8-digit password on the same LAN, or explicitly enable a temporary Cloudflare quick tunnel for public access; rotating the password immediately revokes existing sessions.
+Remote access exposes the loopback-only Harness Web UI through the launcher's authenticated proxy. It supports both older bare `dsh web` URLs and newer launch-token URLs without putting Harness's private token into a remote link. Use a QR code and a rotatable 8-digit password on the same LAN (the computer may use Ethernet or Wi-Fi), or explicitly enable a temporary Cloudflare quick tunnel for public access; rotating the password immediately revokes existing sessions.
 
 ![DSH Launcher remote access](screenshots/ScreenShot_remote_en.png)
 

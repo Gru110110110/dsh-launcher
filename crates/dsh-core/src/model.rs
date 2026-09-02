@@ -320,6 +320,9 @@ pub enum RemoteTunnelState {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteLanSnapshot {
     pub enabled: bool,
+    /// True when the host currently has a non-loopback IPv4 route. Ethernet
+    /// and Wi-Fi are both valid LAN transports.
+    pub available: bool,
     /// Listening and the upstream Harness web UI is reachable. The QR target.
     pub url: Option<String>,
     pub password: String,

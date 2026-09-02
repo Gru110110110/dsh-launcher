@@ -24,7 +24,7 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 
 ### 在手机上使用 Harness
 
-远程访问通过启动器自带的认证代理开放仅监听回环地址的 Harness Web UI，既兼容旧版 `dsh web` 的裸地址，也兼容新版带启动令牌的地址，且不会把 Harness 私有令牌放进远程链接。同一局域网内可扫描二维码并输入可轮换的 8 位密码；需要公网访问时，也可以明确开启临时的 Cloudflare 快速隧道。刷新密码会立即吊销已有会话。
+远程访问通过启动器自带的认证代理开放仅监听回环地址的 Harness Web UI，既兼容旧版 `dsh web` 的裸地址，也兼容新版带启动令牌的地址，且不会把 Harness 私有令牌放进远程链接。同一局域网内可扫描二维码并输入可轮换的 8 位密码，电脑端使用网线或 Wi-Fi 均可；需要公网访问时，也可以明确开启临时的 Cloudflare 快速隧道。刷新密码会立即吊销已有会话。
 
 ![DSH Launcher 远程访问](screenshots/ScreenShot_remote_zh.png)
 

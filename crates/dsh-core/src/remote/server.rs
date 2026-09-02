@@ -27,7 +27,7 @@
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -239,6 +239,9 @@ impl ProxyServer {
         let addr = listener
             .local_addr()
             .map_err(|error| AppError::io("remoteListenFailed", &error))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| AppError::io("remoteListenFailed", &error))?;
         let stop = Arc::new(AtomicBool::new(false));
         let registry = Arc::new(StreamRegistry::new());
         auth.track_registry(&registry);
@@ -265,12 +268,27 @@ impl ProxyServer {
     pub(crate) fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.registry.shutdown_all();
-        // Wake the blocking accept so the listener thread can observe the
-        // stop flag and exit.
-        let _ = TcpStream::connect(self.addr);
+        // Prompt the nonblocking accept loop to observe the stop flag without
+        // waiting for its next poll. A listener bound to an unspecified address
+        // reports 0.0.0.0/:: as its local address, but those are bind-only
+        // addresses and are not portable connect targets (notably on
+        // Windows). Always wake wildcard listeners through loopback.
+        let _ = TcpStream::connect(wake_address(self.addr));
         if let Some(handle) = self.listener.take() {
             let _ = handle.join();
         }
+    }
+}
+
+fn wake_address(address: SocketAddr) -> SocketAddr {
+    match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), address.port())
+        }
+        _ => address,
     }
 }
 
@@ -296,11 +314,26 @@ fn accept_loop(
     stop: Arc<AtomicBool>,
     registry: Arc<StreamRegistry>,
 ) {
-    for stream in listener.incoming() {
+    loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        let Ok(stream) = stream else { break };
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            Err(_) => break,
+        };
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        // Some platforms propagate O_NONBLOCK from the listener to accepted
+        // sockets. Connection handlers intentionally use blocking I/O.
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
         if registry.len() >= MAX_CONNECTIONS * 2 {
             let mut stream = stream;
             let _ = write_response(
@@ -1313,6 +1346,34 @@ mod tests {
     use super::*;
     use crate::remote::auth;
     use std::{net::Ipv4Addr, sync::Arc, thread, time::Instant};
+
+    #[test]
+    fn wildcard_listener_wakes_through_loopback() {
+        let port = 43123;
+        assert_eq!(
+            wake_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+        );
+        assert_eq!(
+            wake_address(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)
+        );
+    }
+
+    #[test]
+    fn wildcard_listener_stop_returns_within_a_bounded_time() {
+        let auth = AuthState::new(RemoteScope::Lan, "12345678".to_owned());
+        let upstream = Arc::new(RwLock::new(None));
+        let mut server = ProxyServer::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), auth, upstream)
+            .expect("wildcard proxy binds");
+
+        let started = Instant::now();
+        server.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "proxy stop must not wait indefinitely"
+        );
+    }
 
     struct FakeUpstream {
         addr: SocketAddr,

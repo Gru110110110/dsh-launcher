@@ -389,16 +389,33 @@ pub async fn market_rollback_pending(state: State<'_, Arc<AppState>>) -> Result<
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn remote_set_master(enabled: bool, state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
-    state.set_remote_master(enabled)
-}
-
-#[tauri::command]
-pub fn remote_set_lan_enabled(
+pub async fn remote_set_master(
     enabled: bool,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), AppError> {
-    state.set_remote_lan_enabled(enabled)
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.set_remote_master(enabled)).await,
+    )
+}
+
+#[tauri::command]
+pub async fn remote_set_lan_enabled(
+    enabled: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.set_remote_lan_enabled(enabled)).await,
+    )
+}
+
+#[tauri::command]
+pub async fn remote_refresh_lan(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || state.refresh_remote_lan()).await,
+    )
 }
 
 /// Enabling public access requires the UI's disclaimer acknowledgement; the

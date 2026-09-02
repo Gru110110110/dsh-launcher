@@ -1770,6 +1770,10 @@ impl AppState {
         self.remote.set_lan_enabled(enabled)
     }
 
+    pub(crate) fn refresh_remote_lan(&self) -> AppResult<()> {
+        self.remote.refresh_lan()
+    }
+
     pub(crate) fn set_remote_public_enabled(
         &self,
         enabled: bool,
@@ -2585,6 +2589,7 @@ pub fn run() {
             commands::market_open_plugin_github,
             commands::remote_set_master,
             commands::remote_set_lan_enabled,
+            commands::remote_refresh_lan,
             commands::remote_set_public_enabled,
             commands::remote_rotate_password,
             commands::remote_set_password,

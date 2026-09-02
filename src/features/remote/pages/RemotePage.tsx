@@ -32,7 +32,7 @@ function SegmentedControl<T extends string>({
   label,
 }: {
   value: T;
-  options: readonly { value: T; label: string }[];
+  options: readonly { value: T; label: string; disabled?: boolean }[];
   onChange: (value: T) => void;
   label: string;
 }) {
@@ -44,6 +44,7 @@ function SegmentedControl<T extends string>({
           role="radio"
           aria-checked={option.value === value}
           className={option.value === value ? "selected" : ""}
+          disabled={option.disabled}
           key={option.value}
           onClick={() => {
             onChange(option.value);
@@ -359,7 +360,11 @@ export function RemotePage() {
                 label={t("remote.lan")}
                 value={remote.lan.enabled ? "on" : "off"}
                 options={[
-                  { value: "on", label: t("remote.masterOn") },
+                  {
+                    value: "on",
+                    label: t("remote.masterOn"),
+                    disabled: !remote.lan.available,
+                  },
                   { value: "off", label: t("remote.masterOff") },
                 ]}
                 onChange={(choice) => {
@@ -367,7 +372,13 @@ export function RemotePage() {
                 }}
               />
             </div>
+            {remote.master && !remote.lan.available && (
+              <div className="info-row remote-status-row" role="status">
+                <span>{t("remote.lanUnavailable")}</span>
+              </div>
+            )}
             {remote.master &&
+              remote.lan.available &&
               remote.lan.enabled &&
               (remote.lan.url ? (
                 <RemoteLinkPanel
