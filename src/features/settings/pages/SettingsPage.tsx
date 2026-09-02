@@ -19,6 +19,10 @@ import {
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { launcherApi } from "@/platform/launcherApi";
+import {
+  getDesktopUpdateAction,
+  getDesktopUpdateDetail,
+} from "@/platform/desktopUpdatePresentation";
 import { shallowEqual, useLauncherSelector } from "@/platform/launcherStore";
 import type {
   HarnessUpdateChannel,
@@ -32,8 +36,6 @@ import type {
 import { showTimedError } from "@/shared/errorToast";
 import githubIconUrl from "../../../../assets/external/github.svg";
 import {
-  getDesktopUpdateAction,
-  getDesktopUpdateDetail,
   proxyDraftAfterSave,
   proxyDraftChanged,
   proxyDraftFromSettings,

@@ -5,7 +5,11 @@ import type {
 } from "@/platform/generated/bindings";
 import {
   getDesktopUpdateAction,
+  getDesktopUpdateCompactLabel,
   getDesktopUpdateDetail,
+  shouldShowDesktopUpdateAction,
+} from "@/platform/desktopUpdatePresentation";
+import {
   proxyDraftAfterSave,
   proxyDraftChanged,
   proxyDraftFromSettings,
@@ -17,6 +21,60 @@ import {
 } from "./presentation";
 
 describe("settings presentation", () => {
+  it("shows the shell update entry only when an update can be acted on", () => {
+    expect(shouldShowDesktopUpdateAction({ kind: "idle" })).toBe(false);
+    expect(shouldShowDesktopUpdateAction({ kind: "checking" })).toBe(false);
+    expect(
+      shouldShowDesktopUpdateAction({ kind: "failed", version: null }),
+    ).toBe(false);
+    expect(
+      shouldShowDesktopUpdateAction({ kind: "available", version: "0.3.0" }),
+    ).toBe(true);
+    expect(
+      shouldShowDesktopUpdateAction({ kind: "preparing", version: "0.3.0" }),
+    ).toBe(true);
+    expect(
+      shouldShowDesktopUpdateAction({
+        kind: "downloading",
+        version: "0.3.0",
+        done: 25,
+        total: 100,
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowDesktopUpdateAction({ kind: "installing", version: "0.3.0" }),
+    ).toBe(true);
+    expect(
+      shouldShowDesktopUpdateAction({ kind: "failed", version: "0.3.0" }),
+    ).toBe(true);
+  });
+
+  it("uses a compact update label and direct percentage in the shell", () => {
+    expect(
+      getDesktopUpdateCompactLabel({ kind: "available", version: "0.3.0" }),
+    ).toEqual({ key: "action.updateDesktopShort" });
+    expect(
+      getDesktopUpdateCompactLabel({ kind: "preparing", version: "0.3.0" }),
+    ).toEqual({
+      key: "action.updateDesktopPercent",
+      values: { percent: 0 },
+    });
+    expect(
+      getDesktopUpdateCompactLabel({
+        kind: "downloading",
+        version: "0.3.0",
+        done: 10,
+        total: 100,
+      }),
+    ).toEqual({
+      key: "action.updateDesktopPercent",
+      values: { percent: 10 },
+    });
+    expect(
+      getDesktopUpdateCompactLabel({ kind: "installing", version: "0.3.0" }),
+    ).toEqual({ key: "action.installingDesktopShort" });
+  });
+
   it("shows the available desktop version", () => {
     expect(
       getDesktopUpdateDetail({ kind: "available", version: "0.3.0" }),
@@ -55,7 +113,7 @@ describe("settings presentation", () => {
       disabled: true,
       spinning: true,
       operation: null,
-      label: { key: "action.updatingDesktop" },
+      label: { key: "action.installingDesktopShort" },
     });
   });
 

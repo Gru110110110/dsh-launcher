@@ -123,8 +123,9 @@ button:disabled {
   object-fit: contain;
 }
 
-.brand span {
+.brand-copy {
   display: flex;
+  min-width: 0;
   flex-direction: column;
 }
 
@@ -139,6 +140,33 @@ button:disabled {
   color: var(--subtle);
   font-size: 11px;
   letter-spacing: 0.04em;
+}
+
+.sidebar-update-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 54px;
+  height: 28px;
+  margin-left: auto;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--brand);
+  box-shadow: 0 2px 5px rgb(47 108 255 / 23%);
+  color: white;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.sidebar-update-button:hover:not(:disabled) {
+  background: var(--brand-hover);
+}
+
+.sidebar-update-button:disabled {
+  opacity: 1;
 }
 
 .sidebar-caption {
