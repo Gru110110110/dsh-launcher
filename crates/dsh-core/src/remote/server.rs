@@ -57,6 +57,8 @@ const MAX_CONNECTIONS: usize = 128;
 const LOGIN_PATH: &str = "/__dsh-remote/login";
 const LOGOUT_PATH: &str = "/__dsh-remote/logout";
 const BOOTSTRAP_PATH: &str = "/__dsh-remote/bootstrap";
+const ICON_PATH: &str = "/__dsh-remote/icon.png";
+const APP_ICON: &[u8] = include_bytes!("../../../../public/assets/logo.png");
 
 /// Shared authentication state for one scope. Held by the owning
 /// `RemoteService` and every live server of the scope, so password rotation
@@ -464,6 +466,7 @@ fn handle_connection_inner(
     let login_ip = login_source_ip(&head, peer_ip, context.auth.scope);
     let path = head.path().to_owned();
     match (head.method.as_str(), path.as_str()) {
+        ("GET", ICON_PATH) => write_response(client, 200, "OK", "image/png", APP_ICON, &[]),
         ("GET", LOGIN_PATH) => {
             if authenticated(&head, &context.auth) {
                 return redirect(client, "/");
@@ -1251,7 +1254,7 @@ fn prefers_chinese(head: &RequestHead) -> bool {
 }
 
 struct LoginCopy<'a> {
-    title: &'a str,
+    subtitle: &'a str,
     label: &'a str,
     submit: &'a str,
     failed: &'a str,
@@ -1260,14 +1263,14 @@ struct LoginCopy<'a> {
 fn login_copy(zh: bool) -> LoginCopy<'static> {
     if zh {
         LoginCopy {
-            title: "DSH 远程访问",
+            subtitle: "远程访问DSH",
             label: "连接密码",
             submit: "连接",
             failed: "密码错误，请重试",
         }
     } else {
         LoginCopy {
-            title: "DSH Remote Access",
+            subtitle: "Remote access to DSH",
             label: "Connection password",
             submit: "Connect",
             failed: "Incorrect password, try again",
@@ -1286,37 +1289,64 @@ fn locked_copy(zh: bool) -> &'static str {
 fn login_page(zh: bool, failed: bool, locked: Option<&str>) -> String {
     let copy = login_copy(zh);
     let notice = match (locked, failed) {
-        (Some(message), _) => format!(r#"<p class="error">{message}</p>"#),
-        (None, true) => format!(r#"<p class="error">{}</p>"#, copy.failed),
-        (None, false) => String::new(),
+        (Some(message), _) => message,
+        (None, true) => copy.failed,
+        (None, false) => "",
     };
     format!(
-        r#"<!doctype html>
+        r##"<!doctype html>
 <html lang="{lang}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
+<meta name="theme-color" content="#f7f7f9" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#17181c" media="(prefers-color-scheme: dark)">
+<title>DSH Launcher · {subtitle}</title>
+<link rel="icon" type="image/png" href="{icon_path}">
 <style>
-body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0f1115; color: #e7e9ee; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }}
-form {{ width: min(320px, 86vw); display: grid; gap: 14px; }}
-h1 {{ font-size: 20px; margin: 0 0 6px; text-align: center; }}
-input {{ padding: 12px; font-size: 18px; letter-spacing: 2px; text-align: center; border-radius: 10px; border: 1px solid #343a46; background: #181b22; color: inherit; }}
-button {{ padding: 12px; font-size: 16px; border: 0; border-radius: 10px; background: #4d6bfe; color: white; cursor: pointer; }}
-.error {{ color: #ff7a7a; text-align: center; margin: 0; font-size: 14px; }}
+:root {{ color-scheme: light; --bg: #f7f7f9; --surface: #fff; --text: #1f1f22; --muted: #8a8a92; --border: #e7e7e9; --border-strong: #d7d7db; --brand: #2f6cff; --brand-hover: #235be2; --brand-soft: #dfe7fb; --danger: #d63730; --shadow: 0 1px 3px rgb(0 0 0 / 7%); }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: max(28px, env(safe-area-inset-top)) 24px max(28px, env(safe-area-inset-bottom)); background: var(--bg); color: var(--text); font-family: Inter, -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }}
+.login {{ width: min(360px, 100%); }}
+.identity {{ display: flex; flex-direction: column; align-items: center; margin-bottom: 34px; text-align: center; }}
+.app-icon {{ width: 76px; height: 76px; margin-bottom: 18px; border-radius: 20px; box-shadow: 0 5px 16px rgb(0 0 0 / 14%); object-fit: contain; }}
+h1 {{ margin: 0; font-size: 27px; font-weight: 720; letter-spacing: -.025em; line-height: 1.15; }}
+.subtitle {{ margin: 9px 0 0; color: var(--muted); font-size: 14px; line-height: 1.5; }}
+form {{ display: grid; gap: 12px; }}
+.field-label {{ position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; }}
+input {{ width: 100%; height: 48px; padding: 0 16px; border: 1px solid var(--border-strong); border-radius: 8px; outline: 0; background: var(--surface); box-shadow: var(--shadow); color: var(--text); font: inherit; font-size: 17px; letter-spacing: 2px; text-align: center; transition: border-color 150ms ease, box-shadow 150ms ease; }}
+input::placeholder {{ color: var(--muted); letter-spacing: 0; }}
+input:focus {{ border-color: var(--brand); box-shadow: 0 0 0 2px var(--brand-soft); }}
+button {{ height: 44px; padding: 0 16px; border: 0; border-radius: 8px; background: var(--brand); box-shadow: 0 2px 5px rgb(47 108 255 / 23%); color: #fff; font: inherit; font-size: 14px; font-weight: 650; cursor: pointer; transition: background 150ms ease, transform 100ms ease; }}
+button:hover {{ background: var(--brand-hover); }}
+button:active {{ transform: translateY(1px); }}
+button:focus-visible {{ outline: 2px solid var(--brand); outline-offset: 2px; }}
+.error {{ order: -1; margin: 0 0 2px; color: var(--danger); font-size: 13px; line-height: 1.4; text-align: center; }}
+.error:empty {{ display: none; }}
+@media (prefers-color-scheme: dark) {{ :root {{ color-scheme: dark; --bg: #17181c; --surface: #222328; --text: #f2f2f4; --muted: #a5a5ad; --border: #33343a; --border-strong: #44454d; --brand: #5d89ff; --brand-hover: #7399ff; --brand-soft: #283657; --danger: #ff7770; --shadow: 0 1px 3px rgb(0 0 0 / 30%); }} }}
+@media (max-height: 520px) {{ .identity {{ margin-bottom: 24px; }} .app-icon {{ width: 64px; height: 64px; margin-bottom: 14px; border-radius: 17px; }} }}
+@media (prefers-reduced-motion: reduce) {{ input, button {{ transition: none; }} }}
 </style>
 </head>
 <body>
+<main class="login">
+<header class="identity">
+<img class="app-icon" src="{icon_path}" width="76" height="76" alt="">
+<h1>DSH Launcher</h1>
+<p class="subtitle">{subtitle}</p>
+</header>
 <form method="post" action="/__dsh-remote/login" autocomplete="off">
-<h1>{title}</h1>
-{notice}
-<input type="password" name="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" required aria-label="{label}" placeholder="{label}" autofocus>
+<label class="field-label" for="password">{label}</label>
+<input id="password" type="password" name="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" required aria-describedby="login-error" placeholder="{label}" autofocus>
 <button type="submit">{submit}</button>
+<p class="error" id="login-error" role="alert">{notice}</p>
 </form>
+</main>
 </body>
-</html>"#,
+</html>"##,
         lang = if zh { "zh-CN" } else { "en" },
-        title = copy.title,
+        subtitle = copy.subtitle,
+        icon_path = ICON_PATH,
         notice = notice,
         label = copy.label,
         submit = copy.submit,
@@ -1579,12 +1609,35 @@ mod tests {
             &proxy,
             "GET /__dsh-remote/login HTTP/1.1\r\nHost: x\r\nAccept-Language: zh-CN\r\nConnection: close\r\n\r\n",
         );
-        assert!(zh.contains("DSH 远程访问"), "{zh}");
+        assert!(zh.contains("<h1>DSH Launcher</h1>"), "{zh}");
+        assert!(zh.contains("<p class=\"subtitle\">远程访问DSH</p>"), "{zh}");
+        assert!(zh.contains("src=\"/__dsh-remote/icon.png\""), "{zh}");
         let en = request(
             &proxy,
             "GET /__dsh-remote/login HTTP/1.1\r\nHost: x\r\nAccept-Language: en-US\r\nConnection: close\r\n\r\n",
         );
-        assert!(en.contains("DSH Remote Access"), "{en}");
+        assert!(en.contains("<h1>DSH Launcher</h1>"), "{en}");
+        assert!(
+            en.contains("<p class=\"subtitle\">Remote access to DSH</p>"),
+            "{en}"
+        );
+    }
+
+    #[test]
+    fn login_icon_is_available_without_a_session() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let proxy = start_proxy("12345678", &seen);
+        let response = request(
+            &proxy,
+            "GET /__dsh-remote/icon.png HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("Content-Type: image/png"), "{response}");
+        assert!(
+            response.contains(&format!("Content-Length: {}", APP_ICON.len())),
+            "{response}"
+        );
+        assert!(seen.lock().expect("seen").is_empty());
     }
 
     #[test]
