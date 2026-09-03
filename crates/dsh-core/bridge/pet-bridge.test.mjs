@@ -12,43 +12,144 @@ const session = { header: { id: "top" }, cwd: "/tmp/demo" };
 test("reduces the five public states", () => {
   const reducer = new PetReducer();
   expect(reducer.handle(session, { type: "turn/start", seq: 1 }).state).toBe(
-    PetState.THINKING,
+    PetState.WORKING,
   );
   expect(
     reducer.handle(session, {
-      type: "tool/call",
+      type: "assistant/chunk",
       seq: 2,
+      data: {
+        chunk: { type: "reasoning-delta", index: 0, text: "thinking" },
+      },
+    }).state,
+  ).toBe(PetState.THINKING);
+  expect(
+    reducer.handle(session, {
+      type: "tool/call",
+      seq: 3,
       data: { name: "write_file", callId: "a" },
     }).state,
   ).toBe(PetState.WORKING);
   expect(
     reducer.handle(session, {
       type: "approval/asked",
-      seq: 3,
+      seq: 4,
       data: { id: "p" },
     }).state,
   ).toBe(PetState.WAITING);
   expect(
     reducer.handle(session, {
       type: "approval/decided",
-      seq: 4,
+      seq: 5,
       data: { id: "p" },
     }).state,
   ).toBe(PetState.WORKING);
   expect(
     reducer.handle(session, {
       type: "tool/result",
-      seq: 5,
+      seq: 6,
       data: { callId: "a", error: { code: "failed" } },
     }).state,
   ).toBe(PetState.ERROR);
   expect(
     reducer.handle(session, {
       type: "turn/end",
-      seq: 6,
+      seq: 7,
       data: { reason: { kind: "completed" } },
     }).state,
   ).toBe(PetState.IDLE);
+});
+
+test("shows thinking only for reasoning stream chunks", () => {
+  const stateForChunk = (chunk) => {
+    const reducer = new PetReducer();
+    reducer.handle(session, { type: "turn/start" });
+    return reducer.handle(session, {
+      type: "assistant/chunk",
+      data: { chunk },
+    }).state;
+  };
+
+  expect(
+    stateForChunk({ type: "block-start", index: 0, blockType: "reasoning" }),
+  ).toBe(PetState.THINKING);
+  expect(
+    stateForChunk({ type: "reasoning-delta", index: 0, text: "thinking" }),
+  ).toBe(PetState.THINKING);
+  expect(
+    stateForChunk({ type: "text-delta", index: 0, text: "answering" }),
+  ).toBe(PetState.WORKING);
+  expect(
+    stateForChunk({
+      type: "tool-call-delta",
+      index: 0,
+      id: "search-call",
+      name: "find",
+      argumentsDelta: "{}",
+    }),
+  ).toBe(PetState.WORKING);
+  expect(
+    stateForChunk({
+      type: "block-end",
+      index: 0,
+      block: { type: "reasoning", text: "done" },
+    }),
+  ).toBe(PetState.WORKING);
+});
+
+test("keeps non-reasoning active phases working", () => {
+  const reducer = new PetReducer();
+  expect(reducer.handle(session, { type: "turn/start" }).state).toBe(
+    PetState.WORKING,
+  );
+  expect(reducer.handle(session, { type: "step/start" }).state).toBe(
+    PetState.WORKING,
+  );
+  expect(
+    reducer.handle(session, {
+      type: "assistant/message",
+      data: { message: { content: [{ type: "text", text: "done" }] } },
+    }).state,
+  ).toBe(PetState.WORKING);
+  expect(
+    reducer.handle(session, {
+      type: "tool/call",
+      data: { name: "find", callId: "search-call" },
+    }).state,
+  ).toBe(PetState.WORKING);
+  expect(
+    reducer.handle(session, {
+      type: "tool/result",
+      data: { callId: "search-call" },
+    }).state,
+  ).toBe(PetState.WORKING);
+});
+
+test("recognizes model-facing tool failures without internal error metadata", () => {
+  const reducer = new PetReducer();
+  reducer.handle(session, { type: "turn/start" });
+  reducer.handle(session, {
+    type: "tool/call",
+    data: { name: "find", callId: "failed-call" },
+  });
+
+  expect(
+    reducer.handle(session, {
+      type: "tool/result",
+      data: {
+        message: {
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "failed-call",
+              content: [{ type: "text", text: "not found" }],
+              isError: true,
+            },
+          ],
+        },
+      },
+    }).state,
+  ).toBe(PetState.ERROR);
 });
 
 test("waiting outranks working across sessions", () => {

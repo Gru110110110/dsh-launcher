@@ -77,6 +77,13 @@ function toolCallIdOf(event, fallback = "") {
     ?? fallback);
 }
 
+function toolResultFailed(event) {
+  if (event?.data?.error) return true;
+  const content = event?.data?.message?.content;
+  return Array.isArray(content)
+    && content.some((item) => item?.type === "tool-result" && item.isError === true);
+}
+
 function toolActivity(name) {
   const value = String(name || "").toLowerCase();
   if (/search|grep|find|glob|web|read|fetch|open/u.test(value)) return "searching";
@@ -103,6 +110,10 @@ function progressOf(todos) {
   if (!Array.isArray(todos) || todos.length === 0) return undefined;
   const completed = todos.filter((todo) => ["completed", "complete", "done"].includes(todo?.status)).length;
   return { completed, total: todos.length };
+}
+
+function isReasoningChunk(chunk) {
+  return chunk?.type === "reasoning-delta" || (chunk?.type === "block-start" && chunk.blockType === "reasoning");
 }
 
 function compareRecords(left, right) {
@@ -132,13 +143,23 @@ export class PetReducer {
         record.waitingApprovalId = undefined;
         record.task = undefined;
         record.progress = undefined;
-        this.#update(record, PetState.THINKING, "turn-start");
+        this.#update(record, PetState.WORKING, "turn-start");
         break;
       case "step/start":
+        if (!record.turnActive || record.openTools.size > 0) return undefined;
+        this.#update(record, PetState.WORKING, "step-start");
+        break;
       case "assistant/chunk":
+        if (!record.turnActive || record.openTools.size > 0) return undefined;
+        if (isReasoningChunk(event.data?.chunk)) {
+          this.#update(record, PetState.THINKING, "thinking");
+        } else {
+          this.#update(record, PetState.WORKING, "model-output");
+        }
+        break;
       case "assistant/message":
         if (!record.turnActive || record.openTools.size > 0) return undefined;
-        this.#update(record, PetState.THINKING, "thinking");
+        this.#update(record, PetState.WORKING, "assistant-message");
         break;
       case "tool/call": {
         const callId = toolCallIdOf(event, `seq-${String(event.seq ?? "unknown")}`);
@@ -156,7 +177,7 @@ export class PetReducer {
         const callId = toolCallIdOf(event);
         if (callId) record.openTools.delete(callId);
         if (callId === record.waitingCallId) record.waitingCallId = undefined;
-        if (event.data?.error) {
+        if (toolResultFailed(event)) {
           this.#update(record, PetState.ERROR, "tool-error");
         } else {
           this.#resume(record, "tool-result");
@@ -234,7 +255,7 @@ export class PetReducer {
       const toolName = record.openTools.values().next().value;
       this.#update(record, PetState.WORKING, phase, toolActivity(toolName), toolName);
     } else {
-      this.#update(record, PetState.THINKING, phase);
+      this.#update(record, PetState.WORKING, phase);
     }
   }
 

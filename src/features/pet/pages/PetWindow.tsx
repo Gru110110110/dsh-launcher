@@ -97,7 +97,7 @@ export function PetWindow() {
 
   return (
     <main
-      className={`desktop-pet state-${live.state}`}
+      className="desktop-pet"
       onPointerDown={(event) => {
         if (
           event.button !== 0 ||
@@ -116,7 +116,8 @@ export function PetWindow() {
         language={launcher.language}
         bubble={launcher.pet.bubbleEnabled}
         reducedMotion={launcher.pet.reducedMotion}
-        fallbackBubble={t(`pet.defaultBubble.${live.state}`)}
+        fallbackBubble={(state) => t(`pet.defaultBubble.${state}`)}
+        transitionMode="cycle-boundary"
         className="pet-window-renderer"
       />
     </main>
