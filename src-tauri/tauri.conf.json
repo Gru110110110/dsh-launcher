@@ -14,6 +14,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "DSH Launcher",
         "width": 1180,
         "height": 760,
@@ -25,6 +26,7 @@
       },
       {
         "label": "pet",
+        "create": false,
         "title": "DSH Desktop Pet",
         "url": "index.html#/pet-window",
         "width": 300,

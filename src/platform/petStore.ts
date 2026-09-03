@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { PetSnapshot } from "./generated/bindings";
+import { asIpcError } from "./ipcError";
 import { petApi } from "./petApi";
 
 let current: PetSnapshot | null = null;
@@ -30,10 +31,7 @@ export function initializePetStore(): Promise<void> {
       await petApi.onState(accept);
       accept(await petApi.snapshot());
     } catch (error) {
-      initializationError =
-        error instanceof Error
-          ? error
-          : new Error("Desktop pet IPC unavailable");
+      initializationError = asIpcError(error);
       throw initializationError;
     }
   })();

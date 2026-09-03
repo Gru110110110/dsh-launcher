@@ -41,6 +41,7 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{TrayIcon, TrayIconBuilder, TrayIconEvent},
 };
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::commands;
@@ -85,6 +86,21 @@ impl ProgressEventThrottle {
 struct DownloadProgressThrottle {
     done: u64,
     events: ProgressEventThrottle,
+}
+
+#[derive(Default)]
+struct MainWindowActivation {
+    pending: AtomicBool,
+}
+
+impl MainWindowActivation {
+    fn request(&self) {
+        self.pending.store(true, Ordering::SeqCst);
+    }
+
+    fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::SeqCst)
+    }
 }
 
 impl DownloadProgressThrottle {
@@ -2520,6 +2536,25 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn activate_main_window(app: &AppHandle) {
+    if app.get_webview_window("main").is_some() {
+        show_main_window(app);
+    } else if let Some(activation) = app.try_state::<MainWindowActivation>() {
+        activation.request();
+    }
+}
+
+fn report_startup_failure(app: &AppHandle, error: &str) {
+    log::error!("launcher setup failed before the main window became available: {error}");
+    app.dialog()
+        .message(format!(
+            "DSH Launcher 无法启动。\n\nDSH Launcher could not start.\n\n{error}"
+        ))
+        .title("DSH Launcher")
+        .kind(MessageDialogKind::Error)
+        .blocking_show();
+}
+
 fn install_tray(app: &tauri::App, state: &Arc<AppState>) -> tauri::Result<()> {
     let current = state.snapshot();
     let menu = tray_menu(app.handle(), current.language, current.pet.enabled)?;
@@ -2590,39 +2625,88 @@ fn lifecycle_decision(exit_ready: bool, tray_available: bool) -> LifecycleDecisi
     }
 }
 
+fn setup_application(app: &mut tauri::App) -> Result<(), String> {
+    let main_window_config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .cloned()
+        .ok_or_else(|| "main window configuration is missing".to_owned())?;
+    let pet_window_config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "pet")
+        .cloned();
+    let paths = ApplicationPaths::from_environment()
+        .map_err(|error| format!("application paths are unavailable: {error}"))?;
+    paths
+        .ensure_dirs()
+        .map_err(|error| format!("application directories are unavailable: {error}"))?;
+    let state = AppState::new(app.handle().clone(), paths)
+        .map_err(|error| format!("application state could not be initialized: {error}"))?;
+    app.manage(Arc::clone(&state));
+    // Configured windows are otherwise created before this setup hook. Build them only
+    // after AppState is managed so a fast WebView2 page cannot invoke a stateful command
+    // while the second (pet) webview is still being constructed.
+    tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window_config)
+        .map_err(|error| format!("main window could not be configured: {error}"))?
+        .build()
+        .map_err(|error| format!("main window could not be created: {error}"))?;
+    if app.state::<MainWindowActivation>().take_pending() {
+        show_main_window(app.handle());
+    }
+    if let Some(config) = pet_window_config {
+        let pet_window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)
+            .and_then(|builder| builder.build());
+        if let Err(error) = pet_window {
+            log::warn!("desktop pet window unavailable; continuing without it: {error}");
+        }
+    }
+    if let Err(error) = install_tray(app, &state) {
+        log::warn!("system tray unavailable; closing the window will exit: {error}");
+    }
+    if let Err(error) = state.start(false, None) {
+        // The desktop shell is the recovery surface for deployment
+        // and service failures. Worker-spawn failures already record
+        // a Failed snapshot; preserve that state and adapt any other
+        // synchronous failure before continuing Tauri setup.
+        if state.snapshot().phase != LauncherPhase::Failed {
+            state.fail(error.clone());
+        }
+        log::error!("automatic Harness startup could not begin: {error:?}");
+    }
+    tauri::async_runtime::spawn(check_desktop_update_after_startup(state));
+    Ok(())
+}
+
 pub fn run() {
     if dsh_core::service::handle_service_guard_cli() || handle_cli_probe() {
         return;
     }
     tauri::Builder::default()
+        .manage(MainWindowActivation::default())
+        // This must remain the first registered plugin: later plugins and setup work should
+        // only run in the primary process. The file lock in AppState remains a final safeguard.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            activate_main_window(app);
+        }))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
                 .build(),
         )
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            let paths = ApplicationPaths::from_environment().map_err(|error| error.to_string())?;
-            paths.ensure_dirs().map_err(|error| error.to_string())?;
-            let state =
-                AppState::new(app.handle().clone(), paths).map_err(|error| error.to_string())?;
-            if let Err(error) = install_tray(app, &state) {
-                log::warn!("system tray unavailable; closing the window will exit: {error}");
-            }
-            app.manage(Arc::clone(&state));
-            if let Err(error) = state.start(false, None) {
-                // The desktop shell is the recovery surface for deployment
-                // and service failures. Worker-spawn failures already record
-                // a Failed snapshot; preserve that state and adapt any other
-                // synchronous failure before continuing Tauri setup.
-                if state.snapshot().phase != LauncherPhase::Failed {
-                    state.fail(error.clone());
-                }
-                log::error!("automatic Harness startup could not begin: {error:?}");
-            }
-            tauri::async_runtime::spawn(check_desktop_update_after_startup(state));
-            Ok(())
+            setup_application(app).map_err(|error| {
+                report_startup_failure(app.handle(), &error);
+                error.into()
+            })
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event
@@ -2716,7 +2800,7 @@ pub fn run() {
                 ..
             } => {
                 if !has_visible_windows {
-                    show_main_window(app);
+                    activate_main_window(app);
                 }
             }
             RunEvent::ExitRequested { api, .. } => {
@@ -2829,9 +2913,9 @@ mod tests {
     use super::{
         DEEPSEEK_PLATFORM, DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS, DesktopUpdateCheckFailure,
         DesktopUpdateDownloadFailure, DownloadProgressThrottle, GITHUB_REPOSITORY,
-        HARNESS_GITHUB_REPOSITORY, LifecycleDecision, PROGRESS_EVENT_INTERVAL,
-        ProgressEventThrottle, UpdaterProxyPlan, WEBSITE, acquire_instance_lock,
-        acquire_instance_lock_with_timeout, apply_updater_system_plan,
+        HARNESS_GITHUB_REPOSITORY, LifecycleDecision, MainWindowActivation,
+        PROGRESS_EVENT_INTERVAL, ProgressEventThrottle, UpdaterProxyPlan, WEBSITE,
+        acquire_instance_lock, acquire_instance_lock_with_timeout, apply_updater_system_plan,
         classify_desktop_update_check_error, classify_desktop_update_download_error,
         clear_startup_repair_notice, complete_harness_deployment, desktop_update_check_error,
         desktop_update_download_error, desktop_update_start_state, external_link_url,
@@ -2846,6 +2930,30 @@ mod tests {
         LauncherSnapshot, ProxyMode, ProxySettings,
     };
     use semver::Version;
+
+    #[test]
+    fn main_window_activation_remembers_early_second_launch() {
+        let activation = MainWindowActivation::default();
+        assert!(!activation.take_pending());
+
+        activation.request();
+        assert!(activation.take_pending());
+        assert!(!activation.take_pending());
+    }
+
+    #[test]
+    fn configured_webviews_wait_for_application_setup() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let windows = config["app"]["windows"].as_array().unwrap();
+        for label in ["main", "pet"] {
+            let window = windows
+                .iter()
+                .find(|window| window["label"] == label)
+                .unwrap();
+            assert_eq!(window["create"], false, "{label} loaded before setup");
+        }
+    }
 
     #[test]
     fn updater_proxy_plan_maps_each_mode() {

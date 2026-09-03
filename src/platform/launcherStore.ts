@@ -1,5 +1,6 @@
 import { useRef, useSyncExternalStore } from "react";
 import type { LauncherSnapshot } from "./generated/bindings";
+import { asIpcError } from "./ipcError";
 import { launcherApi } from "./launcherApi";
 
 let current: LauncherSnapshot | null = null;
@@ -25,8 +26,7 @@ export function initializeLauncherStore(): Promise<void> {
       await launcherApi.onState(accept);
       accept(await launcherApi.snapshot());
     } catch (error) {
-      initializationError =
-        error instanceof Error ? error : new Error("Launcher IPC unavailable");
+      initializationError = asIpcError(error);
       throw initializationError;
     }
   })();
