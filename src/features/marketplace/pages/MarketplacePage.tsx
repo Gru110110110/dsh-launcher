@@ -867,7 +867,9 @@ export function MarketplacePage() {
           {t("market.catalog.ready", {
             count: catalog.pluginCount,
             generatedAt: catalog.generatedAt
-              ? new Date(catalog.generatedAt).toLocaleDateString()
+              ? new Date(catalog.generatedAt).toLocaleDateString(
+                  launcher.language === "zh" ? "zh-CN" : "en-US",
+                )
               : "–",
           })}
         </p>

@@ -116,7 +116,9 @@ function ShellContent() {
         </aside>
         <main className="main-content">
           <Suspense
-            fallback={<div className="route-loading" aria-label="Loading" />}
+            fallback={
+              <div className="route-loading" aria-label={t("app.loading")} />
+            }
           >
             <Outlet />
           </Suspense>

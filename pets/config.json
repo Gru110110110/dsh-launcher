@@ -8,13 +8,13 @@
       "name": { "zh": "土拨鼠", "en": "Marmot" },
       "folder": "marmot",
       "tags": [
-        { "zh": "憨厚", "en": "Gentle" },
+        { "zh": "憨厚", "en": "Good-natured" },
         { "zh": "贪吃", "en": "Snack lover" },
         { "zh": "爱好：胡萝卜", "en": "Loves carrots" }
       ],
       "description": {
         "zh": "圆滚滚的土拨鼠，抱着零食不撒手。Agent 工作时它就蹲在旁边啃胡萝卜，是最忠实的监工。",
-        "en": "A round little marmot who never lets go of a snack. It keeps watch beside the Agent with a carrot while work is underway."
+        "en": "A round little marmot who never lets go of a snack. While the Agent works, it sits nearby munching on a carrot—the most loyal little supervisor."
       },
       "animations": {
         "waiting": "waiting.json",
