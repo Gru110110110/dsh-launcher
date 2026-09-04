@@ -1,5 +1,5 @@
 use std::{
-    io::BufRead,
+    io::{BufRead, Read},
     net::{Ipv4Addr, TcpListener},
     sync::{
         Arc, Mutex,
@@ -161,6 +161,33 @@ impl PetBridgeEndpoint {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Query the host directly: a cached idle SSE event can predate a new turn.
+    /// Unknown or failed probes never authorize an automatic restart.
+    pub fn confirms_idle(&self) -> bool {
+        let probe = || -> AppResult<bool> {
+            let response = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .map_err(|_| AppError::new("petBridgeUnavailable"))?
+                .get(format!("http://127.0.0.1:{}/pet/state", self.port))
+                .header("x-dsh-pet-token", &self.token)
+                .send()
+                .and_then(|response| response.error_for_status())
+                .map_err(|_| AppError::new("petBridgeUnavailable"))?;
+            let mut bytes = Vec::new();
+            response
+                .take(MAX_EVENT_LINE as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_EVENT_LINE {
+                return Ok(false);
+            }
+            Ok(parse_wire_snapshot(&bytes)?.state == PetState::Idle)
+        };
+        probe().unwrap_or(false)
     }
 
     fn events_url(&self, since: u64) -> String {
@@ -516,6 +543,50 @@ fn read_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_probe_requires_current_idle_state_and_fails_closed() {
+        use std::io::Write;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = PetBridgeEndpoint::new(listener.local_addr().unwrap().port(), "test-only");
+        let worker = thread::spawn(move || {
+            for state in ["working", "thinking", "waiting", "error", "idle", "invalid"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = String::new();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                assert!(request.starts_with("GET /pet/state "));
+                assert!(request.contains("x-dsh-pet-token: test-only"));
+                let body = format!(
+                    r#"{{"version":1,"sequence":1,"state":"{state}","phase":"test","updatedAtMs":1}}"#
+                );
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        for expected in [false, false, false, false, true, false] {
+            assert_eq!(endpoint.confirms_idle(), expected);
+        }
+        worker.join().unwrap();
+        assert!(
+            !endpoint.confirms_idle(),
+            "unreachable bridge must not imply idle"
+        );
+    }
 
     #[test]
     fn parses_a_bounded_five_state_snapshot() {

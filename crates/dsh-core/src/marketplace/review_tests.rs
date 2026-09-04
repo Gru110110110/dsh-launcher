@@ -9,6 +9,407 @@ fn change(id: &str, profile: &str, action: MarketOperationKind) -> PendingMarket
     }
 }
 
+struct ActivationProbe<'a> {
+    market: &'a Marketplace,
+    calls: Vec<&'static str>,
+    fail_starts: usize,
+    fail_stop: bool,
+    defer_restart: bool,
+}
+
+impl MarketService for ActivationProbe<'_> {
+    fn defer_restart(&mut self) -> bool {
+        self.defer_restart
+    }
+
+    fn stop(&mut self) -> AppResult<()> {
+        assert!(self.market.operation_busy());
+        self.calls.push("stop");
+        if self.fail_stop {
+            Err(AppError::new("stopFailed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn start(&mut self) -> AppResult<()> {
+        assert!(
+            self.market.begin_operation().is_err(),
+            "gate must cover activation"
+        );
+        self.calls.push("start");
+        if self.calls.len() == 2 {
+            assert!(
+                self.market.last_good_profile("web").exists(),
+                "keep rollback until ready"
+            );
+        }
+        if self.fail_starts > 0 {
+            self.fail_starts -= 1;
+            Err(AppError::new("serviceNoAddress"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn staged_result(action: MarketOperationKind, profile: &str) -> MarketOperationResult {
+    MarketOperationResult {
+        ok: true,
+        action,
+        plugin_id: "owner/group".into(),
+        restart_required: true,
+        profile: Some(profile.into()),
+        error: None,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn desktop_uninstall_clears_web_and_old_receipt_copies_from_installed_filter() {
+    for (defer_restart, fail_starts) in [(false, 0), (true, 0), (false, 1)] {
+        let temp = tempfile::tempdir().unwrap();
+        let market = super::tests::fake_marketplace(temp.path());
+        market.initialize();
+        let plugin = super::tests::trading_plugin();
+        let packages = install_plan(&plugin)
+            .unwrap()
+            .packages
+            .iter()
+            .map(|name| format!("{name}@1.0.0"))
+            .collect::<Vec<_>>();
+        for profile in ["web", "trading-web"] {
+            market
+                .mutate_profile_packages(
+                    profile,
+                    "add",
+                    &packages,
+                    &change(&plugin.id, profile, MarketOperationKind::Install),
+                )
+                .unwrap();
+            fs::write(
+                market.profile_dir(profile).join("cordis.patch.yml"),
+                "# preserved\n[]\n",
+            )
+            .unwrap();
+        }
+        market
+            .mutate_profile_packages(
+                "other",
+                "add",
+                &["alpha@1.0.0".into()],
+                &change("owner/other", "other", MarketOperationKind::Install),
+            )
+            .unwrap();
+        market.clear_pending_verification().unwrap();
+        let untouched = profile_control_digest(&market.profile_dir("other")).unwrap();
+        *market.catalog.lock().unwrap() =
+            Some(Arc::new(LoadedCatalog::new(super::tests::catalog(vec![
+                plugin.clone(),
+            ]))));
+        let installed_query = MarketQuery {
+            installed: Some(true),
+            ..Default::default()
+        };
+        // Warm the same installed cache used by the marketplace filter.
+        let before = market.query(&installed_query).unwrap();
+        assert_eq!(before.total, 1);
+        let target = before.items[0].installed.as_ref().unwrap();
+        assert_eq!(target.profile.as_deref(), Some("web"));
+        let _guard = market.begin_operation().unwrap();
+        let mut service = ActivationProbe {
+            market: &market,
+            calls: vec![],
+            fail_starts,
+            fail_stop: false,
+            defer_restart,
+        };
+        let outcome =
+            market.uninstall_desktop_while_guarded(&plugin.id, Some(target), true, &mut service);
+        if fail_starts > 0 {
+            assert_eq!(outcome.unwrap_err().code, "marketUninstallIncomplete");
+            assert_eq!(
+                market.query(&installed_query).unwrap().total,
+                1,
+                "a failed web activation must still show the restored copy"
+            );
+            assert_eq!(service.calls, ["stop", "start", "stop", "start"]);
+        } else {
+            let result = outcome.unwrap();
+            assert!(result.ok);
+            assert_eq!(result.restart_required, defer_restart);
+            assert_eq!(market.query(&installed_query).unwrap().total, 0);
+            assert!(
+                market.query(&MarketQuery::default()).unwrap().items[0]
+                    .installed
+                    .is_none(),
+                "uninstall must not resurrect the old Fix card"
+            );
+            assert_eq!(
+                service.calls,
+                if defer_restart {
+                    vec![]
+                } else {
+                    vec!["stop", "start"]
+                }
+            );
+        }
+        for profile in ["web", "trading-web"] {
+            assert_eq!(
+                fs::read_to_string(market.profile_dir(profile).join("cordis.patch.yml")).unwrap(),
+                "# preserved\n[]\n"
+            );
+        }
+        assert_eq!(
+            profile_control_digest(&market.profile_dir("other")).unwrap(),
+            untouched
+        );
+        assert!(
+            read_receipts(&market.profile_dir("trading-web"))
+                .unwrap()
+                .plugins
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn active_work_defers_changes_without_stopping_or_discarding_rollback() {
+    for action in [MarketOperationKind::Install, MarketOperationKind::Uninstall] {
+        let temp = tempfile::tempdir().unwrap();
+        let market = super::tests::fake_marketplace(temp.path());
+        let _guard = market.begin_operation().unwrap();
+        market
+            .mutate_profile_packages(
+                "web",
+                "add",
+                &["alpha@1.0.0".into()],
+                &change("owner/group", "web", MarketOperationKind::Install),
+            )
+            .unwrap();
+        let result = if action == MarketOperationKind::Uninstall {
+            market
+                .clear_web_pending_verification_while_guarded()
+                .unwrap();
+            let target = market.scan_installed(None).remove(0);
+            market
+                .uninstall_while_guarded("owner/group", Some(&target), true)
+                .unwrap()
+        } else {
+            staged_result(action, "web")
+        };
+        let mut service = ActivationProbe {
+            market: &market,
+            calls: vec![],
+            fail_starts: 0,
+            fail_stop: false,
+            defer_restart: true,
+        };
+        let pending = market.pending_verification().unwrap();
+        let backup = profile_control_digest(&market.last_good_profile("web")).unwrap();
+        let result = market
+            .activate_operation_while_guarded(result, &mut service)
+            .unwrap();
+        assert!(result.ok && result.restart_required);
+        assert!(
+            service.calls.is_empty(),
+            "deferred changes must not stop, start or open"
+        );
+        assert_eq!(market.pending_verification().unwrap(), pending);
+        assert_eq!(
+            profile_control_digest(&market.last_good_profile("web")).unwrap(),
+            backup
+        );
+        // Explicit activation later still verifies the candidate and commits it.
+        service.defer_restart = false;
+        let result = market
+            .activate_operation_while_guarded(result, &mut service)
+            .unwrap();
+        assert!(!result.restart_required);
+        assert_eq!(service.calls, ["stop", "start"]);
+        assert!(market.pending_verification().unwrap().is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn one_click_web_install_and_uninstall_wait_for_activation_before_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let market = super::tests::fake_marketplace(temp.path());
+    let _guard = market.begin_operation().unwrap();
+    market
+        .mutate_profile_packages(
+            "web",
+            "add",
+            &["alpha@1.0.0".into(), "beta@1.0.0".into()],
+            &change("owner/group", "web", MarketOperationKind::Install),
+        )
+        .unwrap();
+    let mut service = ActivationProbe {
+        market: &market,
+        calls: vec![],
+        fail_starts: 0,
+        fail_stop: false,
+        defer_restart: false,
+    };
+    let result = market
+        .activate_operation_while_guarded(
+            staged_result(MarketOperationKind::Install, "web"),
+            &mut service,
+        )
+        .unwrap();
+    assert!(!result.restart_required);
+    assert_eq!(service.calls, ["stop", "start"]);
+    assert!(market.pending_verification().unwrap().is_none());
+    assert!(!market.last_good_profile("web").exists());
+    let target = market.scan_installed(None).remove(0);
+    let result = market
+        .uninstall_while_guarded("owner/group", Some(&target), true)
+        .unwrap();
+    service.calls.clear();
+    market
+        .activate_operation_while_guarded(result, &mut service)
+        .unwrap();
+    assert_eq!(service.calls, ["stop", "start"]);
+    assert!(market.scan_installed(None).is_empty());
+    assert!(market.pending_verification().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_activation_restores_install_and_uninstall_without_another_click() {
+    for action in [MarketOperationKind::Install, MarketOperationKind::Uninstall] {
+        let temp = tempfile::tempdir().unwrap();
+        let market = super::tests::fake_marketplace(temp.path());
+        market
+            .mutate_profile_packages(
+                "web",
+                "add",
+                &["alpha@1.0.0".into()],
+                &change("owner/group", "web", MarketOperationKind::Install),
+            )
+            .unwrap();
+        market.clear_pending_verification().unwrap();
+        let active = market.profile_dir("web");
+        fs::write(
+            active.join("cordis.patch.yml"),
+            "# retained user config\n[]\n",
+        )
+        .unwrap();
+        let before = profile_control_digest(&active).unwrap();
+        let _guard = market.begin_operation().unwrap();
+        let result = if action == MarketOperationKind::Install {
+            market
+                .mutate_profile_packages(
+                    "web",
+                    "add",
+                    &["beta@1.0.0".into()],
+                    &change("owner/second", "web", action),
+                )
+                .unwrap();
+            staged_result(action, "web")
+        } else {
+            let target = market.scan_installed(None).remove(0);
+            market
+                .uninstall_while_guarded("owner/group", Some(&target), true)
+                .unwrap()
+        };
+        let mut service = ActivationProbe {
+            market: &market,
+            calls: vec![],
+            fail_starts: 1,
+            fail_stop: false,
+            defer_restart: false,
+        };
+        let error = market
+            .activate_operation_while_guarded(result, &mut service)
+            .unwrap_err();
+        assert_eq!(error.code, "marketVerificationFailed");
+        assert_eq!(service.calls, ["stop", "start", "stop", "start"]);
+        assert_eq!(profile_control_digest(&active).unwrap(), before);
+        assert!(market.pending_verification().unwrap().is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_stop_retains_pending_backup_and_never_starts_or_rolls_back() {
+    let temp = tempfile::tempdir().unwrap();
+    let market = super::tests::fake_marketplace(temp.path());
+    let _guard = market.begin_operation().unwrap();
+    market
+        .mutate_profile_packages(
+            "web",
+            "add",
+            &["alpha@1.0.0".into()],
+            &change("owner/group", "web", MarketOperationKind::Install),
+        )
+        .unwrap();
+    let mut service = ActivationProbe {
+        market: &market,
+        calls: vec![],
+        fail_starts: 0,
+        fail_stop: true,
+        defer_restart: false,
+    };
+    assert!(
+        market
+            .activate_operation_while_guarded(
+                staged_result(MarketOperationKind::Install, "web"),
+                &mut service
+            )
+            .is_err()
+    );
+    assert_eq!(service.calls, ["stop"]);
+    assert!(market.pending_verification().unwrap().is_some());
+    assert!(market.last_good_profile("web").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_uninstall_retains_backup_without_starting_inactive_workloads() {
+    let temp = tempfile::tempdir().unwrap();
+    let market = super::tests::fake_marketplace(temp.path());
+    market
+        .mutate_profile_packages(
+            "custom",
+            "add",
+            &["alpha@1.0.0".into()],
+            &change("owner/group", "custom", MarketOperationKind::Install),
+        )
+        .unwrap();
+    market.clear_pending_verification().unwrap();
+    let before = profile_control_digest(&market.profile_dir("custom")).unwrap();
+    let _guard = market.begin_operation().unwrap();
+    let target = market.scan_installed(None).remove(0);
+    let result = market
+        .uninstall_while_guarded("owner/group", Some(&target), false)
+        .unwrap();
+    let mut service = ActivationProbe {
+        market: &market,
+        calls: vec![],
+        fail_starts: 0,
+        fail_stop: false,
+        defer_restart: false,
+    };
+    market
+        .activate_operation_while_guarded(result, &mut service)
+        .unwrap();
+    assert!(service.calls.is_empty());
+    assert!(market.pending_verification().unwrap().is_none());
+    let backup = fs::read_dir(market.profiles_dir())
+        .unwrap()
+        .flatten()
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".custom.market-retained-")
+        })
+        .unwrap();
+    assert_eq!(profile_control_digest(&backup.path()).unwrap(), before);
+}
+
 #[cfg(unix)]
 #[test]
 fn one_click_uninstall_removes_entire_recorded_group_even_without_catalog() {
@@ -51,16 +452,36 @@ fn one_click_uninstall_removes_entire_recorded_group_even_without_catalog() {
     );
     assert!(!active.join("node_modules/consumer").exists());
     assert!(!active.join("node_modules/provider").exists());
-    // Uninstall is itself one reversible transaction, including receipts.
-    market.rollback_pending().unwrap();
-    assert_eq!(
+    // Staging never discards rollback merely because configuration composes.
+    assert!(market.pending_verification().unwrap().is_some());
+    assert!(
         read_manifest(&active.join("package.json"))
             .unwrap()
             .dependencies
-            .len(),
-        3
+            .is_empty()
     );
-    assert_eq!(market.scan_installed(None).len(), 1);
+    assert!(market.scan_installed(None).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_composition_failure_never_publishes_the_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let market = super::tests::fake_marketplace(temp.path());
+    fs::write(market.paths.app_home.join("verify-fail"), "fail").unwrap();
+
+    let error = market
+        .mutate_profile_packages(
+            "custom",
+            "add",
+            &["alpha@1.0.0".into()],
+            &change("owner/alpha", "custom", MarketOperationKind::Install),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code, "marketProfileVerificationFailed");
+    assert!(!market.profile_dir("custom").exists());
+    assert!(market.pending_verification().unwrap().is_none());
 }
 
 #[cfg(unix)]
@@ -298,43 +719,23 @@ fn force_policy_reaches_pnpm_without_enabling_lifecycle_scripts() {
 
 #[cfg(unix)]
 #[test]
-fn custom_verification_requires_current_batch_and_never_commits_web() {
+fn composition_check_alone_never_discards_rollback() {
     let temp = tempfile::tempdir().unwrap();
     let market = super::tests::fake_marketplace(temp.path());
-    market
-        .mutate_profile_packages(
-            "custom",
-            "add",
-            &["alpha@1.0.0".into()],
-            &change("owner/one", "custom", MarketOperationKind::Install),
-        )
-        .unwrap();
-    let stale = market.pending_verification().unwrap().unwrap();
-    market
-        .mutate_profile_packages(
-            "custom",
-            "add",
-            &["beta@1.0.0".into()],
-            &change("owner/two", "custom", MarketOperationKind::Install),
-        )
-        .unwrap();
-    assert!(market.accept_custom_pending(&stale).is_err());
-    assert!(market.last_good_profile("custom").exists());
-    let current = market.pending_verification().unwrap().unwrap();
-    market.accept_custom_pending(&current).unwrap();
-    assert!(market.pending_verification().unwrap().is_none());
-    assert!(!market.last_good_profile("custom").exists());
-    market
-        .mutate_profile_packages(
-            "web",
-            "add",
-            &["alpha@1.0.0".into()],
-            &change("owner/one", "web", MarketOperationKind::Install),
-        )
-        .unwrap();
-    let current = market.pending_verification().unwrap().unwrap();
-    assert!(market.accept_custom_pending(&current).is_err());
-    assert!(market.last_good_profile("web").exists());
+    for profile in ["custom", "web"] {
+        market
+            .mutate_profile_packages(
+                profile,
+                "add",
+                &["alpha@1.0.0".into()],
+                &change("owner/one", profile, MarketOperationKind::Install),
+            )
+            .unwrap();
+        let pending = market.pending_verification().unwrap();
+        market.verify_profile_composition(profile).unwrap();
+        assert_eq!(market.pending_verification().unwrap(), pending);
+        assert!(market.last_good_profile(profile).exists());
+    }
 }
 
 /// Run via scripts/test-marketplace-real-pnpm.py, which supplies a loopback
@@ -363,9 +764,7 @@ fn real_pnpm_group_lifecycle() {
         )
         .unwrap();
     let active = market.profile_dir("custom");
-    market
-        .accept_custom_pending(&market.pending_verification().unwrap().unwrap())
-        .unwrap();
+    market.clear_pending_verification().unwrap();
     fs::write(
         active.join("cordis.patch.yml"),
         "# user configuration\n[]\n",

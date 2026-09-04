@@ -41,6 +41,8 @@ use crate::{
     paths::ApplicationPaths,
 };
 
+mod activation;
+pub use activation::MarketService;
 mod receipts;
 #[cfg(test)]
 mod review_tests;
@@ -415,6 +417,8 @@ pub struct MarketOperationResult {
     pub action: MarketOperationKind,
     pub plugin_id: String,
     pub restart_required: bool,
+    /// Exact profile changed by this operation; skills do not change one.
+    pub profile: Option<String>,
     #[serde(default)]
     pub error: Option<AppError>,
 }
@@ -957,8 +961,19 @@ impl Marketplace {
         expected_version: Option<&str>,
         service_running: bool,
     ) -> AppResult<MarketOperationResult> {
-        self.initialize();
         let _guard = self.begin_operation()?;
+        self.install_while_guarded(plugin_id, force, expected_version, service_running)
+    }
+
+    /// The caller holds the mutation gate through activation and rollback.
+    pub fn install_while_guarded(
+        &self,
+        plugin_id: &str,
+        force: bool,
+        expected_version: Option<&str>,
+        service_running: bool,
+    ) -> AppResult<MarketOperationResult> {
+        self.initialize();
         let catalog = self
             .catalog
             .lock()
@@ -984,8 +999,18 @@ impl Marketplace {
         target: Option<&InstalledPlugin>,
         service_running: bool,
     ) -> AppResult<MarketOperationResult> {
-        self.initialize();
         let _guard = self.begin_operation()?;
+        self.uninstall_while_guarded(plugin_id, target, service_running)
+    }
+
+    /// The caller holds the mutation gate through activation and rollback.
+    pub fn uninstall_while_guarded(
+        &self,
+        plugin_id: &str,
+        target: Option<&InstalledPlugin>,
+        service_running: bool,
+    ) -> AppResult<MarketOperationResult> {
+        self.initialize();
         let catalog = self.catalog.lock().expect("catalog poisoned").clone();
         let installed = self.scan_installed(catalog.as_ref().map(|catalog| &catalog.file));
         let matched: Vec<InstalledPlugin> = installed
@@ -1053,6 +1078,7 @@ impl Marketplace {
             plugin_id: plugin_id.into(),
             restart_required: service_running
                 && changed_profile.as_deref() == Some(DEFAULT_PROFILE),
+            profile: changed_profile,
             error: None,
         })
     }
@@ -1225,25 +1251,6 @@ impl Marketplace {
             }
         }
         Ok(())
-    }
-
-    /// Custom profiles are verified by the user after running their own CLI.
-    /// Bind this irreversible backup cleanup to the exact reviewed batch.
-    pub fn accept_custom_pending(&self, expected: &PendingVerification) -> AppResult<()> {
-        let _guard = self.begin_operation()?;
-        self.recover_all_profile_transactions()?;
-        if self.pending_verification()?.as_ref() != Some(expected)
-            || expected.changes.is_empty()
-            || expected.changes.iter().any(|change| {
-                change
-                    .profile
-                    .as_deref()
-                    .is_none_or(|profile| profile == DEFAULT_PROFILE)
-            })
-        {
-            return Err(AppError::new("marketProfileChanged"));
-        }
-        self.clear_pending_verification_while_guarded()
     }
 
     pub fn clear_pending_verification(&self) -> AppResult<()> {
@@ -1424,7 +1431,7 @@ impl Marketplace {
                     .map(|plan| plan.packages.join(" "))
                     .unwrap_or_default(),
             },
-            install_profile: install_plan(plugin)
+            install_profile: desktop_install_plan(plugin)
                 .filter(|_| kind == PluginKind::CordisPlugin)
                 .map(|plan| plan.profile),
             install_packages: {
@@ -1647,7 +1654,8 @@ impl Marketplace {
             verified.package_version.as_deref(),
         )?;
         validate_install_metadata(&plugin.name, force, &verified)?;
-        let plan = install_plan(plugin).ok_or_else(|| AppError::new("marketCatalogInvalid"))?;
+        let plan =
+            desktop_install_plan(plugin).ok_or_else(|| AppError::new("marketCatalogInvalid"))?;
         let install_specs = verified.resolved_packages;
         let install_spec = install_specs.join(" ");
         self.require_runtime()?;
@@ -1678,6 +1686,7 @@ impl Marketplace {
             action: MarketOperationKind::Install,
             plugin_id: plugin.id.clone(),
             restart_required: service_running && plan.profile == DEFAULT_PROFILE,
+            profile: Some(plan.profile),
             error: None,
         })
     }
@@ -1751,6 +1760,7 @@ impl Marketplace {
             action: MarketOperationKind::Install,
             plugin_id: plugin.id.clone(),
             restart_required: false,
+            profile: None,
             error: None,
         })
     }
@@ -2005,6 +2015,7 @@ impl Marketplace {
                         }
                     }
                 }
+                self.verify_profile_composition(&candidate_name)?;
                 Ok(())
             });
         if let Err(error) = outcome {
@@ -2082,6 +2093,29 @@ impl Marketplace {
             // Publication succeeded; cleanup is retried from the durable
             // transaction record before the next mutation/startup.
             log::warn!("marketplace publication cleanup pending: {error}");
+        }
+        Ok(())
+    }
+
+    /// Compose every profile layer through the pinned Harness runtime without
+    /// booting plugin services. This validates the disposable candidate before
+    /// its directory is published as the active profile.
+    fn verify_profile_composition(&self, profile: &str) -> AppResult<()> {
+        self.require_runtime()?;
+        let mut command = new_command(&self.paths.node_bin);
+        command
+            .arg(&self.paths.dsh_bin)
+            .arg("--profile")
+            .arg(profile)
+            .arg("--dump-config")
+            .current_dir(&self.paths.app_home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        market_command_env(&mut command, &self.paths, &[]);
+        let (success, _output) = run_child(command, INSTALL_TIMEOUT)?;
+        if !success {
+            return Err(AppError::new("marketProfileVerificationFailed").value("profile", profile));
         }
         Ok(())
     }
@@ -2866,26 +2900,36 @@ impl InstalledIndex {
         {
             return Some(skill);
         }
-        if let Some(group) = entries.iter().find(|entry| entry.grouped) {
+        // Prefer the managed Web installation regardless of read_dir order.
+        if let Some(group) = entries
+            .iter()
+            .find(|entry| entry.grouped && entry.profile.as_deref() == Some(DEFAULT_PROFILE))
+        {
             return Some(group);
         }
-        let plan = install_plan(plugin)?;
+        let Some(plan) = install_plan(plugin) else {
+            // Receipt-backed legacy uninstall remains available even when a
+            // newer catalog no longer contains a supported install recipe.
+            return entries.iter().find(|entry| entry.grouped);
+        };
         let packages = plan.packages.iter().filter(|p| {
             !matches!(
                 p.as_str(),
                 "@deepseek-ai/dsh-base" | "@deepseek-ai/dsh-web-app" | "@deepseek-ai/dsh-headless"
             ) || package_matches_plugin_identity(plugin, p)
         });
-        if !packages.clone().all(|package| {
-            entries.iter().any(|entry| {
-                entry.local_name == *package && entry.profile.as_deref() == Some(&plan.profile)
-            })
-        }) {
-            return None;
+        for profile in [DEFAULT_PROFILE, plan.profile.as_str()] {
+            if packages.clone().all(|package| {
+                entries.iter().any(|entry| {
+                    entry.local_name == *package && entry.profile.as_deref() == Some(profile)
+                })
+            }) {
+                return entries
+                    .iter()
+                    .find(|entry| entry.profile.as_deref() == Some(profile));
+            }
         }
-        entries
-            .iter()
-            .find(|entry| entry.profile.as_deref() == Some(&plan.profile))
+        entries.iter().find(|entry| entry.grouped)
     }
 
     fn build(installed: Vec<InstalledPlugin>) -> Self {
@@ -2977,6 +3021,17 @@ fn sort_plugins(plugins: &mut [&MarketPlugin], sort: MarketSort) {
 struct InstallPlan {
     profile: String,
     packages: Vec<String>,
+}
+
+/// README profiles describe standalone CLI examples. Desktop installs target
+/// the Web composition actually served by the launcher, preserving the entire
+/// chosen package group and letting composition/startup reject incompatibility.
+/// Existing custom profiles are never moved, rewritten, or silently imported.
+fn desktop_install_plan(plugin: &MarketPlugin) -> Option<InstallPlan> {
+    install_plan(plugin).map(|mut plan| {
+        plan.profile = DEFAULT_PROFILE.into();
+        plan
+    })
 }
 
 impl InstallPlan {
@@ -5049,7 +5104,7 @@ fn extract_tarball(bytes: &[u8], dest: &Path) -> AppResult<()> {
 mod tests {
     use super::*;
 
-    fn catalog(plugins: Vec<MarketPlugin>) -> MarketCatalogFile {
+    pub(super) fn catalog(plugins: Vec<MarketPlugin>) -> MarketCatalogFile {
         MarketCatalogFile {
             schema_version: 1,
             generated_at: Some("2026-01-01T00:00:00Z".into()),
@@ -5154,7 +5209,7 @@ mod tests {
         assert_eq!(plugins[0].name, "alpha");
     }
 
-    fn trading_plugin() -> MarketPlugin {
+    pub(super) fn trading_plugin() -> MarketPlugin {
         let mut item = plugin("zhu1090093659/dsh-trading", "dsh-trading", 0, None);
         item.install = Some(MarketInstallInfo {
             method: Some("pnpm-profile".into()),
@@ -5171,6 +5226,9 @@ mod tests {
     fn install_plan_keeps_all_packages_and_profile_without_combining_alternatives() {
         let plan = install_plan(&trading_plugin()).expect("plan");
         assert_eq!(plan.profile, "trading-web");
+        let desktop = desktop_install_plan(&trading_plugin()).unwrap();
+        assert_eq!(desktop.profile, "web");
+        assert_eq!(desktop.packages, plan.packages);
         assert_eq!(
             plan.packages,
             ["@dshtrading/base", "@dshtrading/crypto", "@dshtrading/us"]
@@ -5365,7 +5423,16 @@ if (root / 'fail').exists(): sys.exit(7)
         let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.join("home")));
         fs::create_dir_all(marketplace.paths.node_bin.parent().unwrap()).unwrap();
         fs::create_dir_all(marketplace.paths.dsh_bin.parent().unwrap()).unwrap();
-        fs::write(&marketplace.paths.node_bin, "fake node").unwrap();
+        fs::write(
+            &marketplace.paths.node_bin,
+            "#!/bin/sh\n# Isolated Harness composition probe used by marketplace tests.\n[ -e \"$HOME/verify-fail\" ] && exit 9\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            &marketplace.paths.node_bin,
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         fs::write(&marketplace.paths.dsh_bin, "fake harness").unwrap();
         *marketplace.pnpm_bin.lock().unwrap() = Some(bin);
         marketplace
@@ -5474,7 +5541,7 @@ if (root / 'fail').exists(): sys.exit(7)
     }
 
     #[test]
-    fn partial_or_other_profile_install_does_not_mark_multi_package_plan_complete() {
+    fn full_web_install_is_recognized_but_split_or_partial_groups_are_not() {
         let plugin = trading_plugin();
         let plan = install_plan(&plugin).unwrap();
         let mut entries = plan
@@ -5491,6 +5558,12 @@ if (root / 'fail').exists(): sys.exit(7)
                 profile: Some("web".into()),
             })
             .collect::<Vec<_>>();
+        assert!(
+            InstalledIndex::build(entries.clone())
+                .for_plugin(&plugin)
+                .is_some()
+        );
+        entries[0].profile = Some(plan.profile.clone());
         assert!(
             InstalledIndex::build(entries.clone())
                 .for_plugin(&plugin)

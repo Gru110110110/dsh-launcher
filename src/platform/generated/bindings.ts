@@ -299,6 +299,10 @@ export type MarketOperationResult = {
   action: MarketOperationKind;
   pluginId: string;
   restartRequired: boolean;
+  /**
+   * Exact profile changed by this operation; skills do not change one.
+   */
+  profile: string | null;
   error: LauncherError | null;
 };
 

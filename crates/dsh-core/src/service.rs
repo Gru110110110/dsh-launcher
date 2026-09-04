@@ -33,7 +33,7 @@ use crate::{
     child_process::{configure_process_group, new_command},
     log_file::{BoundedLog, SERVER_LOG_MAX_BYTES},
     paths::atomic_write,
-    pet::{PetListener, PetService, PetSnapshot},
+    pet::{PetBridgeEndpoint, PetListener, PetService, PetSnapshot},
     process_recovery::recover_owned_services,
     runtime::terminate_tree,
 };
@@ -54,6 +54,7 @@ pub struct ServerManager {
     guard_stdin: Option<ChildStdin>,
     balance_endpoint: Option<BalanceBridgeEndpoint>,
     pet: PetService,
+    pet_endpoint: Option<PetBridgeEndpoint>,
     #[cfg(unix)]
     shutdown_pid: Option<u32>,
     #[cfg(windows)]
@@ -70,6 +71,7 @@ impl ServerManager {
             guard_stdin: None,
             balance_endpoint: None,
             pet: PetService::default(),
+            pet_endpoint: None,
             #[cfg(unix)]
             shutdown_pid: None,
             #[cfg(windows)]
@@ -93,6 +95,14 @@ impl ServerManager {
         self.pet.snapshot()
     }
 
+    pub fn can_restart_automatically(&mut self) -> bool {
+        !self.is_running()
+            || self
+                .pet_endpoint
+                .as_ref()
+                .is_some_and(PetBridgeEndpoint::confirms_idle)
+    }
+
     pub fn is_running(&mut self) -> bool {
         self.child
             .as_mut()
@@ -101,6 +111,35 @@ impl ServerManager {
 
     pub fn start(&mut self) -> AppResult<String> {
         self.start_cancellable(|| false)
+    }
+
+    /// Marketplace publication needs a responding Web document, not merely
+    /// a printed address. Only follow same-origin bootstrap redirects and never
+    /// send this loopback probe through a configured system proxy.
+    pub fn verify_web_ready(&mut self, url: &str, cancelled: impl Fn() -> bool) -> AppResult<()> {
+        if parse_web_url(&format!("dsh web: {url}")).is_none() {
+            return Err(AppError::new("serviceNoAddress"));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|_| AppError::new("serviceNoAddress"))?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if cancelled() {
+                return Err(AppError::new("deploymentCancelled"));
+            }
+            if !self.is_running() {
+                break;
+            }
+            if web_document_ready(&client, url) && self.is_running() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        Err(AppError::new("serviceNoAddress"))
     }
 
     pub fn start_cancellable(&mut self, cancelled: impl Fn() -> bool) -> AppResult<String> {
@@ -180,6 +219,7 @@ impl ServerManager {
 
     fn activate_bridges(&mut self, plan: &BalanceLaunchPlan) {
         self.balance_endpoint = plan.endpoint.clone();
+        self.pet_endpoint = plan.pet_endpoint.clone();
         self.pet.start(plan.pet_endpoint.clone());
     }
 
@@ -434,6 +474,7 @@ impl ServerManager {
         }
         self.web_url = None;
         self.balance_endpoint = None;
+        self.pet_endpoint = None;
         Ok(())
     }
 
@@ -781,6 +822,65 @@ fn capture(
     }
 }
 
+fn web_document_ready(client: &reqwest::blocking::Client, url: &str) -> bool {
+    let Ok(mut current) = url::Url::parse(url) else {
+        return false;
+    };
+    let origin = current.origin();
+    let mut cookies = std::collections::BTreeMap::new();
+    // Harness exchanges the printed ?token URL for a session cookie and a
+    // redirect to /. Keep only this probe's cookies in memory; no browser or
+    // user credential store is read or written, and no cross-origin redirect
+    // may receive the bootstrap token or cookies.
+    for _ in 0..4 {
+        let cookie = cookies
+            .values()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join("; ");
+        let mut request = client.get(current.clone());
+        if !cookie.is_empty() {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+        let Ok(response) = request.send() else {
+            return false;
+        };
+        if response.status().is_redirection() {
+            let Some(next) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| current.join(value).ok())
+            else {
+                return false;
+            };
+            if next.origin() != origin {
+                return false;
+            }
+            for header in response.headers().get_all(reqwest::header::SET_COOKIE) {
+                if let Ok(value) = header.to_str()
+                    && let Some(pair) = value.split(';').next()
+                    && let Some((name, _)) = pair.split_once('=')
+                {
+                    cookies.insert(name.to_owned(), pair.to_owned());
+                }
+            }
+            current = next;
+            continue;
+        }
+        if !response.status().is_success() {
+            return false;
+        }
+        let mut body = String::new();
+        return response
+            .take(2 * 1024 * 1024)
+            .read_to_string(&mut body)
+            .is_ok()
+            && body.to_ascii_lowercase().contains("<html");
+    }
+    false
+}
+
 fn parse_web_url(line: &str) -> Option<String> {
     let candidate = line
         .trim()
@@ -1078,6 +1178,90 @@ mod tests {
         assert!(!wait_for_port_release(&url, Duration::from_millis(20)));
         drop(listener);
         assert!(wait_for_port_release(&url, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn marketplace_readiness_requires_html_and_refuses_cross_origin_redirects() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for (status, body) in [
+                ("500 Internal Server Error", "<html>failure</html>"),
+                ("200 OK", "still compiling"),
+                ("302 Found", "<html>redirect</html>"),
+                ("200 OK", "<!doctype html><html>Harness</html>"),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0; 2048];
+                let count = socket.read(&mut request).unwrap();
+                assert!(count > 0);
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nLocation: http://example.invalid/elsewhere\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(!web_document_ready(&client, &url));
+        assert!(!web_document_ready(&client, &url));
+        assert!(!web_document_ready(&client, &url));
+        assert!(web_document_ready(&client, &url));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn marketplace_readiness_exchanges_bootstrap_token_for_an_in_memory_cookie() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("http://{}/?token=fixture", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for authenticated in [false, true] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                if authenticated {
+                    assert!(
+                        request
+                            .to_lowercase()
+                            .contains("cookie: fixture-session=verified")
+                    );
+                    let body = "<html>Harness</html>";
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                } else {
+                    assert!(request.contains("/?token=fixture"));
+                    socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: fixture-session=verified; HttpOnly; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(web_document_ready(&client, &url));
+        server.join().unwrap();
     }
 
     #[cfg(unix)]

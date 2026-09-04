@@ -130,6 +130,16 @@ export const SORT_OPTIONS: readonly SortOption[] = [
   { value: "name", labelKey: "market.sort.name" },
 ];
 
+export function needsHarnessInstall(
+  plugin: Pick<PluginSummary, "kind" | "installed">,
+): boolean {
+  return (
+    plugin.kind === "cordisPlugin" &&
+    plugin.installed?.source === "profile" &&
+    plugin.installed.profile !== "web"
+  );
+}
+
 type KindFilter = "" | PluginKind;
 
 type KindOption = { value: KindFilter; labelKey: string };

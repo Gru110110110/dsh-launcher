@@ -36,6 +36,7 @@ import {
   installedFilterValue,
   isForceableInstallError,
   installReviewState,
+  needsHarnessInstall,
   isMarketCatalogUnavailable,
   isRetryableMarketRefreshError,
   marketCatalogView,
@@ -46,7 +47,6 @@ import {
   type InstalledFilter,
 } from "../presentation";
 import { ConfirmInstallDialog } from "./ConfirmInstallDialog";
-import { ConfirmUninstallDialog } from "./ConfirmUninstallDialog";
 
 const SEARCH_DEBOUNCE_MS = 300;
 
@@ -69,6 +69,7 @@ function PluginCard({
   const description =
     language === "zh" ? plugin.descriptionZh : plugin.description;
   const installed = plugin.installed !== null;
+  const needsActivation = needsHarnessInstall(plugin);
 
   return (
     <article className="market-card panel">
@@ -88,7 +89,11 @@ function PluginCard({
           {installed && (
             <span className="market-installed-badge">
               <Check size={12} aria-hidden />
-              {t("market.card.installed")}
+              {t(
+                needsActivation
+                  ? "market.card.installedElsewhere"
+                  : "market.card.installed",
+              )}
             </span>
           )}
         </div>
@@ -147,6 +152,19 @@ function PluginCard({
           >
             <ExternalLink size={14} />
           </button>
+          {needsActivation && (
+            <button
+              className="primary-button market-plugin-action-button"
+              type="button"
+              disabled={disabled}
+              onClick={() => {
+                onInstall(plugin);
+              }}
+            >
+              {busy && <LoaderCircle size={14} className="spin" />}
+              {t("market.card.installToHarness")}
+            </button>
+          )}
           {installed ? (
             <button
               className="outline-button danger market-plugin-action-button"
@@ -209,10 +227,6 @@ export function MarketplacePage() {
     plugin: PluginSummary;
     detail?: string;
     force: boolean;
-  } | null>(null);
-  const [uninstallConfirm, setUninstallConfirm] = useState<{
-    plugin: PluginSummary;
-    target: InstalledPlugin;
   } | null>(null);
   const dataToken = useRef(0);
   const compatToken = useRef(0);
@@ -561,15 +575,18 @@ export function MarketplacePage() {
     marketApi
       .inspect(plugin.id)
       .then((inspected) => {
+        if (installReviewState(inspected) === "normal") {
+          install(inspected);
+          return;
+        }
         setConflict({
           plugin: inspected,
           force: installReviewState(inspected) === "warning",
         });
+        setBusyPlugin(null);
       })
       .catch((error: unknown) => {
         showTimedError(error, translate);
-      })
-      .finally(() => {
         setBusyPlugin(null);
       });
   }
@@ -596,34 +613,18 @@ export function MarketplacePage() {
           return;
         }
         runPendingQuery();
-        if (result.restartRequired) {
-          toast.success(
-            t("market.toast.installedRestartRequired", {
-              plugin: plugin.name,
-            }),
-            {
-              id: `market-installed-${plugin.id}`,
-              duration: 12_000,
-              action: {
-                label: t("market.restartRequired.restart"),
-                onClick: () => {
-                  void launcherApi.restart().catch((error: unknown) => {
-                    showTimedError(error, translate);
-                  });
-                },
-              },
-            },
-          );
-        } else {
-          toast.success(
-            t(
-              plugin.kind === "skill"
+        if (result.error) showTimedError(result.error, translate);
+        toast.success(
+          t(
+            result.restartRequired
+              ? "market.toast.installedRestartRequired"
+              : plugin.kind === "skill"
                 ? "market.toast.installedSkill"
                 : "market.toast.installed",
-            ),
-            { id: `market-installed-${plugin.id}` },
-          );
-        }
+            { plugin: plugin.name },
+          ),
+          { id: `market-installed-${plugin.id}` },
+        );
         // Re-query to refresh installed badges.
         const query = buildQuery(pageNumber);
         runQuery(query);
@@ -637,6 +638,8 @@ export function MarketplacePage() {
       })
       .finally(() => {
         setBusyPlugin(null);
+        runPendingQuery();
+        runQuery(buildQuery(pageNumber));
       });
   }
 
@@ -649,24 +652,18 @@ export function MarketplacePage() {
           showTimedError(result.error, translate);
           return;
         }
-        toast.success(t("market.toast.uninstalled"), {
-          id: `market-uninstalled-${pluginId}`,
-        });
+        if (result.error) showTimedError(result.error, translate);
+        toast.success(
+          t(
+            result.restartRequired
+              ? "market.toast.uninstalledRestartRequired"
+              : "market.toast.uninstalled",
+          ),
+          {
+            id: `market-uninstalled-${pluginId}`,
+          },
+        );
         runPendingQuery();
-        if (result.restartRequired) {
-          toast(t("market.restartRequired.detail"), {
-            id: `market-restart-${pluginId}`,
-            duration: 12_000,
-            action: {
-              label: t("market.restartRequired.restart"),
-              onClick: () => {
-                void launcherApi.restart().catch((error: unknown) => {
-                  showTimedError(error, translate);
-                });
-              },
-            },
-          });
-        }
         const query = buildQuery(pageNumber);
         runQuery(query);
       })
@@ -675,6 +672,8 @@ export function MarketplacePage() {
       })
       .finally(() => {
         setBusyPlugin(null);
+        runPendingQuery();
+        runQuery(buildQuery(pageNumber));
       });
   }
 
@@ -711,6 +710,35 @@ export function MarketplacePage() {
         <h1>{t("market.title")}</h1>
         <p>{t("market.subtitle")}</p>
       </header>
+
+      {pending &&
+        launcher.phase === "ready" &&
+        pending.changes.some((change) => change.profile === "web") && (
+          <div className="market-pending panel" role="status">
+            <TriangleAlert size={16} aria-hidden />
+            <span>{t("market.restartRequired.detail")}</span>
+            <button
+              className="outline-button"
+              type="button"
+              disabled={busyPlugin !== null || launcher.marketBusy}
+              onClick={() => {
+                setBusyPlugin(pending.pluginId);
+                void launcherApi
+                  .restart()
+                  .catch((error: unknown) => {
+                    showTimedError(error, translate);
+                  })
+                  .finally(() => {
+                    setBusyPlugin(null);
+                    runPendingQuery();
+                    runQuery(buildQuery(pageNumber));
+                  });
+              }}
+            >
+              {t("market.restartRequired.restart")}
+            </button>
+          </div>
+        )}
 
       {pending &&
         (launcher.phase === "failed" ||
@@ -763,33 +791,6 @@ export function MarketplacePage() {
             >
               {t("market.pending.rollback")}
             </button>
-            {pending.changes.length > 0 &&
-              pending.changes.every(
-                (change) => change.profile && change.profile !== "web",
-              ) && (
-                <button
-                  className="outline-button"
-                  type="button"
-                  disabled={busyPlugin !== null || launcher.marketBusy}
-                  onClick={() => {
-                    setBusyPlugin(pending.pluginId);
-                    void marketApi
-                      .acceptCustomPending(pending)
-                      .then(() => {
-                        setPending(null);
-                      })
-                      .catch((error: unknown) => {
-                        showTimedError(error, translate);
-                        runPendingQuery();
-                      })
-                      .finally(() => {
-                        setBusyPlugin(null);
-                      });
-                  }}
-                >
-                  {t("market.pending.acceptCustom")}
-                </button>
-              )}
           </div>
         )}
 
@@ -915,10 +916,7 @@ export function MarketplacePage() {
               }}
               onUninstall={(target) => {
                 if (target.installed !== null) {
-                  setUninstallConfirm({
-                    plugin: target,
-                    target: target.installed,
-                  });
+                  uninstallPlugin(target.id, target.installed);
                 }
               }}
             />
@@ -1020,21 +1018,6 @@ export function MarketplacePage() {
             const { plugin, force } = conflict;
             setConflict(null);
             install(plugin, force);
-          }}
-        />
-      )}
-      {uninstallConfirm !== null && (
-        <ConfirmUninstallDialog
-          plugin={uninstallConfirm.plugin}
-          target={uninstallConfirm.target}
-          disabled={launcher.marketBusy || busyPlugin !== null}
-          onCancel={() => {
-            setUninstallConfirm(null);
-          }}
-          onConfirm={() => {
-            const { plugin, target } = uninstallConfirm;
-            setUninstallConfirm(null);
-            uninstallPlugin(plugin.id, target);
           }}
         />
       )}

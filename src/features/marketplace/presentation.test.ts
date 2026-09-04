@@ -6,6 +6,7 @@ import {
   formatStars,
   installedFilterValue,
   installReviewState,
+  needsHarnessInstall,
   isForceableInstallError,
   isMarketCatalogUnavailable,
   isRetryableMarketRefreshError,
@@ -15,6 +16,37 @@ import {
   pendingChangeLabels,
   shouldClearPendingVerification,
 } from "./presentation";
+
+describe("needsHarnessInstall", () => {
+  it("offers a single install action for an old standalone copy only", () => {
+    const installed = {
+      pluginId: "owner/trading",
+      localName: "trading",
+      version: "1.0.0",
+      source: "profile" as const,
+      profile: "trading-web",
+      grouped: true,
+      packages: ["base", "crypto"],
+      retainedPackages: [],
+    };
+    expect(needsHarnessInstall({ kind: "cordisPlugin", installed })).toBe(true);
+    expect(
+      needsHarnessInstall({
+        kind: "cordisPlugin",
+        installed: { ...installed, profile: "web" },
+      }),
+    ).toBe(false);
+    expect(needsHarnessInstall({ kind: "cordisPlugin", installed: null })).toBe(
+      false,
+    );
+    expect(
+      needsHarnessInstall({
+        kind: "skill",
+        installed: { ...installed, source: "skills", profile: null },
+      }),
+    ).toBe(false);
+  });
+});
 
 describe("catalogGenerationChanged", () => {
   it("keeps the refresh-start baseline when a revision event wins the race", () => {

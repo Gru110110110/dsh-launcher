@@ -353,13 +353,18 @@ pub async fn market_install(
     expected_version: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<MarketOperationResult, AppError> {
-    let running = service_running(state.inner());
     let state = Arc::clone(state.inner());
     flatten_blocking_result(
         tauri::async_runtime::spawn_blocking(move || {
-            state
-                .marketplace
-                .install(&plugin_id, force, expected_version.as_deref(), running)
+            state.run_market_operation(|market, running, service| {
+                let result = market.install_while_guarded(
+                    &plugin_id,
+                    force,
+                    expected_version.as_deref(),
+                    running,
+                )?;
+                market.activate_operation_while_guarded(result, service)
+            })
         })
         .await,
     )
@@ -371,13 +376,17 @@ pub async fn market_uninstall(
     target: Option<InstalledPlugin>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<MarketOperationResult, AppError> {
-    let running = service_running(state.inner());
     let state = Arc::clone(state.inner());
     flatten_blocking_result(
         tauri::async_runtime::spawn_blocking(move || {
-            state
-                .marketplace
-                .uninstall(&plugin_id, target.as_ref(), running)
+            state.run_market_operation(|market, running, service| {
+                market.uninstall_desktop_while_guarded(
+                    &plugin_id,
+                    target.as_ref(),
+                    running,
+                    service,
+                )
+            })
         })
         .await,
     )
@@ -388,20 +397,6 @@ pub fn market_pending_verification(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<PendingVerification>, AppError> {
     state.inner().marketplace.pending_verification()
-}
-
-#[tauri::command]
-pub async fn market_accept_custom_pending(
-    expected: PendingVerification,
-    state: State<'_, Arc<AppState>>,
-) -> Result<(), AppError> {
-    let state = Arc::clone(state.inner());
-    flatten_blocking_result(
-        tauri::async_runtime::spawn_blocking(move || {
-            state.marketplace.accept_custom_pending(&expected)
-        })
-        .await,
-    )
 }
 
 #[tauri::command]

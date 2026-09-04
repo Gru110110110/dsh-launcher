@@ -39,8 +39,6 @@ export const marketApi = {
     command<MarketOperationResult>("market_uninstall", { pluginId, target }),
   pendingVerification: () =>
     command<PendingVerification | null>("market_pending_verification"),
-  acceptCustomPending: (expected: PendingVerification) =>
-    action("market_accept_custom_pending", { expected }),
   rollbackPending: () => action("market_rollback_pending"),
   openGithub: (pluginId: string) =>
     action("market_open_plugin_github", { pluginId }),
@@ -240,7 +238,7 @@ if (!isTauri) {
   marketApi.inspect = (pluginId) => {
     const plugin = devPlugins.find((candidate) => candidate.id === pluginId);
     return plugin
-      ? delay({ ...plugin })
+      ? delay({ ...plugin, compatibility: "compatible" as const })
       : Promise.reject(new Error(`plugin not found: ${pluginId}`));
   };
   marketApi.query = devQuery;
@@ -257,31 +255,49 @@ if (!isTauri) {
           sourceBindingDetail: plugin.sourceBindingDetail,
         })),
     );
-  marketApi.installed = () => delay<InstalledPlugin[]>([]);
-  marketApi.install = (pluginId: string) =>
-    delay<MarketOperationResult>(
-      {
-        ok: true,
-        action: "install",
-        pluginId,
-        restartRequired: false,
-        error: null,
-      },
-      800,
+  marketApi.installed = () =>
+    delay<InstalledPlugin[]>(
+      devPlugins.flatMap((p) => (p.installed ? [p.installed] : [])),
     );
-  marketApi.uninstall = (pluginId: string) =>
-    delay<MarketOperationResult>(
-      {
-        ok: true,
-        action: "uninstall",
-        pluginId,
-        restartRequired: false,
-        error: null,
-      },
-      600,
-    );
+  marketApi.install = async (pluginId: string) => {
+    await delay(null, 800);
+    const plugin = devPlugins.find((p) => p.id === pluginId);
+    if (!plugin) throw new Error("Plugin not found");
+    const profile = plugin.kind === "skill" ? null : "web";
+    plugin.installed = {
+      pluginId,
+      localName: plugin.name,
+      version: "1.0.0",
+      grouped: profile !== null,
+      source: profile === null ? "skills" : "profile",
+      profile,
+      packages: [plugin.name],
+      retainedPackages: [],
+    };
+    return {
+      ok: true,
+      action: "install",
+      pluginId,
+      restartRequired: false,
+      profile,
+      error: null,
+    };
+  };
+  marketApi.uninstall = async (pluginId: string) => {
+    await delay(null, 600);
+    const plugin = devPlugins.find((p) => p.id === pluginId);
+    const profile = plugin?.installed?.profile ?? null;
+    if (plugin) plugin.installed = null;
+    return {
+      ok: true,
+      action: "uninstall",
+      pluginId,
+      restartRequired: false,
+      profile,
+      error: null,
+    };
+  };
   marketApi.pendingVerification = () => delay<PendingVerification | null>(null);
-  marketApi.acceptCustomPending = () => Promise.resolve();
   marketApi.rollbackPending = () => Promise.resolve();
   marketApi.openGithub = () => Promise.resolve();
 }

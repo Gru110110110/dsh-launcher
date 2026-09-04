@@ -16,7 +16,7 @@ use dsh_core::{
     ThemePreference,
     balance::{BalanceService, BalanceSnapshot},
     browser::BrowserCatalog,
-    marketplace::Marketplace,
+    marketplace::{MarketOperationResult, MarketService, Marketplace},
     migration::MigrationService,
     network,
     pet::{PetListener, PetPreferencesPatch, PetSnapshot},
@@ -485,6 +485,42 @@ impl AppState {
         )
     }
 
+    pub(crate) fn run_market_operation(
+        &self,
+        operation: impl FnOnce(
+            &Marketplace,
+            bool,
+            &mut dyn MarketService,
+        ) -> AppResult<MarketOperationResult>,
+    ) -> AppResult<MarketOperationResult> {
+        let _guard = self.marketplace.begin_operation()?;
+        let phase = self.snapshot().phase;
+        if self.quitting.load(Ordering::SeqCst)
+            || !matches!(
+                phase,
+                LauncherPhase::Ready | LauncherPhase::Stopped | LauncherPhase::Failed
+            )
+        {
+            return Err(AppError::new("launcherBusy"));
+        }
+        let defer_restart = self.marketplace.has_pending_web_rollback()
+            || !self
+                .server
+                .lock()
+                .expect("server poisoned")
+                .can_restart_automatically();
+        // Keep the gate through activation/restoration, or return a durable
+        // pending result without restarting a host whose work must be preserved.
+        operation(
+            &self.marketplace,
+            phase == LauncherPhase::Ready,
+            &mut MarketActivationService {
+                app: self,
+                defer_restart,
+            },
+        )
+    }
+
     pub(crate) fn stop_service(&self) -> AppResult<()> {
         let _market_guard = self.marketplace.begin_operation()?;
         if !self.mutate_if(|snapshot| {
@@ -539,7 +575,12 @@ impl AppState {
                 self.fail(error.clone());
                 return Err(error);
             }
-            server.start()
+            server.start().and_then(|url| {
+                if had_pending_market_change {
+                    server.verify_web_ready(&url, || self.quitting.load(Ordering::SeqCst))?;
+                }
+                Ok(url)
+            })
         };
         match restarted {
             Ok(url) => {
@@ -567,6 +608,10 @@ impl AppState {
                 log::error!(
                     "Harness did not publish an address with an unverified marketplace batch; rolling back: {error}"
                 );
+                if let Err(stop_error) = self.server.lock().expect("server poisoned").stop() {
+                    self.fail(stop_error.clone());
+                    return Err(stop_error);
+                }
                 if let Err(rollback_error) = self.marketplace.rollback_web_pending_while_guarded() {
                     self.fail(rollback_error.clone());
                     return Err(rollback_error);
@@ -2797,7 +2842,6 @@ pub fn run() {
             commands::market_uninstall,
             commands::market_pending_verification,
             commands::market_rollback_pending,
-            commands::market_accept_custom_pending,
             commands::market_open_plugin_github,
             commands::remote_set_master,
             commands::remote_set_lan_enabled,
@@ -2859,6 +2903,70 @@ fn handle_cli_probe() -> bool {
         return true;
     }
     false
+}
+
+struct MarketActivationService<'a> {
+    app: &'a AppState,
+    defer_restart: bool,
+}
+
+impl MarketService for MarketActivationService<'_> {
+    fn defer_restart(&mut self) -> bool {
+        self.defer_restart
+            || !self
+                .app
+                .server
+                .lock()
+                .expect("server poisoned")
+                .can_restart_automatically()
+    }
+
+    fn stop(&mut self) -> AppResult<()> {
+        if let Err(error) = self.app.server.lock().expect("server poisoned").stop() {
+            self.app.fail(error.clone());
+            return Err(error);
+        }
+        self.app.mutate(|snapshot| {
+            snapshot.phase = LauncherPhase::Starting;
+            snapshot.web_url = None;
+            snapshot.service_started_at_ms = None;
+            snapshot.activity = Some(ActivityState {
+                code: ActivityCode::StartingService,
+                values: Default::default(),
+                started_at_ms: now_ms(),
+            });
+            snapshot.error = None;
+        });
+        Ok(())
+    }
+
+    fn start(&mut self) -> AppResult<()> {
+        let outcome = {
+            let mut server = self.app.server.lock().expect("server poisoned");
+            server
+                .start_cancellable(|| self.app.quitting.load(Ordering::SeqCst))
+                .and_then(|url| {
+                    server.verify_web_ready(&url, || self.app.quitting.load(Ordering::SeqCst))?;
+                    Ok(url)
+                })
+        };
+        match outcome {
+            Ok(url) => {
+                self.app.mutate(|snapshot| {
+                    snapshot.phase = LauncherPhase::Ready;
+                    snapshot.web_url = Some(url);
+                    snapshot.service_started_at_ms = Some(now_ms());
+                    snapshot.activity = None;
+                    snapshot.error = None;
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.app.fail(error.clone());
+                Err(error)
+            }
+        }
+    }
 }
 
 /// A marketplace rollback is justified only when the managed process ran but
