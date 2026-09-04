@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "count": 1,
+  "count": 2,
   "pets": [
     {
       "id": "marmot",
@@ -41,6 +41,28 @@
           "zh": "等你回来哦……",
           "en": "I'll be here when you get back…"
         }
+      }
+    },
+    {
+      "id": "orange-cat",
+      "nickname": { "zh": "橘子", "en": "Juzi" },
+      "name": { "zh": "橘猫", "en": "Orange cat" },
+      "folder": "orange-cat",
+      "tags": [
+        { "zh": "慵懒", "en": "Lazy" },
+        { "zh": "傲娇", "en": "Aloof but affectionate" },
+        { "zh": "爱好：晒太阳踩键盘", "en": "Loves sunbathing and walking on keyboards" }
+      ],
+      "description": {
+        "zh": "十橘九胖。平时爱搭不理，一旦检测到报错就会第一时间跳上键盘凑热闹。",
+        "en": "Nine out of ten orange cats are chubby. Usually aloof, but the moment an error pops up, Juzi is first to hop onto the keyboard and join the commotion."
+      },
+      "animations": {
+        "waiting": "waiting.json",
+        "error": "error.json",
+        "working": "working.json",
+        "thinking": "thinking.json",
+        "idle": "idle.json"
       }
     }
   ]

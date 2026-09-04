@@ -24,6 +24,8 @@ Search, filter, inspect, install, and uninstall Cordis and Skill plugins from a 
 
 ### Keep a desktop pet beside your work
 
+Choose between Mochi the marmot and Juzi the orange cat.
+
 The first-class Desktop Pet page lets you choose a companion, preview its five states, and control its size, speech bubble, motion, and mouse click-through behavior. The separate transparent always-on-top pet window follows top-level Harness work in real time: idle, reasoning-only thinking, active work, waiting for you, or error. Rapid updates are coalesced and applied only between complete animation cycles, so state changes stay smooth without building a stale playback backlog. Its position and preferences persist across launches, and the tray menu can show or hide it without reopening the main window.
 
 ### Use Harness from your phone
