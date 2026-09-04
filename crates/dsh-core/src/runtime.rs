@@ -307,7 +307,9 @@ fn primary_version_query_failure(kinds: &[NetworkErrorKind]) -> Option<NetworkEr
 }
 
 pub fn verify_release_sources() -> AppResult<Vec<String>> {
-    let client = http_client()?;
+    // Release checks must not load macOS Keychain trust stores, even when
+    // invoked through an example compiled without cfg(test).
+    let client = http_client_with_native_certs(false)?;
     let mut verified = Vec::new();
     for base in NODE_BASES {
         let manifest_url = format!("{base}/v{NODE_VERSION}/SHASUMS256.txt");
@@ -2861,7 +2863,12 @@ fn acquire_lock(file: &File, controller: &DeploymentController) -> AppResult<()>
 }
 
 fn http_client() -> AppResult<Client> {
+    http_client_with_native_certs(!cfg!(test))
+}
+
+fn http_client_with_native_certs(native_certs: bool) -> AppResult<Client> {
     network::blocking_builder("dsh-desktop", &network::active())?
+        .tls_built_in_native_certs(native_certs)
         .connect_timeout(Duration::from_secs(env_seconds(
             "DSH_DESKTOP_NETWORK_TIMEOUT_SECONDS",
             10,

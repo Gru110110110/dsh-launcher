@@ -812,6 +812,13 @@ mod tests {
     fn live_tunnel_survives_logging_after_the_assigned_url() {
         use std::os::unix::fs::PermissionsExt;
 
+        struct StopOnDrop(Arc<TunnelProcess>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.stop();
+            }
+        }
+
         struct Sink {
             url: Mutex<Option<String>>,
             exits: std::sync::atomic::AtomicUsize,
@@ -829,7 +836,7 @@ mod tests {
         let binary = temp.path().join("fake-cloudflared");
         fs::write(
             &binary,
-            "#!/bin/sh\nset -e\nprintf '%s\\n' 'https://still-running.trycloudflare.com' >&2\n/bin/sleep 0.1\nprintf '%s\\n' 'post-url diagnostic' >&2\n/bin/sleep 1\n",
+            "#!/bin/sh\nset -e\nprintf '%s\\n' 'https://still-running.trycloudflare.com' >&2\nwhile [ ! -f \"$0.continue\" ]; do /bin/sleep 0.05; done\ni=0\nwhile [ \"$i\" -lt 4096 ]; do printf '%s\\n' 'post-url diagnostic' >&2; i=$((i + 1)); done\n: > \"$0.logged\"\nwhile :; do /bin/sleep 0.05; done\n",
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
@@ -839,8 +846,9 @@ mod tests {
         });
         let events = Arc::clone(&sink) as Arc<dyn TunnelEvents>;
         let process = TunnelProcess::spawn(&binary, 1, events).unwrap();
+        let _cleanup = StopOnDrop(Arc::clone(&process));
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while sink.url.lock().unwrap().is_none() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -848,7 +856,16 @@ mod tests {
             sink.url.lock().unwrap().as_deref(),
             Some("https://still-running.trycloudflare.com")
         );
-        thread::sleep(Duration::from_millis(300));
+        // Release the writer only after the URL callback. More than a pipe
+        // buffer of diagnostics must drain before the child acknowledges it;
+        // its lifetime must not depend on scheduler speed during the suite.
+        fs::write(binary.with_extension("continue"), b"").unwrap();
+        let logged = binary.with_extension("logged");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !logged.exists() && !process.has_exited() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(logged.exists(), "post-URL diagnostics did not drain");
         assert_eq!(sink.exits.load(Ordering::SeqCst), 0);
         assert!(!process.has_exited());
 
