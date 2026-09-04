@@ -206,6 +206,9 @@ export type CompatibilityInfo = {
 };
 
 export type InstalledPlugin = {
+  grouped: boolean;
+  packages: Array<string>;
+  retainedPackages: Array<string>;
   pluginId: string | null;
   localName: string;
   version: string | null;
@@ -232,6 +235,8 @@ export type PluginSummary = {
   needsConfig: boolean;
   installMethod: string;
   installTarget: string;
+  installProfile: string | null;
+  installPackages: Array<string>;
   installVersion: string | null;
   sourceBinding: SourceBindingStatus;
   sourceBindingDetail: string | null;

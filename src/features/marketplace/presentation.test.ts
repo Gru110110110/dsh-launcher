@@ -5,7 +5,8 @@ import {
   formatScore,
   formatStars,
   installedFilterValue,
-  isForceableCompatibilityError,
+  installReviewState,
+  isForceableInstallError,
   isMarketCatalogUnavailable,
   isRetryableMarketRefreshError,
   marketCatalogView,
@@ -175,20 +176,23 @@ describe("isRetryableMarketRefreshError", () => {
   });
 });
 
-describe("isForceableCompatibilityError", () => {
-  it("allows only compatibility decisions to be force-confirmed", () => {
-    expect(isForceableCompatibilityError({ code: "marketIncompatible" })).toBe(
-      true,
-    );
-    expect(isForceableCompatibilityError({ code: "marketCompatUnknown" })).toBe(
-      true,
-    );
-    expect(
-      isForceableCompatibilityError({ code: "marketSourceMismatch" }),
-    ).toBe(false);
-    expect(isForceableCompatibilityError({ code: "marketSourceUnknown" })).toBe(
-      false,
-    );
+describe("isForceableInstallError", () => {
+  it("offers explicit confirmation for source and compatibility warnings only", () => {
+    for (const code of [
+      "marketIncompatible",
+      "marketCompatUnknown",
+      "marketSourceMismatch",
+      "marketSourceUnknown",
+    ]) {
+      expect(isForceableInstallError({ code })).toBe(true);
+    }
+    for (const code of [
+      "marketNetworkFailed",
+      "marketPackageChanged",
+      "marketInstallFailed",
+    ]) {
+      expect(isForceableInstallError({ code })).toBe(false);
+    }
   });
 
   it("extracts only a non-empty safe conflict detail", () => {
@@ -253,5 +257,42 @@ describe("paginationItems", () => {
       8,
       9,
     ]);
+  });
+});
+
+describe("installReviewState", () => {
+  const plugin = {
+    kind: "cordisPlugin",
+    installVersion: "confirmed-plan",
+    sourceBinding: "verified",
+    compatibility: "compatible",
+  } as const;
+  it("opens a risk confirmation directly for missing or mismatched repository declarations", () => {
+    expect(installReviewState(plugin)).toBe("normal");
+    expect(installReviewState({ ...plugin, sourceBinding: "unknown" })).toBe(
+      "warning",
+    );
+    expect(installReviewState({ ...plugin, sourceBinding: "mismatch" })).toBe(
+      "warning",
+    );
+    expect(
+      installReviewState({ ...plugin, compatibility: "incompatible" }),
+    ).toBe("warning");
+    expect(installReviewState({ ...plugin, compatibility: "unknown" })).toBe(
+      "warning",
+    );
+  });
+  it("does not allow consent to replace missing package resolution", () => {
+    expect(
+      installReviewState({
+        ...plugin,
+        installVersion: null,
+        sourceBinding: "unknown",
+      }),
+    ).toBe("blocked");
+    expect(installReviewState({ ...plugin, sourceBinding: "notChecked" })).toBe(
+      "blocked",
+    );
+    expect(installReviewState({ ...plugin, kind: "skill" })).toBe("normal");
   });
 });

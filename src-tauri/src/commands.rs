@@ -391,10 +391,31 @@ pub fn market_pending_verification(
 }
 
 #[tauri::command]
+pub async fn market_accept_custom_pending(
+    expected: PendingVerification,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || {
+            state.marketplace.accept_custom_pending(&expected)
+        })
+        .await,
+    )
+}
+
+#[tauri::command]
 pub async fn market_rollback_pending(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
     let state = Arc::clone(state.inner());
     flatten_blocking_result(
-        tauri::async_runtime::spawn_blocking(move || state.marketplace.rollback_pending()).await,
+        tauri::async_runtime::spawn_blocking(move || {
+            let _guard = state.marketplace.begin_operation()?;
+            if service_running(&state) && state.marketplace.has_pending_web_rollback() {
+                return Err(AppError::new("marketRollbackRequiresStop"));
+            }
+            state.marketplace.rollback_pending_while_guarded()
+        })
+        .await,
     )
 }
 

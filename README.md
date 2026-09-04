@@ -18,7 +18,7 @@ The home page prepares and verifies the private Node.js/Harness runtime, starts 
 
 ### Install plugins from the marketplace
 
-Search, filter, inspect, install, and uninstall Cordis and Skill plugins from a validated marketplace snapshot. Before installation, the launcher shows the exact source, version, target, compatibility result, and execution risk; uninstall keeps a recoverable backup. If a Harness update makes an installed plugin fail during startup, the launcher retries through a reversible uninstall and tells you exactly which plugin was removed.
+Search, filter, inspect, install, and uninstall Cordis and Skill plugins from a validated marketplace snapshot. Source and compatibility warnings can be accepted explicitly to continue installing. Multi-package commands install the complete package group into the specified profile; uninstall follows that record while preserving shared packages and existing configuration. Before installation, the launcher shows the exact source, version, target, compatibility result, and execution risk; uninstall keeps a recoverable backup. If a Harness update makes an installed plugin fail during startup, the launcher retries through a reversible uninstall and tells you exactly which plugin was removed.
 
 ![DSH Launcher plugin marketplace](screenshots/ScreenShot_plugin_en.png)
 

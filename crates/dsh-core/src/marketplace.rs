@@ -41,6 +41,15 @@ use crate::{
     paths::ApplicationPaths,
 };
 
+mod receipts;
+#[cfg(test)]
+mod review_tests;
+mod transaction;
+use receipts::{
+    InstallReceipt, group_removals, package_requirements, read_receipts, write_receipts,
+};
+use transaction::{ProfileTransaction, sync_directory};
+
 const MARKET_REPOSITORY: &str = "2BingLing/dsh-market";
 const MARKET_BRANCH: &str = "master";
 /// Immutable trust anchor shipped with the desktop release. Catalog updates
@@ -245,6 +254,12 @@ pub struct CompatibilityInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledPlugin {
+    #[serde(default)]
+    pub grouped: bool,
+    #[serde(default)]
+    pub packages: Vec<String>,
+    #[serde(default)]
+    pub retained_packages: Vec<String>,
     pub plugin_id: Option<String>,
     pub local_name: String,
     #[serde(default)]
@@ -280,6 +295,8 @@ pub struct PluginSummary {
     #[serde(default)]
     pub install_method: String,
     pub install_target: String,
+    pub install_profile: Option<String>,
+    pub install_packages: Vec<String>,
     #[serde(default)]
     pub install_version: Option<String>,
     pub source_binding: SourceBindingStatus,
@@ -506,6 +523,8 @@ struct CachedCompatibility {
     info: CompatibilityInfo,
     source_binding: SourceBindingStatus,
     source_binding_detail: Option<String>,
+    #[serde(default)]
+    resolved_packages: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -811,7 +830,7 @@ impl Marketplace {
             .filter(|plugin| match query.installed {
                 None => true,
                 Some(want_installed) => {
-                    installed_index.by_plugin.contains_key(&plugin.id) == want_installed
+                    installed_index.for_plugin(plugin).is_some() == want_installed
                 }
             })
             .collect();
@@ -967,13 +986,8 @@ impl Marketplace {
     ) -> AppResult<MarketOperationResult> {
         self.initialize();
         let _guard = self.begin_operation()?;
-        let catalog = self
-            .catalog
-            .lock()
-            .expect("catalog poisoned")
-            .clone()
-            .ok_or_else(|| AppError::new("marketCatalogUnavailable"))?;
-        let installed = self.scan_installed(Some(&catalog));
+        let catalog = self.catalog.lock().expect("catalog poisoned").clone();
+        let installed = self.scan_installed(catalog.as_ref().map(|catalog| &catalog.file));
         let matched: Vec<InstalledPlugin> = installed
             .into_iter()
             .filter(|entry| {
@@ -1012,12 +1026,23 @@ impl Marketplace {
                     .profile
                     .clone()
                     .unwrap_or_else(|| DEFAULT_PROFILE.into());
-                self.remove_profile_package(
-                    &profile,
-                    &selected.local_name,
-                    plugin_id,
-                    &selected.local_name,
-                )?;
+                if selected.grouped {
+                    self.require_runtime()?;
+                    let change = PendingMarketChange {
+                        plugin_id: plugin_id.into(),
+                        name: selected.local_name.clone(),
+                        action: MarketOperationKind::Uninstall,
+                        profile: Some(profile.clone()),
+                    };
+                    self.mutate_profile_packages(&profile, "remove", &selected.packages, &change)?;
+                } else {
+                    self.remove_profile_package(
+                        &profile,
+                        &selected.local_name,
+                        plugin_id,
+                        &selected.local_name,
+                    )?;
+                }
                 Some(profile)
             }
         };
@@ -1026,7 +1051,8 @@ impl Marketplace {
             ok: true,
             action: MarketOperationKind::Uninstall,
             plugin_id: plugin_id.into(),
-            restart_required: service_running && changed_profile.is_some(),
+            restart_required: service_running
+                && changed_profile.as_deref() == Some(DEFAULT_PROFILE),
             error: None,
         })
     }
@@ -1061,7 +1087,7 @@ impl Marketplace {
                 continue;
             }
             let profile = entry.file_name().to_string_lossy().into_owned();
-            if profile.starts_with('.') || !valid_profile_dir_name(&profile) {
+            if profile != DEFAULT_PROFILE || !valid_profile_dir_name(&profile) {
                 continue;
             }
             let Ok(manifest) = read_manifest(&profile_dir.join("package.json")) else {
@@ -1109,13 +1135,14 @@ impl Marketplace {
         self.pending_file().exists()
     }
 
-    pub fn pending_change_summary(&self) -> String {
+    pub fn pending_web_change_summary(&self) -> String {
         let Ok(Some(pending)) = self.pending_verification() else {
             return String::new();
         };
         let mut names = pending
             .changes
             .iter()
+            .filter(|change| change.profile.as_deref() == Some(DEFAULT_PROFILE))
             .map(|change| {
                 if change.plugin_id.is_empty() {
                     change.profile.as_deref().unwrap_or(&change.name)
@@ -1130,12 +1157,102 @@ impl Marketplace {
         names.join(", ")
     }
 
+    pub fn has_pending_web_rollback(&self) -> bool {
+        self.last_good_profile(DEFAULT_PROFILE).exists()
+            || self
+                .pending_verification()
+                .ok()
+                .flatten()
+                .is_some_and(|pending| {
+                    pending
+                        .changes
+                        .iter()
+                        .any(|change| change.profile.as_deref() == Some(DEFAULT_PROFILE))
+                })
+    }
+
+    pub fn clear_web_pending_verification_while_guarded(&self) -> AppResult<()> {
+        self.recover_profile_transaction(DEFAULT_PROFILE)?;
+        let backup = self.last_good_profile(DEFAULT_PROFILE);
+        if backup.exists() {
+            fs::rename(
+                &backup,
+                self.profile_dir(&format!(".web.market-verified-{}", process_timestamp())),
+            )?;
+            sync_directory(&self.profiles_dir())?;
+        }
+        self.remove_pending_profile(DEFAULT_PROFILE)?;
+        self.finish_web_verified_cleanup()
+    }
+
+    pub fn rollback_web_pending_while_guarded(&self) -> AppResult<()> {
+        self.recover_profile_transaction(DEFAULT_PROFILE)?;
+        self.rollback_profile(DEFAULT_PROFILE)?;
+        self.remove_pending_profile(DEFAULT_PROFILE)?;
+        self.invalidate_installed_cache();
+        Ok(())
+    }
+
+    fn remove_pending_profile(&self, profile: &str) -> AppResult<()> {
+        let Some(mut pending) = self.pending_verification()? else {
+            return Ok(());
+        };
+        pending
+            .changes
+            .retain(|change| change.profile.as_deref() != Some(profile));
+        if pending.changes.is_empty() {
+            return remove_file_if_exists(&self.pending_file());
+        }
+        if let Some(last) = pending.changes.last() {
+            pending.name.clone_from(&last.name);
+            pending.plugin_id.clone_from(&last.plugin_id);
+        }
+        crate::paths::atomic_write(&self.pending_file(), &serde_json::to_vec(&pending)?)
+    }
+
+    fn finish_web_verified_cleanup(&self) -> AppResult<()> {
+        let Ok(entries) = fs::read_dir(self.profiles_dir()) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".web.market-verified-")
+            {
+                self.remove_pending_profile(DEFAULT_PROFILE)?;
+                fs::remove_dir_all(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Custom profiles are verified by the user after running their own CLI.
+    /// Bind this irreversible backup cleanup to the exact reviewed batch.
+    pub fn accept_custom_pending(&self, expected: &PendingVerification) -> AppResult<()> {
+        let _guard = self.begin_operation()?;
+        self.recover_all_profile_transactions()?;
+        if self.pending_verification()?.as_ref() != Some(expected)
+            || expected.changes.is_empty()
+            || expected.changes.iter().any(|change| {
+                change
+                    .profile
+                    .as_deref()
+                    .is_none_or(|profile| profile == DEFAULT_PROFILE)
+            })
+        {
+            return Err(AppError::new("marketProfileChanged"));
+        }
+        self.clear_pending_verification_while_guarded()
+    }
+
     pub fn clear_pending_verification(&self) -> AppResult<()> {
         let _guard = self.begin_operation()?;
         self.clear_pending_verification_while_guarded()
     }
 
     pub fn clear_pending_verification_while_guarded(&self) -> AppResult<()> {
+        self.recover_all_profile_transactions()?;
         let pending = self.pending_file();
         if !pending.exists() {
             return self.finish_verified_cleanups();
@@ -1162,6 +1279,7 @@ impl Marketplace {
     }
 
     pub fn rollback_pending_while_guarded(&self) -> AppResult<()> {
+        self.recover_all_profile_transactions()?;
         let profiles = self.pending_profiles()?;
         for profile in profiles {
             self.rollback_profile(&profile)?;
@@ -1184,6 +1302,10 @@ impl Marketplace {
         if target.exists() {
             fs::rename(&target, &rejected)
                 .map_err(|error| AppError::io("marketRollbackFailed", &error))?;
+        }
+        if represents_absent_profile(&last_good) {
+            fs::remove_dir_all(&last_good)?;
+            return Ok(());
         }
         if let Err(error) = fs::rename(&last_good, &target) {
             if rejected.exists() {
@@ -1298,7 +1420,35 @@ impl Marketplace {
                 .unwrap_or_default(),
             install_target: match kind {
                 PluginKind::Skill => plugin.id.clone(),
-                PluginKind::CordisPlugin => install_package_name(plugin).unwrap_or_default(),
+                PluginKind::CordisPlugin => install_plan(plugin)
+                    .map(|plan| plan.packages.join(" "))
+                    .unwrap_or_default(),
+            },
+            install_profile: install_plan(plugin)
+                .filter(|_| kind == PluginKind::CordisPlugin)
+                .map(|plan| plan.profile),
+            install_packages: {
+                let cache = self.compat_cache.lock().expect("compat poisoned");
+                let resolved = cache
+                    .get(&plugin.id)
+                    .map(|entry| entry.resolved_packages.as_slice())
+                    .unwrap_or_default();
+                install_plan(plugin)
+                    .map(|plan| {
+                        plan.packages
+                            .into_iter()
+                            .map(|package| {
+                                resolved
+                                    .iter()
+                                    .find(|spec| {
+                                        normalize_package_spec(spec).as_deref() == Some(&package)
+                                    })
+                                    .cloned()
+                                    .unwrap_or(package)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
             },
             install_version: compatibility.install_version,
             source_binding: compatibility.source_binding,
@@ -1307,7 +1457,7 @@ impl Marketplace {
             score_explanation: plugin.score.as_ref().and_then(|s| s.explanation.clone()),
             compatibility: compatibility.compatibility,
             compatibility_detail: compatibility.compatibility_detail,
-            installed: installed_index.by_plugin.get(&plugin.id).cloned(),
+            installed: installed_index.for_plugin(plugin).cloned(),
         }
     }
 
@@ -1368,7 +1518,9 @@ impl Marketplace {
     }
 
     fn check_compatibility(&self, plugin: &MarketPlugin) -> CompatibilityInfo {
-        let package_name = install_package_name(plugin).unwrap_or_default();
+        let package_name = install_plan(plugin)
+            .map(|plan| plan.cache_key())
+            .unwrap_or_default();
         let cordis_version = installed_cordis_version(&self.paths);
         let now = now_ms();
         {
@@ -1413,7 +1565,9 @@ impl Marketplace {
                         && !cache.get(&plugin.id).is_some_and(|cached| {
                             cached_compatibility_is_valid(
                                 cached,
-                                &install_package_name(plugin).unwrap_or_default(),
+                                &install_plan(plugin)
+                                    .map(|plan| plan.cache_key())
+                                    .unwrap_or_default(),
                                 None,
                                 cordis_version.as_deref(),
                                 now,
@@ -1484,32 +1638,32 @@ impl Marketplace {
         // binds the compatibility decision, repository identity and exact
         // package version to the artifact that pnpm will install.
         let verified = self.refresh_compatibility(plugin);
+        if force && expected_version.is_none() {
+            return Err(AppError::new("marketPackageChanged").value("plugin", &plugin.name));
+        }
         validate_expected_package_version(
             &plugin.name,
             expected_version,
             verified.package_version.as_deref(),
         )?;
         validate_install_metadata(&plugin.name, force, &verified)?;
-        let pkg = install_package_name(plugin).ok_or_else(|| {
-            AppError::new("marketInstallFailed")
-                .value("plugin", &plugin.name)
-                .detail("catalog does not contain a valid npm package target")
-        })?;
-        let install_spec = verified
-            .package_version
-            .as_ref()
-            .map(|version| format!("{pkg}@{version}"))
-            .unwrap_or_else(|| pkg.clone());
+        let plan = install_plan(plugin).ok_or_else(|| AppError::new("marketCatalogInvalid"))?;
+        let install_specs = verified.resolved_packages;
+        let install_spec = install_specs.join(" ");
         self.require_runtime()?;
         let pending_change = PendingMarketChange {
             plugin_id: plugin.id.clone(),
             name: plugin.name.clone(),
             action: MarketOperationKind::Install,
-            profile: Some(DEFAULT_PROFILE.into()),
+            profile: Some(plan.profile.clone()),
         };
-        if let Err(error) =
-            self.mutate_profile_package(DEFAULT_PROFILE, "add", &install_spec, &pending_change)
-        {
+        if let Err(error) = self.mutate_profile_packages_with_policy(
+            &plan.profile,
+            "add",
+            &install_specs,
+            &pending_change,
+            force,
+        ) {
             let detail = error
                 .safe_detail
                 .clone()
@@ -1523,7 +1677,7 @@ impl Marketplace {
             ok: true,
             action: MarketOperationKind::Install,
             plugin_id: plugin.id.clone(),
-            restart_required: service_running,
+            restart_required: service_running && plan.profile == DEFAULT_PROFILE,
             error: None,
         })
     }
@@ -1644,12 +1798,34 @@ impl Marketplace {
         pkg: &str,
         pending_change: &PendingMarketChange,
     ) -> AppResult<()> {
+        self.mutate_profile_packages(profile, verb, &[pkg.to_owned()], pending_change)
+    }
+
+    fn mutate_profile_packages(
+        &self,
+        profile: &str,
+        verb: &str,
+        packages: &[String],
+        pending_change: &PendingMarketChange,
+    ) -> AppResult<()> {
+        self.mutate_profile_packages_with_policy(profile, verb, packages, pending_change, false)
+    }
+
+    fn mutate_profile_packages_with_policy(
+        &self,
+        profile: &str,
+        verb: &str,
+        packages: &[String],
+        pending_change: &PendingMarketChange,
+        force: bool,
+    ) -> AppResult<()> {
         if !valid_profile_dir_name(profile) {
             return Err(AppError::new("marketInstallFailed").detail("invalid profile name"));
         }
         // A previously verified batch may have left only cleanup work after
         // an I/O failure. Finish that work before reusing last-good paths for
         // a new transaction, or fail without touching the active profile.
+        self.recover_all_profile_transactions()?;
         self.finish_verified_cleanups()?;
         self.recover_profile_transaction(profile)?;
         self.ensure_pnpm()?;
@@ -1664,97 +1840,256 @@ impl Marketplace {
         let backup = self.profile_dir(&backup_name);
         let last_good = self.last_good_profile(profile);
 
-        if !source.is_dir() {
-            return Err(AppError::new("marketProfileMissing").value("profile", profile));
-        }
+        let source_exists = fs::symlink_metadata(&source)
+            .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+        let creating = match source_exists {
+            Ok(true) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && verb == "add" => true,
+            _ => return Err(AppError::new("marketProfileMissing").value("profile", profile)),
+        };
         if self.pending_verification_for_mutation()?.is_none() && last_good.exists() {
             fs::remove_dir_all(&last_good)
                 .map_err(|error| AppError::io("marketRollbackFailed", &error))?;
         }
-        let baseline = read_manifest(&source.join("package.json"))?;
+        let baseline = if creating {
+            new_profile_manifest(profile)
+        } else {
+            read_manifest(&source.join("package.json"))?
+        };
+        let mut receipts = read_receipts(&source)?;
+        let removing_group =
+            verb == "remove" && receipts.plugins.contains_key(&pending_change.plugin_id);
+        if removing_group
+            && group_removals(&source, &baseline, &receipts, &pending_change.plugin_id)? != packages
+        {
+            return Err(AppError::new("marketProfileChanged").value("profile", profile));
+        }
         if profile == DEFAULT_PROFILE && !has_installation_owned_foundation(&baseline) {
             return Err(AppError::new("marketProfileInvalid")
                 .detail("web profile has no installation-owned foundation bundle"));
         }
-        let target = normalize_package_spec(pkg).ok_or_else(|| {
-            AppError::new("marketProfileInvalid")
-                .detail("operation target is not a registry package")
-        })?;
-        if verb == "remove" && !baseline.dependencies.contains_key(&target) {
-            return Err(AppError::new("marketNotDirectDependency")
-                .value("plugin", target)
-                .value("profile", profile));
+        let targets = packages
+            .iter()
+            .map(|pkg| {
+                normalize_package_spec(pkg).ok_or_else(|| {
+                    AppError::new("marketProfileInvalid")
+                        .detail("operation target is not a registry package")
+                })
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        if targets.is_empty() && !removing_group {
+            return Err(AppError::new("marketProfileInvalid"));
         }
-        if verb == "add" && baseline.dependencies.contains_key(&target) {
-            return Err(AppError::new("marketAlreadyInstalled").value("plugin", target));
+        let mut additions = Vec::new();
+        for (pkg, target) in packages.iter().zip(&targets) {
+            if verb == "remove" && !baseline.dependencies.contains_key(target) {
+                return Err(AppError::new("marketNotDirectDependency")
+                    .value("plugin", target)
+                    .value("profile", profile));
+            }
+            if verb == "add"
+                && baseline.bundles.contains(target)
+                && !baseline.dependencies.contains_key(target)
+            {
+                // Existing installation-owned foundation layers must keep
+                // resolving from the pinned runtime, not become user deps.
+                continue;
+            }
+            if verb == "add" && baseline.dependencies.contains_key(target) {
+                // Completing a partially installed plan must not upgrade or
+                // overwrite an already present package.
+                if read_installed_version(&source, target).as_deref()
+                    != pkg.strip_prefix(&format!("{target}@"))
+                {
+                    return Err(AppError::new("marketAlreadyInstalled").value("plugin", target));
+                }
+                continue;
+            }
+            additions.push(pkg.clone());
         }
-        let source_revision = profile_control_digest(&source)?;
+        if additions.is_empty()
+            && !removing_group
+            && receipts.plugins.contains_key(&pending_change.plugin_id)
+        {
+            return Err(AppError::new("marketAlreadyInstalled").value("plugin", targets.join(", ")));
+        }
+        let existing_versions: Vec<_> = baseline
+            .dependencies
+            .keys()
+            .filter(|package| verb != "remove" || !targets.contains(package))
+            .filter_map(|package| {
+                read_installed_version(&source, package).map(|version| (package.clone(), version))
+            })
+            .collect();
+        let source_revision = if creating {
+            None
+        } else {
+            Some(profile_control_digest(&source)?)
+        };
         if verb == "remove" {
-            validate_reverse_package_dependencies(&source, &baseline, pkg)?;
+            validate_reverse_package_dependencies_many(&source, &baseline, packages)?;
         }
-        copy_profile_candidate(&source, &candidate)?;
-
-        // Always use the pinned pnpm directly with lifecycle scripts disabled.
-        // The Harness CLI forwards to pnpm without this safety boundary.
-        let outcome =
-            self.run_pnpm_fallback(&candidate_name, verb, pkg)
-                .and_then(|()| match verb {
-                    "add" => self.reconcile_bundles_after_install(&candidate_name),
-                    "remove" => self.reconcile_bundles_after_remove(&candidate_name, pkg),
-                    _ => Err(AppError::new("marketInstallFailed").detail("unsupported operation")),
-                });
+        if verb == "add" {
+            receipts
+                .managed_packages
+                .extend(additions.iter().filter_map(|p| normalize_package_spec(p)));
+            receipts.plugins.insert(
+                pending_change.plugin_id.clone(),
+                InstallReceipt {
+                    name: pending_change.name.clone(),
+                    packages: targets.clone(),
+                },
+            );
+        } else if removing_group {
+            receipts.plugins.remove(&pending_change.plugin_id);
+        }
+        if verb == "remove" {
+            receipts.managed_packages.retain(|p| !targets.contains(p));
+        }
+        let preparation = if creating {
+            create_profile_candidate(&candidate, profile, &baseline)
+        } else {
+            copy_profile_candidate(&source, &candidate)
+        };
+        if let Err(error) = preparation {
+            let _ = fs::remove_dir_all(&candidate);
+            return Err(error);
+        }
+        // One pnpm invocation and one publication for the complete plan.
+        let outcome = self
+            .run_pnpm_fallback(
+                &candidate_name,
+                if additions.is_empty() {
+                    "install"
+                } else {
+                    verb
+                },
+                &additions,
+                force || verb == "remove",
+            )
+            .and_then(|()| match verb {
+                "add" => self.reconcile_bundles_after_install(&candidate_name, packages),
+                "remove" => {
+                    for pkg in packages {
+                        self.reconcile_bundles_after_remove(&candidate_name, pkg)?;
+                    }
+                    Ok(())
+                }
+                _ => Err(AppError::new("marketInstallFailed").detail("unsupported operation")),
+            })
+            .and_then(|()| {
+                validate_candidate_profile_many(&baseline, &candidate, verb, packages)?;
+                write_receipts(&candidate, &receipts)?;
+                for (package, version) in &existing_versions {
+                    if read_installed_version(&candidate, package).as_ref() != Some(version) {
+                        return Err(AppError::new("marketProfileInvalid").detail(format!(
+                            "profile mutation changed existing package version {package}"
+                        )));
+                    }
+                }
+                if verb == "add" {
+                    for pkg in packages {
+                        let target = normalize_package_spec(pkg).expect("validated target");
+                        if baseline.bundles.contains(&target)
+                            && !baseline.dependencies.contains_key(&target)
+                        {
+                            continue;
+                        }
+                        let expected = pkg.strip_prefix(&format!("{target}@"));
+                        if expected.is_none()
+                            || read_installed_version(&candidate, &target).as_deref() != expected
+                        {
+                            return Err(
+                                AppError::new("marketPackageChanged").value("plugin", target)
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            });
         if let Err(error) = outcome {
             let _ = fs::remove_dir_all(&candidate);
             return Err(error);
         }
-        if let Err(error) = validate_candidate_profile(&baseline, &candidate, verb, pkg) {
-            let _ = fs::remove_dir_all(&candidate);
-            return Err(error);
-        }
-        if profile_control_digest(&source)? != source_revision {
+        let source_unchanged = if let Some(revision) = source_revision {
+            profile_control_digest(&source).map(|current| current == revision)
+        } else {
+            Ok(!source.try_exists()?)
+        };
+        if !source_unchanged.unwrap_or(false) {
             let _ = fs::remove_dir_all(&candidate);
             return Err(AppError::new("marketProfileChanged").value("profile", profile));
         }
 
-        // Persist the rollback journal before the first publication rename.
-        // After a power loss, startup can therefore distinguish a candidate
-        // profile from a previously verified one and restore the batch base.
-        let previous_pending = fs::read(self.pending_file()).ok();
-        if let Err(error) = self.write_pending_change(
+        // Correlate the candidate and journal before either publication
+        // rename. A failed restore leaves both snapshots and this record.
+        let previous_pending = match fs::read(self.pending_file()) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let pending_bytes = self.pending_change_bytes(
             &pending_change.plugin_id,
             &pending_change.name,
             pending_change.action,
             profile,
-        ) {
-            let _ = fs::remove_dir_all(&candidate);
-            return Err(error);
-        }
-
+        )?;
         let publication_backup = if last_good.exists() {
             &backup
         } else {
             &last_good
         };
-        if let Err(error) = fs::rename(&source, publication_backup) {
-            let _ = restore_pending_snapshot(&self.pending_file(), previous_pending.as_deref());
-            let _ = fs::remove_dir_all(&candidate);
-            return Err(AppError::io("marketInstallFailed", &error));
+        let tx = ProfileTransaction {
+            rolled_back: false,
+            candidate: candidate_name,
+            backup: publication_backup
+                .file_name()
+                .expect("profile name")
+                .to_string_lossy()
+                .into_owned(),
+            source_existed: !creating,
+            previous_pending,
+            pending_digest: sha256_bytes(&pending_bytes),
+        };
+        crate::paths::atomic_write(&self.transaction_file(profile), &serde_json::to_vec(&tx)?)?;
+        sync_directory(&profiles_dir)?;
+        let publication = (|| -> AppResult<()> {
+            crate::paths::atomic_write(&self.pending_file(), &pending_bytes)?;
+            sync_directory(&self.catalog_dir())?;
+            if creating {
+                fs::create_dir(&last_good)?;
+                crate::paths::atomic_write(&last_good.join(".market-profile-absent"), b"")?;
+                sync_directory(&last_good)?;
+            } else {
+                fs::rename(&source, publication_backup)?;
+                // Check the actual displaced profile too: a writer may have
+                // changed it after the earlier check but before the rename.
+                if Some(profile_control_digest(publication_backup)?) != source_revision {
+                    return Err(AppError::new("marketProfileChanged").value("profile", profile));
+                }
+            }
+            sync_directory(&profiles_dir)?;
+            fs::rename(&candidate, &source)?;
+            // Rename is the publication boundary. A subsequent fsync/cleanup
+            // failure must not report an installation failure after commit.
+            Ok(())
+        })();
+        if let Err(error) = publication {
+            self.recover_recorded_transaction(profile)?;
+            return Err(error);
         }
-        if let Err(error) = fs::rename(&candidate, &source) {
-            let _ = fs::rename(publication_backup, &source);
-            let _ = restore_pending_snapshot(&self.pending_file(), previous_pending.as_deref());
-            let _ = fs::remove_dir_all(&candidate);
-            return Err(AppError::io("marketInstallFailed", &error));
-        }
-        if backup.exists()
-            && let Err(error) = fs::remove_dir_all(&backup)
-        {
-            log::warn!("could not remove marketplace profile backup: {error}");
+        if let Err(error) = self.recover_recorded_transaction(profile) {
+            // Publication succeeded; cleanup is retried from the durable
+            // transaction record before the next mutation/startup.
+            log::warn!("marketplace publication cleanup pending: {error}");
         }
         Ok(())
     }
 
     fn recover_profile_transaction(&self, profile: &str) -> AppResult<()> {
+        if self.recover_recorded_transaction(profile)? {
+            return Ok(());
+        }
         let target = self.profile_dir(profile);
         let backup_prefix = format!(".{profile}.market-backup-");
         let candidate_prefix = format!(".{profile}.market-candidate-");
@@ -1773,9 +2108,6 @@ impl Marketplace {
         }
         backups.sort();
         candidates.sort();
-        let target_was_missing = !target.exists();
-        let had_ephemeral_backup = !backups.is_empty();
-        let had_candidate = !candidates.is_empty();
         let mut restored_unpublished_change = false;
         if !target.exists()
             && let Some(backup) = backups.pop()
@@ -1784,8 +2116,13 @@ impl Marketplace {
                 .map_err(|error| AppError::io("marketInstallFailed", &error))?;
             restored_unpublished_change = true;
         } else if !target.exists() && self.last_good_profile(profile).exists() {
-            fs::rename(self.last_good_profile(profile), &target)
-                .map_err(|error| AppError::io("marketInstallFailed", &error))?;
+            let last_good = self.last_good_profile(profile);
+            if represents_absent_profile(&last_good) {
+                fs::remove_dir_all(last_good)?;
+            } else {
+                fs::rename(last_good, &target)
+                    .map_err(|error| AppError::io("marketInstallFailed", &error))?;
+            }
             restored_unpublished_change = true;
         }
         for path in backups.into_iter().chain(candidates) {
@@ -1796,9 +2133,7 @@ impl Marketplace {
         // If the journal was durable but the candidate was not published,
         // remove exactly that final change. Earlier changes in the same batch
         // remain pending and must still be verified or rolled back.
-        let abandoned_before_first_rename =
-            !target_was_missing && had_candidate && !had_ephemeral_backup;
-        if restored_unpublished_change || abandoned_before_first_rename {
+        if restored_unpublished_change {
             log::warn!(
                 "recovered an unpublished marketplace change for profile {profile}; removing the final change from the pending batch"
             );
@@ -1867,7 +2202,13 @@ impl Marketplace {
     }
 
     /// Fallback: run the pinned pnpm directly inside the target profile.
-    fn run_pnpm_fallback(&self, profile: &str, verb: &str, pkg: &str) -> AppResult<()> {
+    fn run_pnpm_fallback(
+        &self,
+        profile: &str,
+        verb: &str,
+        packages: &[String],
+        force: bool,
+    ) -> AppResult<()> {
         let bin_dir = self
             .pnpm_bin
             .lock()
@@ -1880,7 +2221,13 @@ impl Marketplace {
         fs::create_dir_all(&profile_dir)
             .map_err(|error| AppError::io("createDirectory", &error))?;
         let mut command = new_command(&executable);
-        command.arg(verb).arg(pkg).args(pnpm_mutation_flags(verb));
+        command
+            .arg(verb)
+            .args(packages)
+            .args(pnpm_mutation_flags(verb));
+        if force && verb != "remove" {
+            command.arg("--no-strict-peer-dependencies");
+        }
         command
             .current_dir(&profile_dir)
             .stdin(Stdio::null())
@@ -1897,10 +2244,19 @@ impl Marketplace {
     /// Reconcile `dsh.profile.bundles` after installing via pnpm directly
     /// (mirrors the Harness CLI's own reconciliation: dependencies whose
     /// package declares `dsh.bundle` join the bundle stack).
-    fn reconcile_bundles_after_install(&self, profile: &str) -> AppResult<()> {
+    fn reconcile_bundles_after_install(&self, profile: &str, packages: &[String]) -> AppResult<()> {
         let manifest_path = self.profile_dir(profile).join("package.json");
         let mut manifest = read_manifest(&manifest_path)?;
-        let dependencies: Vec<String> = manifest.dependencies.keys().cloned().collect();
+        let mut dependencies: Vec<String> = packages
+            .iter()
+            .filter_map(|pkg| normalize_package_spec(pkg))
+            .filter(|pkg| manifest.dependencies.contains_key(pkg))
+            .collect();
+        for dependency in manifest.dependencies.keys() {
+            if !dependencies.contains(dependency) {
+                dependencies.push(dependency.clone());
+            }
+        }
         let bundles = &mut manifest.bundles;
         let profile_dir = self.profile_dir(profile);
         let mut changed = false;
@@ -1960,6 +2316,9 @@ impl Marketplace {
                     plugin_id,
                     local_name,
                     version,
+                    grouped: false,
+                    packages: Vec::new(),
+                    retained_packages: Vec::new(),
                     source: PluginSource::Skills,
                     profile: None,
                 });
@@ -1980,6 +2339,43 @@ impl Marketplace {
                 let Ok(manifest) = read_manifest(&manifest_path) else {
                     continue;
                 };
+                let Ok(receipts) = read_receipts(&profile_dir) else {
+                    continue;
+                };
+                let mut grouped_packages = HashSet::new();
+                for (id, receipt) in &receipts.plugins {
+                    let Ok(packages) = group_removals(&profile_dir, &manifest, &receipts, id)
+                    else {
+                        continue;
+                    };
+                    let retained_packages = receipt
+                        .packages
+                        .iter()
+                        .filter(|p| {
+                            !packages.contains(p)
+                                && (manifest.dependencies.contains_key(*p)
+                                    || manifest.bundles.contains(*p))
+                        })
+                        .cloned()
+                        .collect();
+                    grouped_packages.extend(
+                        receipt
+                            .packages
+                            .iter()
+                            .filter(|p| receipts.managed_packages.contains(*p))
+                            .cloned(),
+                    );
+                    found.push(InstalledPlugin {
+                        plugin_id: Some(id.clone()),
+                        local_name: receipt.name.clone(),
+                        version: None,
+                        source: PluginSource::Profile,
+                        profile: Some(profile_name.clone()),
+                        grouped: true,
+                        packages,
+                        retained_packages,
+                    });
+                }
                 let mut names: Vec<String> = manifest.dependencies.keys().cloned().collect();
                 for bundle in &manifest.bundles {
                     if !names.iter().any(|name| name == bundle) {
@@ -1987,6 +2383,9 @@ impl Marketplace {
                     }
                 }
                 for dep in names {
+                    if grouped_packages.contains(&dep) {
+                        continue;
+                    }
                     let package_key = dep.to_lowercase();
                     let plugin_id = read_installed_repository(&profile_dir, &dep)
                         .and_then(|repository| {
@@ -2005,6 +2404,9 @@ impl Marketplace {
                         plugin_id,
                         local_name: dep,
                         version: version.map(|v| v.trim_start_matches(['^', '~']).to_owned()),
+                        grouped: false,
+                        packages: Vec::new(),
+                        retained_packages: Vec::new(),
                         source: PluginSource::Profile,
                         profile: Some(profile_name.clone()),
                     });
@@ -2063,6 +2465,7 @@ impl Marketplace {
         }
     }
 
+    #[cfg(test)]
     fn write_pending_change(
         &self,
         plugin_id: &str,
@@ -2070,6 +2473,17 @@ impl Marketplace {
         action: MarketOperationKind,
         profile: &str,
     ) -> AppResult<()> {
+        let bytes = self.pending_change_bytes(plugin_id, name, action, profile)?;
+        crate::paths::atomic_write(&self.pending_file(), &bytes)
+    }
+
+    fn pending_change_bytes(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        action: MarketOperationKind,
+        profile: &str,
+    ) -> AppResult<Vec<u8>> {
         let existing = self.pending_verification_for_mutation()?;
         let mut marker = existing.unwrap_or(PendingVerification {
             plugin_id: plugin_id.into(),
@@ -2089,9 +2503,7 @@ impl Marketplace {
         });
         fs::create_dir_all(self.catalog_dir())
             .map_err(|error| AppError::io("createDirectory", &error))?;
-        let bytes = serde_json::to_vec(&marker)?;
-        crate::paths::atomic_write(&self.pending_file(), &bytes)?;
-        Ok(())
+        Ok(serde_json::to_vec(&marker)?)
     }
 
     fn pending_verification_for_mutation(&self) -> AppResult<Option<PendingVerification>> {
@@ -2268,6 +2680,7 @@ impl Marketplace {
     }
 
     fn finish_verified_cleanups(&self) -> AppResult<()> {
+        self.finish_web_verified_cleanup()?;
         let Ok(entries) = fs::read_dir(self.catalog_dir()) else {
             return Ok(());
         };
@@ -2307,7 +2720,9 @@ impl Marketplace {
             let Some(rest) = name.strip_prefix('.') else {
                 continue;
             };
-            if let Some((profile, _)) = rest.split_once(".market-backup-") {
+            if let Some(profile) = rest.strip_suffix(".market-transaction.json") {
+                profiles.insert(profile.to_owned());
+            } else if let Some((profile, _)) = rest.split_once(".market-backup-") {
                 profiles.insert(profile.to_owned());
             } else if let Some((profile, _)) = rest.split_once(".market-candidate-") {
                 profiles.insert(profile.to_owned());
@@ -2365,7 +2780,19 @@ impl PluginIndex {
                 plugin.full_name.to_lowercase(),
                 &plugin.id,
             );
-            if let Some(package_name) = install_package_name(plugin) {
+            for package_name in install_plan(plugin)
+                .map(|plan| plan.packages)
+                .unwrap_or_default()
+            {
+                if matches!(
+                    package_name.as_str(),
+                    "@deepseek-ai/dsh-base"
+                        | "@deepseek-ai/dsh-web-app"
+                        | "@deepseek-ai/dsh-headless"
+                ) && !package_matches_plugin_identity(plugin, &package_name)
+                {
+                    continue;
+                }
                 let package_key = package_name.to_lowercase();
                 insert_ranked_package_binding(
                     &mut index.by_package,
@@ -2427,15 +2854,49 @@ fn insert_ranked_package_binding(
 
 #[derive(Debug, Default)]
 struct InstalledIndex {
-    by_plugin: HashMap<String, InstalledPlugin>,
+    by_plugin: HashMap<String, Vec<InstalledPlugin>>,
 }
 
 impl InstalledIndex {
+    fn for_plugin(&self, plugin: &MarketPlugin) -> Option<&InstalledPlugin> {
+        let entries = self.by_plugin.get(&plugin.id)?;
+        if let Some(skill) = entries
+            .iter()
+            .find(|entry| entry.source == PluginSource::Skills)
+        {
+            return Some(skill);
+        }
+        if let Some(group) = entries.iter().find(|entry| entry.grouped) {
+            return Some(group);
+        }
+        let plan = install_plan(plugin)?;
+        let packages = plan.packages.iter().filter(|p| {
+            !matches!(
+                p.as_str(),
+                "@deepseek-ai/dsh-base" | "@deepseek-ai/dsh-web-app" | "@deepseek-ai/dsh-headless"
+            ) || package_matches_plugin_identity(plugin, p)
+        });
+        if !packages.clone().all(|package| {
+            entries.iter().any(|entry| {
+                entry.local_name == *package && entry.profile.as_deref() == Some(&plan.profile)
+            })
+        }) {
+            return None;
+        }
+        entries
+            .iter()
+            .find(|entry| entry.profile.as_deref() == Some(&plan.profile))
+    }
+
     fn build(installed: Vec<InstalledPlugin>) -> Self {
         let mut index = Self::default();
         for entry in installed {
             if let Some(plugin_id) = &entry.plugin_id {
-                index.by_plugin.entry(plugin_id.clone()).or_insert(entry);
+                index
+                    .by_plugin
+                    .entry(plugin_id.clone())
+                    .or_default()
+                    .push(entry);
             }
         }
         index
@@ -2450,6 +2911,9 @@ struct InstalledCache {
 
 fn same_install_location(left: &InstalledPlugin, right: &InstalledPlugin) -> bool {
     left.source == right.source
+        && left.grouped == right.grouped
+        && left.packages == right.packages
+        && left.retained_packages == right.retained_packages
         && left.local_name == right.local_name
         && left.profile == right.profile
 }
@@ -2507,6 +2971,96 @@ fn sort_plugins(plugins: &mut [&MarketPlugin], sort: MarketSort) {
         }
         MarketSort::Name => plugins.sort_by_key(|plugin| plugin.name.to_lowercase()),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallPlan {
+    profile: String,
+    packages: Vec<String>,
+}
+
+impl InstallPlan {
+    fn cache_key(&self) -> String {
+        format!("v2:{}:{}", self.profile, self.packages.join(" "))
+    }
+}
+
+fn install_plan(plugin: &MarketPlugin) -> Option<InstallPlan> {
+    let plans: Vec<_> = plugin
+        .install
+        .iter()
+        .flat_map(|i| &i.commands)
+        .filter_map(|command| install_plan_from_command(command))
+        .collect();
+    plans
+        .iter()
+        .find(|plan| {
+            plan.packages
+                .iter()
+                .any(|pkg| package_matches_plugin_identity(plugin, pkg))
+        })
+        .or_else(|| plans.first())
+        .cloned()
+        .or_else(|| {
+            // An explicit but unsupported command must never become a different
+            // install through the display-name fallback.
+            if plugin
+                .install
+                .as_ref()
+                .is_some_and(|i| !i.commands.is_empty())
+            {
+                return None;
+            }
+            install_package_name(plugin).map(|package| InstallPlan {
+                profile: DEFAULT_PROFILE.into(),
+                packages: vec![package],
+            })
+        })
+}
+
+/// Parse data, never execute catalog command text. Different commands are
+/// alternatives; one command's complete package list is a single transaction.
+fn install_plan_from_command(command: &str) -> Option<InstallPlan> {
+    let tokens: Vec<_> = command.split_whitespace().collect();
+    let start = match tokens.as_slice() {
+        ["dsh", "plugin", ..] => 2,
+        ["pnpm", "add", ..] => 1,
+        _ => return None,
+    };
+    let mut profile = DEFAULT_PROFILE.to_owned();
+    let mut packages = Vec::new();
+    let mut add = false;
+    let mut index = start;
+    while index < tokens.len() {
+        let token = tokens[index];
+        index += 1;
+        match token {
+            "add" if !add => {
+                add = true;
+            }
+            "--profile" | "-p" => {
+                profile = tokens.get(index)?.trim_matches(['\'', '"']).to_owned();
+                index += 1;
+            }
+            "--save-exact" | "-E" | "--save-prod" | "-P" if add => {}
+            _ if token.starts_with("--profile=") => {
+                profile = token
+                    .strip_prefix("--profile=")?
+                    .trim_matches(['\'', '"'])
+                    .to_owned();
+            }
+            _ if token.starts_with('#') && add => break,
+            _ if add => {
+                let package = normalize_package_spec(token)?;
+                if !packages.contains(&package) {
+                    packages.push(package);
+                }
+            }
+            _ => return None,
+        }
+    }
+    (add && valid_profile_dir_name(&profile) && !packages.is_empty())
+        .then_some(InstallPlan { profile, packages })
 }
 
 fn install_package_name(plugin: &MarketPlugin) -> Option<String> {
@@ -2586,7 +3140,7 @@ fn sanitize_catalog(catalog: &mut MarketCatalogFile) -> AppResult<()> {
             && catalog_source_matches_id(plugin)
             && match plugin.kind.as_str() {
                 "skill" => valid_skill_dir_name(&plugin.name),
-                "cordis-plugin" => install_package_name(plugin).is_some(),
+                "cordis-plugin" => install_plan(plugin).is_some(),
                 _ => false,
             };
         if !safe {
@@ -2698,6 +3252,12 @@ fn pnpm_mutation_flags(verb: &str) -> &'static [&'static str] {
             "--config.ignore-scripts=true",
             "--no-strict-peer-dependencies",
         ]
+    } else if verb == "add" {
+        &[
+            "--ignore-scripts",
+            "--strict-peer-dependencies",
+            "--save-exact",
+        ]
     } else {
         &["--ignore-scripts", "--strict-peer-dependencies"]
     }
@@ -2781,12 +3341,12 @@ fn valid_skill_dir_name(name: &str) -> bool {
 
 fn valid_profile_dir_name(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= 100
         && !name.starts_with('.')
-        && Path::new(name).components().count() == 1
-        && matches!(
-            Path::new(name).components().next(),
-            Some(Component::Normal(_))
-        )
+        && !name.ends_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Clone profile metadata into a transaction candidate. `node_modules` is
@@ -2925,6 +3485,47 @@ struct ProfileManifest {
     bundles: Vec<String>,
 }
 
+// Matches the published @deepseek-ai/dsh-app-boot profile initialization
+// contract. Only a fresh candidate is written; no active profile is seeded.
+fn new_profile_manifest(profile: &str) -> ProfileManifest {
+    let mut bundles = vec!["@deepseek-ai/dsh-base".into()];
+    match profile {
+        "web" => bundles.push("@deepseek-ai/dsh-web-app".into()),
+        "headless" => bundles.push("@deepseek-ai/dsh-headless".into()),
+        _ => {}
+    }
+    ProfileManifest {
+        dependencies: BTreeMap::new(),
+        bundles,
+    }
+}
+
+fn create_profile_candidate(
+    candidate: &Path,
+    profile: &str,
+    manifest: &ProfileManifest,
+) -> AppResult<()> {
+    fs::create_dir(candidate)?;
+    let raw = serde_json::json!({
+        "name": format!("dsh-profile-{profile}"), "private": true,
+        "dependencies": manifest.dependencies, "dsh": { "profile": { "bundles": manifest.bundles } }
+    });
+    fs::write(
+        candidate.join("package.json"),
+        serde_json::to_vec_pretty(&raw)?,
+    )?;
+    fs::write(candidate.join("cordis.patch.yml"), "[]\n")?;
+    fs::write(
+        candidate.join("pnpm-workspace.yaml"),
+        "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n",
+    )?;
+    Ok(())
+}
+
+fn represents_absent_profile(last_good: &Path) -> bool {
+    last_good.join(".market-profile-absent").is_file() && !last_good.join("package.json").exists()
+}
+
 fn has_installation_owned_foundation(manifest: &ProfileManifest) -> bool {
     manifest
         .bundles
@@ -3045,19 +3646,44 @@ fn package_declares_bundle(profile_dir: &Path, dep: &str) -> bool {
         .is_some()
 }
 
+#[cfg(test)]
 fn validate_candidate_profile(
     baseline: &ProfileManifest,
-    candidate_dir: &Path,
+    candidate: &Path,
     verb: &str,
     spec: &str,
 ) -> AppResult<()> {
-    let target = normalize_package_spec(spec).ok_or_else(|| {
-        AppError::new("marketProfileInvalid").detail("operation target is not a registry package")
-    })?;
-    let candidate = read_manifest(&candidate_dir.join("package.json"))?;
+    validate_candidate_profile_many(baseline, candidate, verb, &[spec.into()])
+}
 
+fn validate_candidate_profile_many(
+    baseline: &ProfileManifest,
+    candidate_dir: &Path,
+    verb: &str,
+    specs: &[String],
+) -> AppResult<()> {
+    let targets = specs
+        .iter()
+        .map(|spec| {
+            normalize_package_spec(spec).ok_or_else(|| {
+                AppError::new("marketProfileInvalid")
+                    .detail("operation target is not a registry package")
+            })
+        })
+        .collect::<AppResult<HashSet<_>>>()?;
+    let candidate = read_manifest(&candidate_dir.join("package.json"))?;
+    for (dependency, version) in &baseline.dependencies {
+        if verb == "remove" && targets.contains(dependency) {
+            continue;
+        }
+        if candidate.dependencies.get(dependency) != Some(version) {
+            return Err(AppError::new("marketProfileInvalid").detail(format!(
+                "profile mutation changed existing dependency {dependency}"
+            )));
+        }
+    }
     for foundation in &baseline.bundles {
-        if verb == "remove" && foundation == &target {
+        if verb == "remove" && targets.contains(foundation) {
             continue;
         }
         if !candidate.bundles.contains(foundation) {
@@ -3066,38 +3692,44 @@ fn validate_candidate_profile(
             )));
         }
     }
-
-    match verb {
-        "add" => {
-            if !candidate.dependencies.contains_key(&target) {
-                return Err(AppError::new("marketProfileInvalid").detail(format!(
-                    "installed package {target} is missing from dependencies"
-                )));
+    for target in &targets {
+        match verb {
+            "add" => {
+                if baseline.bundles.contains(target) && !baseline.dependencies.contains_key(target)
+                {
+                    continue;
+                }
+                if !candidate.dependencies.contains_key(target) {
+                    return Err(AppError::new("marketProfileInvalid").detail(format!(
+                        "installed package {target} is missing from dependencies"
+                    )));
+                }
+                if package_declares_bundle(candidate_dir, target)
+                    && !candidate.bundles.contains(target)
+                {
+                    return Err(AppError::new("marketProfileInvalid")
+                        .detail(format!("installed bundle {target} is not active")));
+                }
             }
-            if !package_declares_bundle(candidate_dir, &target) {
-                return Err(AppError::new("marketProfileInvalid").detail(format!(
-                    "installed package {target} does not declare dsh.bundle"
-                )));
+            "remove" => {
+                if candidate.dependencies.contains_key(target) || candidate.bundles.contains(target)
+                {
+                    return Err(AppError::new("marketProfileInvalid")
+                        .detail(format!("removed package {target} is still active")));
+                }
             }
-            if !candidate.bundles.contains(&target) {
-                return Err(AppError::new("marketProfileInvalid").detail(format!(
-                    "installed bundle {target} is not active in the profile"
-                )));
-            }
-        }
-        "remove" => {
-            if candidate.dependencies.contains_key(&target) || candidate.bundles.contains(&target) {
-                return Err(AppError::new("marketProfileInvalid")
-                    .detail(format!("removed package {target} is still active")));
-            }
-        }
-        _ => {
-            return Err(
-                AppError::new("marketProfileInvalid").detail("unsupported profile mutation")
-            );
+            _ => return Err(AppError::new("marketProfileInvalid").detail("unsupported operation")),
         }
     }
-
+    if verb == "add"
+        && !targets.is_empty()
+        && !targets
+            .iter()
+            .any(|target| candidate.bundles.contains(target))
+    {
+        return Err(AppError::new("marketProfileInvalid")
+            .detail("installed group does not provide a profile bundle"));
+    }
     for dependency in candidate.dependencies.keys() {
         if !candidate_dir
             .join("node_modules")
@@ -3112,57 +3744,75 @@ fn validate_candidate_profile(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_reverse_package_dependencies(
-    profile_dir: &Path,
+    profile: &Path,
     manifest: &ProfileManifest,
     removed: &str,
 ) -> AppResult<()> {
-    for bundle in &manifest.bundles {
-        if bundle == removed {
+    validate_reverse_package_dependencies_many(profile, manifest, &[removed.into()])
+}
+
+fn validate_reverse_package_dependencies_many(
+    profile: &Path,
+    manifest: &ProfileManifest,
+    removed: &[String],
+) -> AppResult<()> {
+    for package in manifest.dependencies.keys().chain(&manifest.bundles) {
+        if removed.contains(package) {
             continue;
         }
-        let package_path = profile_dir
-            .join("node_modules")
-            .join(bundle)
-            .join("package.json");
-        let Ok(bytes) = fs::read(package_path) else {
-            continue;
-        };
-        let Ok(package): Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else {
-            continue;
-        };
-        let required = ["dependencies", "peerDependencies", "optionalDependencies"]
-            .into_iter()
-            .any(|field| {
-                package
-                    .get(field)
-                    .and_then(serde_json::Value::as_object)
-                    .is_some_and(|dependencies| dependencies.contains_key(removed))
-            });
-        if required {
-            return Err(AppError::new("marketPluginRequired")
-                .value("plugin", removed)
-                .value("dependent", bundle));
+        for required in package_requirements(profile, package)? {
+            if removed.contains(&required) {
+                return Err(AppError::new("marketPluginRequired")
+                    .value("plugin", required)
+                    .value("dependent", package));
+            }
         }
     }
     Ok(())
 }
 
 fn profile_control_digest(profile_dir: &Path) -> AppResult<[u8; 32]> {
-    let mut digest = Sha256::new();
-    for name in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
-        digest.update(name.as_bytes());
-        let path = profile_dir.join(name);
-        match fs::read(&path) {
-            Ok(bytes) => {
-                digest.update([1]);
-                digest.update((bytes.len() as u64).to_le_bytes());
-                digest.update(bytes);
+    fn visit(path: &Path, root: &Path, digest: &mut Sha256) -> AppResult<()> {
+        let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if entry.file_name() == "node_modules" {
+                continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => digest.update([0]),
-            Err(error) => return Err(AppError::io("io", &error)),
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            digest.update(
+                path.strip_prefix(root)
+                    .expect("profile child")
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+            if metadata.is_dir() {
+                digest.update([0]);
+                visit(&path, root, digest)?;
+            } else if metadata.is_file() {
+                digest.update([1]);
+                digest.update(metadata.len().to_le_bytes());
+                let mut file = fs::File::open(&path)?;
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let len = file.read(&mut buffer)?;
+                    if len == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..len]);
+                }
+            } else {
+                return Err(AppError::new("marketProfileInvalid")
+                    .detail("profile contains unsupported links or special files"));
+            }
         }
+        Ok(())
     }
+    let mut digest = Sha256::new();
+    visit(profile_dir, profile_dir, &mut digest)?;
     Ok(digest.finalize().into())
 }
 
@@ -3605,21 +4255,163 @@ fn fetch_compatibility_entry_with(
     paths: &ApplicationPaths,
     client: Option<&reqwest::blocking::Client>,
 ) -> CachedCompatibility {
-    let package_name = install_package_name(plugin).unwrap_or_default();
+    let plan = install_plan(plugin);
+    let entries = plan
+        .as_ref()
+        .map(|plan| {
+            plan.packages
+                .iter()
+                .map(|pkg| fetch_package_compatibility(plugin, pkg, paths, client))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    aggregate_compatibility(plan.as_ref(), entries, installed_cordis_version(paths))
+}
+
+fn aggregate_compatibility(
+    plan: Option<&InstallPlan>,
+    entries: Vec<CachedCompatibility>,
+    cordis_version: Option<String>,
+) -> CachedCompatibility {
+    let resolved_packages: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .package_version
+                .as_ref()
+                .map(|version| format!("{}@{version}", entry.package_name))
+        })
+        .collect();
+    let source_failure = entries
+        .iter()
+        .find(|e| e.source_binding == SourceBindingStatus::Mismatch)
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| e.source_binding != SourceBindingStatus::Verified)
+        });
+    let compatibility_failure = entries
+        .iter()
+        .find(|e| e.info.status == CompatibilityStatus::Incompatible)
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| e.info.status != CompatibilityStatus::Compatible)
+        });
+    let complete =
+        plan.is_some_and(|p| !entries.is_empty() && resolved_packages.len() == p.packages.len());
+    CachedCompatibility {
+        package_name: plan.map(InstallPlan::cache_key).unwrap_or_default(),
+        // Consent binds all displayed warnings as well as package versions
+        // and destination. Changed metadata requires a new review, even when
+        // a publisher changes the repository without changing the version.
+        package_version: complete.then(|| {
+            let confirmation = serde_json::json!({
+                "plan": plan.unwrap().cache_key(),
+                "cordis": cordis_version,
+                "packages": entries.iter().map(|entry| serde_json::json!({
+                    "name": entry.package_name, "version": entry.package_version,
+                    "source": entry.source_binding, "sourceDetail": entry.source_binding_detail,
+                    "compatibility": entry.info,
+                })).collect::<Vec<_>>()
+            });
+            format!(
+                "plan-v2:{}",
+                sha256_bytes(confirmation.to_string().as_bytes())
+            )
+        }),
+        resolved_packages,
+        cordis_version,
+        checked_at_ms: now_ms(),
+        info: compatibility_failure
+            .map(|e| CompatibilityInfo {
+                status: e.info.status,
+                detail: Some(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.info.status != CompatibilityStatus::Compatible)
+                        .map(|entry| {
+                            format!(
+                                "{}: {}",
+                                entry.package_name,
+                                entry
+                                    .info
+                                    .detail
+                                    .as_deref()
+                                    .unwrap_or("compatibility unknown")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+            })
+            .unwrap_or(CompatibilityInfo {
+                status: if complete {
+                    CompatibilityStatus::Compatible
+                } else {
+                    CompatibilityStatus::Unknown
+                },
+                detail: None,
+            }),
+        source_binding: source_failure
+            .map(|e| e.source_binding)
+            .unwrap_or(if complete {
+                SourceBindingStatus::Verified
+            } else {
+                SourceBindingStatus::Unknown
+            }),
+        source_binding_detail: if source_failure.is_some() {
+            Some(
+                entries
+                    .iter()
+                    .filter(|e| e.source_binding != SourceBindingStatus::Verified)
+                    .map(|e| {
+                        format!(
+                            "{}: {}",
+                            e.package_name,
+                            e.source_binding_detail
+                                .as_deref()
+                                .unwrap_or("repository unavailable")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        } else {
+            plan.is_none()
+                .then(|| "catalog has no supported installation plan".into())
+        },
+    }
+}
+
+fn fetch_package_compatibility(
+    plugin: &MarketPlugin,
+    package_name: &str,
+    paths: &ApplicationPaths,
+    client: Option<&reqwest::blocking::Client>,
+) -> CachedCompatibility {
     let cordis_version = installed_cordis_version(paths);
     let checked_at_ms = now_ms();
-    let registry = fetch_registry_package_info_with(plugin, client);
+    let registry = fetch_registry_package_info_with(package_name, client);
+    let expected_repository = if matches!(
+        package_name,
+        "@deepseek-ai/dsh-base" | "@deepseek-ai/dsh-web-app"
+    ) {
+        "deepseek-ai/deepseek-harness"
+    } else {
+        &plugin.id
+    };
     let (package_version, info, source_binding, source_binding_detail) = match registry {
         Ok(registry) => {
             let (source_binding, source_binding_detail) = match registry.repository_id.as_deref() {
-                Some(repository) if repository.eq_ignore_ascii_case(&plugin.id) => {
+                Some(repository) if repository.eq_ignore_ascii_case(expected_repository) => {
                     (SourceBindingStatus::Verified, None)
                 }
                 Some(repository) => (
                     SourceBindingStatus::Mismatch,
                     Some(format!(
-                        "npm package points to {repository}, catalog points to {}",
-                        plugin.id
+                        "npm package points to https://github.com/{repository}, catalog points to https://github.com/{}",
+                        expected_repository
                     )),
                 ),
                 None if registry.repository_declared => (
@@ -3653,7 +4445,8 @@ fn fetch_compatibility_entry_with(
         ),
     };
     CachedCompatibility {
-        package_name,
+        package_name: package_name.into(),
+        resolved_packages: Vec::new(),
         package_version,
         cordis_version,
         checked_at_ms,
@@ -3706,21 +4499,29 @@ fn validate_install_metadata(
     force: bool,
     verified: &CachedCompatibility,
 ) -> AppResult<()> {
+    if verified.package_version.is_none()
+        || verified.resolved_packages.is_empty()
+        || verified.source_binding == SourceBindingStatus::NotChecked
+    {
+        return Err(AppError::new("marketNetworkFailed")
+            .value("plugin", plugin_name)
+            .detail("complete package versions could not be resolved; retry before installing"));
+    }
+    if force {
+        return Ok(());
+    }
     match verified.source_binding {
         SourceBindingStatus::Mismatch => {
             return Err(AppError::new("marketSourceMismatch")
                 .value("plugin", plugin_name)
                 .detail(verified.source_binding_detail.clone().unwrap_or_default()));
         }
-        SourceBindingStatus::Unknown | SourceBindingStatus::NotChecked => {
+        SourceBindingStatus::Unknown => {
             return Err(AppError::new("marketSourceUnknown")
                 .value("plugin", plugin_name)
                 .detail(verified.source_binding_detail.clone().unwrap_or_default()));
         }
-        SourceBindingStatus::Verified => {}
-    }
-    if force {
-        return Ok(());
+        SourceBindingStatus::Verified | SourceBindingStatus::NotChecked => {}
     }
     match verified.info.status {
         CompatibilityStatus::Incompatible => Err(AppError::new("marketIncompatible")
@@ -3745,7 +4546,7 @@ fn validate_expected_package_version(
             .value("plugin", plugin_name)
             .value("expected", expected)
             .value("actual", resolved.unwrap_or("unavailable"))
-            .detail("registry latest changed after install confirmation"));
+            .detail("installation details changed after confirmation"));
     }
     Ok(())
 }
@@ -3798,12 +4599,9 @@ fn installed_cordis_version(paths: &ApplicationPaths) -> Option<String> {
 }
 
 fn fetch_registry_package_info_with(
-    plugin: &MarketPlugin,
+    pkg: &str,
     client: Option<&reqwest::blocking::Client>,
 ) -> AppResult<RegistryPackageInfo> {
-    let pkg = install_package_name(plugin).ok_or_else(|| {
-        AppError::new("marketCatalogInvalid").detail("invalid npm package target")
-    })?;
     let encoded = pkg.replace('/', "%2F");
     let url = format!("{NPM_REGISTRY}/{encoded}");
     let bytes = fetch_bytes_with(
@@ -4356,6 +5154,427 @@ mod tests {
         assert_eq!(plugins[0].name, "alpha");
     }
 
+    fn trading_plugin() -> MarketPlugin {
+        let mut item = plugin("zhu1090093659/dsh-trading", "dsh-trading", 0, None);
+        item.install = Some(MarketInstallInfo {
+            method: Some("pnpm-profile".into()),
+            needs_config: Some(false),
+            commands: vec![
+                "dsh plugin --profile trading-web add @dshtrading/base @dshtrading/crypto @dshtrading/us".into(),
+                "dsh plugin --profile trading-web add @dshtrading/base @dshtrading/crypto @dshtrading/us @dshtrading/cn @dshtrading/hk".into(),
+            ],
+        });
+        item
+    }
+
+    #[test]
+    fn install_plan_keeps_all_packages_and_profile_without_combining_alternatives() {
+        let plan = install_plan(&trading_plugin()).expect("plan");
+        assert_eq!(plan.profile, "trading-web");
+        assert_eq!(
+            plan.packages,
+            ["@dshtrading/base", "@dshtrading/crypto", "@dshtrading/us"]
+        );
+        let other = install_plan_from_command("dsh plugin add --profile=readPaper --save-exact @deepseek-ai/dsh-web-app paper-review@latest paper-review").unwrap();
+        assert_eq!(other.profile, "readPaper");
+        assert_eq!(other.packages, ["@deepseek-ai/dsh-web-app", "paper-review"]);
+        assert_eq!(
+            install_plan_from_command("pnpm add alpha beta")
+                .unwrap()
+                .profile,
+            "web"
+        );
+        for command in [
+            "dsh plugin --profile ../escape add alpha beta",
+            "dsh plugin --profile C:\\escape add alpha",
+            "dsh plugin --profile <name> add alpha",
+            "dsh plugin --profile add alpha",
+            "dsh plugin add alpha ./local",
+            "dsh plugin add alpha github:owner/repo",
+            "dsh plugin add alpha && pnpm add beta",
+            "dsh plugin add alpha --dir /tmp/escape",
+            "echo add alpha beta",
+        ] {
+            assert!(install_plan_from_command(command).is_none(), "{command}");
+        }
+    }
+
+    fn verified_package(name: &str) -> CachedCompatibility {
+        CachedCompatibility {
+            package_name: name.into(),
+            package_version: Some("1.0.0".into()),
+            resolved_packages: Vec::new(),
+            cordis_version: Some("4.0.0".into()),
+            checked_at_ms: now_ms(),
+            info: CompatibilityInfo {
+                status: CompatibilityStatus::Compatible,
+                detail: None,
+            },
+            source_binding: SourceBindingStatus::Verified,
+            source_binding_detail: None,
+        }
+    }
+
+    #[test]
+    fn multi_package_confirmation_binds_every_version_and_profile_and_fails_closed() {
+        let plan = install_plan(&trading_plugin()).unwrap();
+        let entries = plan
+            .packages
+            .iter()
+            .map(|p| verified_package(p))
+            .collect::<Vec<_>>();
+        let verified = aggregate_compatibility(Some(&plan), entries.clone(), None);
+        validate_install_metadata("trading", false, &verified).unwrap();
+        let mut changed = entries.clone();
+        changed[0].package_version = Some("1.0.1".into());
+        let changed = aggregate_compatibility(Some(&plan), changed, None);
+        assert!(
+            validate_expected_package_version(
+                "trading",
+                verified.package_version.as_deref(),
+                changed.package_version.as_deref()
+            )
+            .is_err()
+        );
+        let mut other = plan.clone();
+        other.profile = "other".into();
+        assert_ne!(
+            verified.package_version,
+            aggregate_compatibility(Some(&other), entries.clone(), None).package_version
+        );
+        let mut missing = entries.clone();
+        missing[0].source_binding = SourceBindingStatus::Unknown;
+        missing[0].source_binding_detail = Some("repository missing".into());
+        let missing = aggregate_compatibility(Some(&plan), missing, None);
+        assert_eq!(
+            validate_install_metadata("trading", false, &missing)
+                .unwrap_err()
+                .code,
+            "marketSourceUnknown"
+        );
+        validate_install_metadata("trading", true, &missing).unwrap();
+        assert!(
+            missing
+                .source_binding_detail
+                .unwrap()
+                .contains("@dshtrading/base")
+        );
+        let mut incompatible = entries;
+        incompatible[1].info.status = CompatibilityStatus::Incompatible;
+        let incompatible = aggregate_compatibility(Some(&plan), incompatible, None);
+        assert_eq!(
+            validate_install_metadata("trading", false, &incompatible)
+                .unwrap_err()
+                .code,
+            "marketIncompatible"
+        );
+    }
+
+    #[test]
+    fn forced_source_consent_expires_when_any_warning_changes_and_cannot_skip_failed_resolution() {
+        let plan = install_plan(&trading_plugin()).unwrap();
+        let mut entries: Vec<_> = plan
+            .packages
+            .iter()
+            .map(|package| verified_package(package))
+            .collect();
+        for entry in &mut entries {
+            entry.source_binding = SourceBindingStatus::Unknown;
+            entry.source_binding_detail = Some("repository missing".into());
+        }
+        let missing = aggregate_compatibility(Some(&plan), entries.clone(), None);
+        validate_install_metadata("trading", true, &missing).unwrap();
+        for package in &plan.packages {
+            assert!(
+                missing
+                    .source_binding_detail
+                    .as_ref()
+                    .unwrap()
+                    .contains(package)
+            );
+        }
+        entries[2].source_binding = SourceBindingStatus::Mismatch;
+        entries[2].source_binding_detail = Some("https://github.com/other/repository".into());
+        let changed = aggregate_compatibility(Some(&plan), entries.clone(), None);
+        assert!(
+            validate_expected_package_version(
+                "trading",
+                missing.package_version.as_deref(),
+                changed.package_version.as_deref()
+            )
+            .is_err()
+        );
+        let unchanged = aggregate_compatibility(Some(&plan), entries.clone(), None);
+        assert_eq!(changed.package_version, unchanged.package_version);
+        entries[0].package_version = None;
+        let incomplete = aggregate_compatibility(Some(&plan), entries, None);
+        assert_eq!(incomplete.package_version, None);
+        assert_eq!(
+            validate_install_metadata("trading", true, &incomplete)
+                .unwrap_err()
+                .code,
+            "marketNetworkFailed"
+        );
+    }
+
+    // The fake pnpm only reads/writes its temporary candidate. No network,
+    // real package scripts, user homes, or credential APIs participate.
+    #[cfg(unix)]
+    pub(super) fn fake_marketplace(temp: &Path) -> Marketplace {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = temp.join("fake-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join("pnpm");
+        fs::write(
+            &executable,
+            r#"#!/usr/bin/python3
+import json, pathlib, sys
+if sys.argv[1:] == ['--version']:
+    print('10.12.3')
+    sys.exit(0)
+root = pathlib.Path(__file__).resolve().parent.parent
+cwd = pathlib.Path.cwd().resolve()
+assert root in cwd.parents
+with (root / 'calls.jsonl').open('a') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\n')
+manifest = cwd / 'package.json'
+m = json.loads(manifest.read_text())
+for spec in sys.argv[2:]:
+    if spec.startswith('--'): continue
+    if sys.argv[1] == 'remove': m['dependencies'].pop(spec, None)
+    else:
+        name, version = spec.rsplit('@', 1)
+        m['dependencies'][name] = version
+manifest.write_text(json.dumps(m))
+for name, version in m['dependencies'].items():
+    dest = cwd / 'node_modules' / name
+    dest.mkdir(parents=True, exist_ok=True)
+    package = {'name': name, 'version': version, 'dsh': {'bundle': {'patch': {}}}}
+    fixture = root / 'package-fixtures.json'
+    if fixture.exists(): package.update(json.loads(fixture.read_text()).get(name, {}))
+    (dest / 'package.json').write_text(json.dumps(package))
+race = root / 'edit-profile'
+if race.exists():
+    active = root / 'home/dsh-home/profiles' / race.read_text().strip()
+    (active / 'cordis.patch.yml').write_text('# edited concurrently\n[]\n')
+if (root / 'fail').exists(): sys.exit(7)
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.join("home")));
+        fs::create_dir_all(marketplace.paths.node_bin.parent().unwrap()).unwrap();
+        fs::create_dir_all(marketplace.paths.dsh_bin.parent().unwrap()).unwrap();
+        fs::write(&marketplace.paths.node_bin, "fake node").unwrap();
+        fs::write(&marketplace.paths.dsh_bin, "fake harness").unwrap();
+        *marketplace.pnpm_bin.lock().unwrap() = Some(bin);
+        marketplace
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_package_transaction_creates_custom_profile_and_rolls_back_to_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let marketplace = fake_marketplace(temp.path());
+        let plan = install_plan(&trading_plugin()).unwrap();
+        let specs = plan
+            .packages
+            .iter()
+            .map(|p| format!("{p}@1.0.0"))
+            .collect::<Vec<_>>();
+        let change = PendingMarketChange {
+            plugin_id: "zhu1090093659/dsh-trading".into(),
+            name: "trading".into(),
+            action: MarketOperationKind::Install,
+            profile: Some(plan.profile.clone()),
+        };
+        marketplace
+            .mutate_profile_packages(&plan.profile, "add", &specs, &change)
+            .unwrap();
+        let manifest =
+            read_manifest(&marketplace.profile_dir(&plan.profile).join("package.json")).unwrap();
+        assert_eq!(manifest.dependencies.len(), 3);
+        assert_eq!(
+            manifest.bundles,
+            [
+                "@deepseek-ai/dsh-base",
+                "@dshtrading/base",
+                "@dshtrading/crypto",
+                "@dshtrading/us"
+            ]
+        );
+        assert!(!marketplace.profile_dir("web").exists());
+        let calls = fs::read_to_string(temp.path().join("calls.jsonl")).unwrap();
+        assert_eq!(calls.lines().count(), 1);
+        let args: Vec<String> = serde_json::from_str(calls.lines().next().unwrap()).unwrap();
+        assert_eq!(&args[1..4], &specs);
+        assert!(args.contains(&"--ignore-scripts".into()));
+        assert!(
+            marketplace
+                .profile_dir(&plan.profile)
+                .join("pnpm-workspace.yaml")
+                .is_file()
+        );
+        let catalog = catalog(vec![trading_plugin()]);
+        let installed = marketplace.scan_installed(Some(&catalog));
+        assert_eq!(installed.len(), 1);
+        assert!(installed[0].grouped);
+        assert_eq!(installed[0].packages.len(), 3);
+        assert!(
+            InstalledIndex::build(installed)
+                .for_plugin(&trading_plugin())
+                .is_some()
+        );
+        marketplace.rollback_pending().unwrap();
+        assert!(!marketplace.profile_dir(&plan.profile).exists());
+        assert!(
+            fs::read_dir(marketplace.profiles_dir())
+                .unwrap()
+                .flatten()
+                .any(|e| e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".trading-web.market-rejected-"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_multi_package_transaction_preserves_existing_profile_and_leaves_no_new_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let marketplace = fake_marketplace(temp.path());
+        fs::create_dir_all(marketplace.profiles_dir()).unwrap();
+        let web = marketplace.profile_dir("web");
+        create_profile_candidate(&web, "web", &new_profile_manifest("web")).unwrap();
+        fs::write(web.join("cordis.patch.yml"), "# user configuration\n[]\n").unwrap();
+        let before = fs::read(web.join("package.json")).unwrap();
+        fs::write(temp.path().join("fail"), "").unwrap();
+        let specs = vec!["alpha@1.0.0".into(), "beta@1.0.0".into()];
+        for profile in ["web", "trading-web"] {
+            let change = PendingMarketChange {
+                plugin_id: "x/alpha".into(),
+                name: "alpha".into(),
+                action: MarketOperationKind::Install,
+                profile: Some(profile.into()),
+            };
+            assert!(
+                marketplace
+                    .mutate_profile_packages(profile, "add", &specs, &change)
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read(web.join("package.json")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(web.join("cordis.patch.yml")).unwrap(),
+            "# user configuration\n[]\n"
+        );
+        assert!(!marketplace.profile_dir("trading-web").exists());
+        assert!(!marketplace.pending_file().exists());
+        assert_eq!(fs::read_dir(marketplace.profiles_dir()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn partial_or_other_profile_install_does_not_mark_multi_package_plan_complete() {
+        let plugin = trading_plugin();
+        let plan = install_plan(&plugin).unwrap();
+        let mut entries = plan
+            .packages
+            .iter()
+            .map(|package| InstalledPlugin {
+                plugin_id: Some(plugin.id.clone()),
+                local_name: package.clone(),
+                version: Some("1.0.0".into()),
+                grouped: false,
+                packages: Vec::new(),
+                retained_packages: Vec::new(),
+                source: PluginSource::Profile,
+                profile: Some("web".into()),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            InstalledIndex::build(entries.clone())
+                .for_plugin(&plugin)
+                .is_none()
+        );
+        for entry in &mut entries {
+            entry.profile = Some(plan.profile.clone());
+        }
+        entries.pop();
+        assert!(InstalledIndex::build(entries).for_plugin(&plugin).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completing_a_partial_plan_preserves_existing_packages_and_bundle_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let marketplace = fake_marketplace(temp.path());
+        let change = PendingMarketChange {
+            plugin_id: "x/group".into(),
+            name: "group".into(),
+            action: MarketOperationKind::Install,
+            profile: Some("custom".into()),
+        };
+        marketplace
+            .mutate_profile_packages("custom", "add", &["zeta@1.0.0".into()], &change)
+            .unwrap();
+        let specs = vec![
+            "zeta@1.0.0".into(),
+            "gamma@1.0.0".into(),
+            "alpha@1.0.0".into(),
+        ];
+        marketplace
+            .mutate_profile_packages("custom", "add", &specs, &change)
+            .unwrap();
+        let manifest =
+            read_manifest(&marketplace.profile_dir("custom").join("package.json")).unwrap();
+        assert_eq!(
+            manifest.bundles,
+            ["@deepseek-ai/dsh-base", "zeta", "gamma", "alpha"]
+        );
+        let calls = fs::read_to_string(temp.path().join("calls.jsonl")).unwrap();
+        let args: Vec<String> = serde_json::from_str(calls.lines().nth(1).unwrap()).unwrap();
+        assert!(!args.contains(&"zeta@1.0.0".into()));
+        let before = fs::read(marketplace.profile_dir("custom").join("package.json")).unwrap();
+        assert_eq!(
+            marketplace
+                .mutate_profile_packages(
+                    "custom",
+                    "add",
+                    &["zeta@2.0.0".into(), "beta@1.0.0".into()],
+                    &change
+                )
+                .unwrap_err()
+                .code,
+            "marketAlreadyInstalled"
+        );
+        assert_eq!(
+            fs::read(marketplace.profile_dir("custom").join("package.json")).unwrap(),
+            before
+        );
+        marketplace.rollback_pending().unwrap();
+        assert!(!marketplace.profile_dir("custom").exists());
+    }
+
+    #[test]
+    fn crash_before_new_profile_publication_restores_absence_and_discards_journal_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let marketplace = Marketplace::new(ApplicationPaths::from_home(temp.path().join("home")));
+        fs::create_dir_all(marketplace.profiles_dir()).unwrap();
+        let candidate = marketplace.profile_dir(".custom.market-candidate-interrupted");
+        create_profile_candidate(&candidate, "custom", &new_profile_manifest("custom")).unwrap();
+        let last_good = marketplace.last_good_profile("custom");
+        fs::create_dir(&last_good).unwrap();
+        fs::write(last_good.join(".market-profile-absent"), "").unwrap();
+        marketplace
+            .write_pending_change("x/group", "group", MarketOperationKind::Install, "custom")
+            .unwrap();
+        marketplace.recover_profile_transaction("custom").unwrap();
+        assert!(!marketplace.profile_dir("custom").exists());
+        assert!(!last_good.exists());
+        assert!(!candidate.exists());
+        assert!(!marketplace.pending_file().exists());
+    }
+
     #[test]
     fn package_name_comes_from_npm_homepage() {
         let mut item = plugin("x/x", "x", 0, None);
@@ -4518,7 +5737,11 @@ mod tests {
     fn pnpm_remove_uses_supported_safe_recovery_flags() {
         assert_eq!(
             pnpm_mutation_flags("add"),
-            &["--ignore-scripts", "--strict-peer-dependencies"]
+            &[
+                "--ignore-scripts",
+                "--strict-peer-dependencies",
+                "--save-exact"
+            ]
         );
         assert_eq!(
             pnpm_mutation_flags("remove"),
@@ -4801,6 +6024,9 @@ mod tests {
             plugin_id: Some("x/url-manager".into()),
             local_name: "url-manager".into(),
             version: None,
+            grouped: false,
+            packages: Vec::new(),
+            retained_packages: Vec::new(),
             source: PluginSource::Skills,
             profile: None,
         };
@@ -5368,6 +6594,7 @@ mod tests {
     #[test]
     fn compatibility_cache_expires_and_is_bound_to_runtime_and_package() {
         let cached = CachedCompatibility {
+            resolved_packages: Vec::new(),
             package_name: "alpha".into(),
             package_version: Some("1.0.0".into()),
             cordis_version: Some("1.2.3".into()),
@@ -5427,8 +6654,9 @@ mod tests {
     }
 
     #[test]
-    fn forced_install_bypasses_only_the_compatibility_gate() {
+    fn forced_install_allows_reviewed_warnings_but_requires_resolved_packages() {
         let mut verified = CachedCompatibility {
+            resolved_packages: vec!["alpha@1.0.0".into()],
             package_name: "alpha".into(),
             package_version: Some("1.0.0".into()),
             cordis_version: Some("4.0.1".into()),
@@ -5454,10 +6682,25 @@ mod tests {
         validate_install_metadata("alpha", true, &verified)
             .expect("forced confirmation must allow incompatible metadata");
 
-        verified.source_binding = SourceBindingStatus::Mismatch;
-        let blocked = validate_install_metadata("alpha", true, &verified)
-            .expect_err("force must not bypass repository binding verification");
-        assert_eq!(blocked.code, "marketSourceMismatch");
+        for status in [SourceBindingStatus::Mismatch, SourceBindingStatus::Unknown] {
+            verified.source_binding = status;
+            assert!(validate_install_metadata("alpha", false, &verified).is_err());
+            validate_install_metadata("alpha", true, &verified)
+                .expect("explicit consent permits source warnings");
+        }
+        verified.package_version = None;
+        assert_eq!(
+            validate_install_metadata("alpha", true, &verified)
+                .unwrap_err()
+                .code,
+            "marketNetworkFailed"
+        );
+        verified.package_version = Some("1.0.0".into());
+        verified.resolved_packages.clear();
+        assert!(validate_install_metadata("alpha", true, &verified).is_err());
+        verified.resolved_packages.push("alpha@1.0.0".into());
+        verified.source_binding = SourceBindingStatus::NotChecked;
+        assert!(validate_install_metadata("alpha", true, &verified).is_err());
     }
 
     #[test]
@@ -5521,6 +6764,9 @@ mod tests {
             plugin_id: Some("x/alpha".into()),
             local_name: "alpha-latest".into(),
             version: Some("latest".into()),
+            grouped: false,
+            packages: Vec::new(),
+            retained_packages: Vec::new(),
             source: PluginSource::Skills,
             profile: None,
         };
@@ -5814,7 +7060,7 @@ mod tests {
         assert_eq!(pending.changes.len(), 2);
         assert!(pending.changes[0].plugin_id.is_empty());
         assert_eq!(pending.changes[1].name, "new-plugin");
-        assert_eq!(marketplace.pending_change_summary(), "new-plugin, web");
+        assert_eq!(marketplace.pending_web_change_summary(), "new-plugin, web");
     }
 
     #[test]

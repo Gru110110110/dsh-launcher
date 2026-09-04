@@ -5,6 +5,7 @@ import type {
   MarketSort,
   PendingVerification,
   PluginKind,
+  PluginSummary,
 } from "@/platform/generated/bindings";
 
 export const MARKET_PAGE_SIZE = 24;
@@ -178,14 +179,36 @@ export function isRetryableMarketRefreshError(error: unknown): boolean {
   return (candidate.values as Record<string, unknown>).retryable === "true";
 }
 
-export function isForceableCompatibilityError(error: unknown): boolean {
+export function isForceableInstallError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const code = (error as { code?: unknown }).code;
-  return code === "marketIncompatible" || code === "marketCompatUnknown";
+  return (
+    code === "marketIncompatible" ||
+    code === "marketCompatUnknown" ||
+    code === "marketSourceUnknown" ||
+    code === "marketSourceMismatch"
+  );
 }
 
 export function marketConflictDetail(error: unknown): string | undefined {
   if (typeof error !== "object" || error === null) return undefined;
   const detail = (error as { safeDetail?: unknown }).safeDetail;
   return typeof detail === "string" && detail.length > 0 ? detail : undefined;
+}
+
+export function installReviewState(
+  plugin: Pick<
+    PluginSummary,
+    "kind" | "installVersion" | "sourceBinding" | "compatibility"
+  >,
+): "blocked" | "warning" | "normal" {
+  if (plugin.installVersion === null) return "blocked";
+  if (plugin.kind === "skill") return "normal";
+  if (plugin.sourceBinding === "notChecked") return "blocked";
+  if (
+    plugin.sourceBinding !== "verified" ||
+    plugin.compatibility !== "compatible"
+  )
+    return "warning";
+  return "normal";
 }

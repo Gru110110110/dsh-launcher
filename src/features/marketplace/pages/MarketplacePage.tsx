@@ -34,7 +34,8 @@ import {
   formatScore,
   formatStars,
   installedFilterValue,
-  isForceableCompatibilityError,
+  isForceableInstallError,
+  installReviewState,
   isMarketCatalogUnavailable,
   isRetryableMarketRefreshError,
   marketCatalogView,
@@ -369,11 +370,12 @@ export function MarketplacePage() {
     };
   }, []);
 
-  // Clear only after a service start newer than the installation. Merely
-  // setting `pending` while an older service is already ready must retain the
-  // marker until that service has actually restarted.
+  // Read the backend journal after a newer start; never synthesize a
+  // verification snapshot that could disagree with durable cleanup state.
+  const checkedServiceStart = useRef<number | null>(null);
   useEffect(() => {
-    if (!pending) return;
+    if (!pending || checkedServiceStart.current === launcher.serviceStartedAtMs)
+      return;
     if (
       shouldClearPendingVerification(
         launcher.phase,
@@ -381,9 +383,10 @@ export function MarketplacePage() {
         pending.installedAtMs,
       )
     ) {
-      setPending(null);
+      checkedServiceStart.current = launcher.serviceStartedAtMs;
+      runPendingQuery();
     }
-  }, [launcher.phase, launcher.serviceStartedAtMs, pending, translate]);
+  }, [launcher.phase, launcher.serviceStartedAtMs, pending, runPendingQuery]);
 
   // Track the displayed catalog generation so background refreshes can tell
   // whether the data actually changed.
@@ -558,7 +561,10 @@ export function MarketplacePage() {
     marketApi
       .inspect(plugin.id)
       .then((inspected) => {
-        setConflict({ plugin: inspected, force: false });
+        setConflict({
+          plugin: inspected,
+          force: installReviewState(inspected) === "warning",
+        });
       })
       .catch((error: unknown) => {
         showTimedError(error, translate);
@@ -582,17 +588,15 @@ export function MarketplacePage() {
       .install(plugin.id, force, plugin.installVersion)
       .then((result) => {
         if (!result.ok) {
-          if (!force && isForceableCompatibilityError(result.error)) {
+          if (!force && isForceableInstallError(result.error)) {
             confirmForcedInstall(plugin, result.error);
             return;
           }
           showTimedError(result.error, translate);
           return;
         }
+        runPendingQuery();
         if (result.restartRequired) {
-          // Keep the verification marker visible in-session: if the harness
-          // fails after the restart, the pending banner must appear.
-          runPendingQuery();
           toast.success(
             t("market.toast.installedRestartRequired", {
               plugin: plugin.name,
@@ -625,7 +629,7 @@ export function MarketplacePage() {
         runQuery(query);
       })
       .catch((error: unknown) => {
-        if (!force && isForceableCompatibilityError(error)) {
+        if (!force && isForceableInstallError(error)) {
           confirmForcedInstall(plugin, error);
           return;
         }
@@ -648,8 +652,8 @@ export function MarketplacePage() {
         toast.success(t("market.toast.uninstalled"), {
           id: `market-uninstalled-${pluginId}`,
         });
+        runPendingQuery();
         if (result.restartRequired) {
-          runPendingQuery();
           toast(t("market.restartRequired.detail"), {
             id: `market-restart-${pluginId}`,
             duration: 12_000,
@@ -708,43 +712,86 @@ export function MarketplacePage() {
         <p>{t("market.subtitle")}</p>
       </header>
 
-      {pending && launcher.phase === "failed" && (
-        <div className="market-pending panel" role="alert">
-          <TriangleAlert size={16} aria-hidden />
-          <span>
-            {t(
-              pending.journalRecovered
-                ? "market.pending.recoveredDetail"
-                : "market.pending.detail",
-              {
-                plugin: pendingChangeLabels(pending).join(", "),
-              },
-            )}
-          </span>
-          <button
-            className="outline-button danger"
-            type="button"
-            disabled={busyPlugin !== null || launcher.marketBusy}
-            onClick={() => {
-              setBusyPlugin(pending.pluginId);
-              void marketApi
-                .rollbackPending()
-                .then(() => {
-                  setPending(null);
-                  return launcherApi.retry();
-                })
-                .catch((error: unknown) => {
-                  showTimedError(error, translate);
-                })
-                .finally(() => {
-                  setBusyPlugin(null);
-                });
-            }}
-          >
-            {t("market.pending.rollback")}
-          </button>
-        </div>
-      )}
+      {pending &&
+        (launcher.phase === "failed" ||
+          pending.changes.some((change) => change.profile !== "web")) && (
+          <div className="market-pending panel" role="alert">
+            <TriangleAlert size={16} aria-hidden />
+            <span>
+              {t(
+                launcher.phase !== "failed"
+                  ? "market.pending.customDetail"
+                  : pending.journalRecovered
+                    ? "market.pending.recoveredDetail"
+                    : "market.pending.detail",
+                {
+                  plugin: pendingChangeLabels(pending).join(", "),
+                },
+              )}
+            </span>
+            <button
+              className="outline-button danger"
+              type="button"
+              disabled={
+                busyPlugin !== null ||
+                launcher.marketBusy ||
+                (launcher.phase === "ready" &&
+                  pending.changes.some((change) => change.profile === "web"))
+              }
+              title={
+                launcher.phase === "ready" &&
+                pending.changes.some((change) => change.profile === "web")
+                  ? t("error.marketRollbackRequiresStop")
+                  : undefined
+              }
+              onClick={() => {
+                setBusyPlugin(pending.pluginId);
+                void marketApi
+                  .rollbackPending()
+                  .then(() => {
+                    setPending(null);
+                    runQuery(buildQuery(pageNumber));
+                    if (launcher.phase === "failed") return launcherApi.retry();
+                  })
+                  .catch((error: unknown) => {
+                    showTimedError(error, translate);
+                  })
+                  .finally(() => {
+                    setBusyPlugin(null);
+                  });
+              }}
+            >
+              {t("market.pending.rollback")}
+            </button>
+            {pending.changes.length > 0 &&
+              pending.changes.every(
+                (change) => change.profile && change.profile !== "web",
+              ) && (
+                <button
+                  className="outline-button"
+                  type="button"
+                  disabled={busyPlugin !== null || launcher.marketBusy}
+                  onClick={() => {
+                    setBusyPlugin(pending.pluginId);
+                    void marketApi
+                      .acceptCustomPending(pending)
+                      .then(() => {
+                        setPending(null);
+                      })
+                      .catch((error: unknown) => {
+                        showTimedError(error, translate);
+                        runPendingQuery();
+                      })
+                      .finally(() => {
+                        setBusyPlugin(null);
+                      });
+                  }}
+                >
+                  {t("market.pending.acceptCustom")}
+                </button>
+              )}
+          </div>
+        )}
 
       <div className="market-toolbar">
         <label className="market-search">

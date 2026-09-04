@@ -39,6 +39,8 @@ export const marketApi = {
     command<MarketOperationResult>("market_uninstall", { pluginId, target }),
   pendingVerification: () =>
     command<PendingVerification | null>("market_pending_verification"),
+  acceptCustomPending: (expected: PendingVerification) =>
+    action("market_accept_custom_pending", { expected }),
   rollbackPending: () => action("market_rollback_pending"),
   openGithub: (pluginId: string) =>
     action("market_open_plugin_github", { pluginId }),
@@ -120,6 +122,9 @@ if (firstDevPlugin !== undefined) {
       version: "0.3.1",
       source: "profile",
       profile: "web",
+      grouped: false,
+      packages: [],
+      retainedPackages: [],
     },
   };
 }
@@ -153,6 +158,8 @@ function devPlugin(
     needsConfig: false,
     installMethod: kind === "cordisPlugin" ? "pnpm-profile" : "skills-add",
     installTarget: kind === "cordisPlugin" ? name : id,
+    installProfile: kind === "cordisPlugin" ? "web" : null,
+    installPackages: kind === "cordisPlugin" ? [`${name}@1.0.0`] : [],
     installVersion:
       kind === "cordisPlugin"
         ? "1.0.0"
@@ -274,6 +281,7 @@ if (!isTauri) {
       600,
     );
   marketApi.pendingVerification = () => delay<PendingVerification | null>(null);
+  marketApi.acceptCustomPending = () => Promise.resolve();
   marketApi.rollbackPending = () => Promise.resolve();
   marketApi.openGithub = () => Promise.resolve();
 }

@@ -4,6 +4,8 @@ import { useTranslation } from "react-i18next";
 import { useLauncherSelector } from "@/platform/launcherStore";
 import type { PluginSummary } from "@/platform/generated/bindings";
 
+import { installReviewState } from "../presentation";
+
 const BINDING_TRANSLATION_KEYS = {
   notChecked: "market.install.binding.notChecked",
   verified: "market.install.binding.verified",
@@ -32,8 +34,10 @@ export function ConfirmInstallDialog({
   const submitted = useRef(false);
   const [submitting, setSubmitting] = useState(false);
 
+  const confirmDisabled = disabled || installReviewState(plugin) === "blocked";
+
   const confirmOnce = () => {
-    if (disabled || submitted.current) return;
+    if (confirmDisabled || submitted.current) return;
     submitted.current = true;
     setSubmitting(true);
     onConfirm();
@@ -86,22 +90,63 @@ export function ConfirmInstallDialog({
         <p className="market-dialog-detail">
           {t("market.install.source", { source: plugin.id })}
           <br />
-          {t("market.install.target", { target: plugin.installTarget })}
-          <br />
-          {t("market.install.version", {
-            version:
-              plugin.installVersion ?? t("market.install.versionPending"),
-          })}
-          <br />
+          {plugin.kind === "cordisPlugin" ? (
+            <>
+              {t("market.install.profile", { profile: plugin.installProfile })}
+              <br />
+              {t("market.install.target", {
+                target: plugin.installPackages.join(", "),
+              })}
+              <br />
+              {plugin.installProfile !== "web" && (
+                <>
+                  {t("market.install.profileLaunch", {
+                    profile: plugin.installProfile,
+                  })}
+                  <br />
+                </>
+              )}
+            </>
+          ) : (
+            <>
+              {t("market.install.target", { target: plugin.installTarget })}
+              <br />
+              {t("market.install.version", {
+                version:
+                  plugin.installVersion ?? t("market.install.versionPending"),
+              })}
+              <br />
+            </>
+          )}
           {t(
             plugin.kind === "skill"
               ? "market.install.binding.skill"
               : BINDING_TRANSLATION_KEYS[plugin.sourceBinding],
           )}
         </p>
-        {detail !== undefined && detail.length > 0 && (
-          <p className="market-dialog-detail">{detail}</p>
+        {installReviewState(plugin) === "blocked" && (
+          <p className="market-dialog-detail" role="alert">
+            {t("market.install.unresolved")}
+          </p>
         )}
+        {plugin.kind === "cordisPlugin" && plugin.sourceBindingDetail && (
+          <p className="market-dialog-detail" role="alert">
+            {plugin.sourceBindingDetail}
+          </p>
+        )}
+        {plugin.kind === "cordisPlugin" &&
+          plugin.compatibility !== "compatible" && (
+            <p className="market-dialog-detail">
+              {t("market.confirm.compatibility")}
+              {plugin.compatibilityDetail && <> {plugin.compatibilityDetail}</>}
+            </p>
+          )}
+        {detail !== undefined &&
+          detail.length > 0 &&
+          detail !== plugin.sourceBindingDetail &&
+          detail !== plugin.compatibilityDetail && (
+            <p className="market-dialog-detail">{detail}</p>
+          )}
         <footer className="market-dialog-actions">
           <button
             ref={cancelButton}
@@ -114,7 +159,7 @@ export function ConfirmInstallDialog({
           <button
             className="primary-button danger-button"
             type="button"
-            disabled={disabled || submitting}
+            disabled={confirmDisabled || submitting}
             onClick={confirmOnce}
           >
             {t(

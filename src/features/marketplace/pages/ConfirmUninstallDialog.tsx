@@ -75,8 +75,26 @@ export function ConfirmUninstallDialog({
         <p className="market-dialog-copy">{t("market.uninstall.detail")}</p>
         <p className="market-dialog-detail">{location}</p>
         <p className="market-dialog-detail">
-          {t("market.uninstall.target", { target: target.localName })}
+          {target.grouped
+            ? target.packages.length > 0
+              ? t("market.uninstall.packages", {
+                  packages: target.packages.join(", "),
+                })
+              : t("market.uninstall.recordOnly")
+            : t("market.uninstall.target", { target: target.localName })}
         </p>
+        {target.grouped && target.retainedPackages.length > 0 && (
+          <p className="market-dialog-detail">
+            {t("market.uninstall.retained", {
+              packages: target.retainedPackages.join(", "),
+            })}
+          </p>
+        )}
+        {target.grouped && (
+          <p className="market-dialog-copy">
+            {t("market.uninstall.preserveConfig")}
+          </p>
+        )}
         <footer className="market-dialog-actions">
           <button
             ref={cancelButton}

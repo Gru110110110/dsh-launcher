@@ -532,7 +532,7 @@ impl AppState {
         }) {
             return Err(AppError::new("serviceNotReady"));
         }
-        let had_pending_market_change = self.marketplace.has_pending_rollback();
+        let had_pending_market_change = self.marketplace.has_pending_web_rollback();
         let restarted = {
             let mut server = self.server.lock().expect("server poisoned");
             if let Err(error) = server.stop() {
@@ -543,7 +543,10 @@ impl AppState {
         };
         match restarted {
             Ok(url) => {
-                if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
+                if let Err(error) = self
+                    .marketplace
+                    .clear_web_pending_verification_while_guarded()
+                {
                     log::warn!("could not clear verified marketplace rollback state: {error}");
                 }
                 self.prune_startup_repair_backups_after_healthy_start();
@@ -560,11 +563,11 @@ impl AppState {
                 if had_pending_market_change
                     && should_rollback_marketplace_after_start_failure(&error, false) =>
             {
-                let plugins = self.marketplace.pending_change_summary();
+                let plugins = self.marketplace.pending_web_change_summary();
                 log::error!(
                     "Harness did not publish an address with an unverified marketplace batch; rolling back: {error}"
                 );
-                if let Err(rollback_error) = self.marketplace.rollback_pending_while_guarded() {
+                if let Err(rollback_error) = self.marketplace.rollback_web_pending_while_guarded() {
                     self.fail(rollback_error.clone());
                     return Err(rollback_error);
                 }
@@ -775,8 +778,8 @@ impl AppState {
             {
                 Ok(removed) => removed,
                 Err(error) => {
-                    let plugin_rollback = if self.marketplace.has_pending_rollback() {
-                        self.marketplace.rollback_pending_while_guarded()
+                    let plugin_rollback = if self.marketplace.has_pending_web_rollback() {
+                        self.marketplace.rollback_web_pending_while_guarded()
                     } else {
                         Ok(())
                     };
@@ -800,7 +803,10 @@ impl AppState {
         });
         match self.server.lock().expect("server poisoned").start() {
             Ok(url) => {
-                if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
+                if let Err(error) = self
+                    .marketplace
+                    .clear_web_pending_verification_while_guarded()
+                {
                     log::warn!("verified startup repair left marketplace cleanup work: {error}");
                 }
                 if let Err(error) = cache_repair.verify() {
@@ -828,8 +834,8 @@ impl AppState {
                 Ok(())
             }
             Err(error) => {
-                let plugin_rollback = if self.marketplace.has_pending_rollback() {
-                    self.marketplace.rollback_pending_while_guarded()
+                let plugin_rollback = if self.marketplace.has_pending_web_rollback() {
+                    self.marketplace.rollback_web_pending_while_guarded()
                 } else {
                     Ok(())
                 };
@@ -1128,7 +1134,10 @@ impl AppState {
         }
         match started {
             Ok(url) => {
-                if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
+                if let Err(error) = self
+                    .marketplace
+                    .clear_web_pending_verification_while_guarded()
+                {
                     log::warn!("could not clear verified marketplace rollback state: {error}");
                 }
                 self.prune_startup_repair_backups_after_healthy_start();
@@ -1145,17 +1154,17 @@ impl AppState {
                 });
             }
             Err(error)
-                if self.marketplace.has_pending_rollback()
+                if self.marketplace.has_pending_web_rollback()
                     && should_rollback_marketplace_after_start_failure(
                         &error,
                         force || activate_prepared,
                     ) =>
             {
-                let plugins = self.marketplace.pending_change_summary();
+                let plugins = self.marketplace.pending_web_change_summary();
                 log::error!(
                     "Harness did not publish an address with an unverified marketplace batch; rolling back: {error}"
                 );
-                if let Err(rollback_error) = self.marketplace.rollback_pending_while_guarded() {
+                if let Err(rollback_error) = self.marketplace.rollback_web_pending_while_guarded() {
                     self.fail_unless_quitting(rollback_error);
                     return;
                 }
@@ -1212,7 +1221,7 @@ impl AppState {
         startup_error: &AppError,
         controller: &DeploymentController,
     ) -> Option<AppResult<(String, Vec<String>)>> {
-        if self.marketplace.has_pending_rollback() {
+        if self.marketplace.has_pending_web_rollback() {
             return None;
         }
         let candidates = incompatible_plugin_packages(startup_error);
@@ -1229,8 +1238,9 @@ impl AppState {
                 log::warn!(
                     "incompatible plugin recovery could not prepare a safe uninstall: {error}"
                 );
-                if self.marketplace.has_pending_rollback()
-                    && let Err(rollback_error) = self.marketplace.rollback_pending_while_guarded()
+                if self.marketplace.has_pending_web_rollback()
+                    && let Err(rollback_error) =
+                        self.marketplace.rollback_web_pending_while_guarded()
                 {
                     return Some(Err(rollback_error));
                 }
@@ -1250,7 +1260,10 @@ impl AppState {
             });
         match retried {
             Ok(url) => {
-                if let Err(error) = self.marketplace.clear_pending_verification_while_guarded() {
+                if let Err(error) = self
+                    .marketplace
+                    .clear_web_pending_verification_while_guarded()
+                {
                     log::warn!("verified incompatible plugin recovery left cleanup work: {error}");
                 }
                 self.prune_startup_repair_backups_after_healthy_start();
@@ -1260,7 +1273,7 @@ impl AppState {
                 log::warn!(
                     "Harness still failed after incompatible plugin removal; restoring plugins: {error}"
                 );
-                if let Err(rollback_error) = self.marketplace.rollback_pending_while_guarded() {
+                if let Err(rollback_error) = self.marketplace.rollback_web_pending_while_guarded() {
                     return Some(Err(rollback_error));
                 }
                 Some(Err(retain_incompatible_plugin_context(error, &removed)))
@@ -2781,6 +2794,7 @@ pub fn run() {
             commands::market_uninstall,
             commands::market_pending_verification,
             commands::market_rollback_pending,
+            commands::market_accept_custom_pending,
             commands::market_open_plugin_github,
             commands::remote_set_master,
             commands::remote_set_lan_enabled,
