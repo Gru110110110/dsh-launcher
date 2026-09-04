@@ -2543,6 +2543,9 @@ fn show_main_window(app: &AppHandle) {
             log::warn!("main window could not be shown: {error}");
             return;
         }
+        if let Err(error) = window.unminimize() {
+            log::warn!("main window could not be unminimized: {error}");
+        }
         if let Err(error) = window.set_focus() {
             log::warn!("main window could not be focused: {error}");
         }
@@ -2809,13 +2812,10 @@ pub fn run() {
         .expect("error while building DSH Launcher")
         .run(|app, event| match event {
             #[cfg(target_os = "macos")]
-            RunEvent::Reopen {
-                has_visible_windows,
-                ..
-            } => {
-                if !has_visible_windows {
-                    activate_main_window(app);
-                }
+            RunEvent::Reopen { .. } => {
+                // Dock activation always targets the launcher. A visible pet or an
+                // unfocused main window must not suppress restoring the main window.
+                activate_main_window(app);
             }
             RunEvent::ExitRequested { api, .. } => {
                 if let Some(state) = app.try_state::<Arc<AppState>>() {
