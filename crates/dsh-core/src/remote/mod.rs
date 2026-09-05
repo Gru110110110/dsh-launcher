@@ -49,7 +49,7 @@ struct RemoteSettings {
     /// Master switch. Defaults off: remote exposure is always opt-in.
     #[serde(default)]
     master: bool,
-    #[serde(default = "default_enabled")]
+    #[serde(default)]
     lan_enabled: bool,
     #[serde(default)]
     public_enabled: bool,
@@ -59,15 +59,11 @@ struct RemoteSettings {
     public_password: String,
 }
 
-fn default_enabled() -> bool {
-    true
-}
-
 impl Default for RemoteSettings {
     fn default() -> Self {
         Self {
             master: false,
-            lan_enabled: true,
+            lan_enabled: false,
             public_enabled: false,
             lan_password: generate_password(),
             public_password: generate_password(),
@@ -87,6 +83,14 @@ impl RemoteSettings {
         }
         if !is_valid_password(&settings.public_password) {
             settings.public_password = generate_password();
+        }
+        // The master switch is authoritative. Older versions kept the scope
+        // preferences enabled while the master switch was off, which made
+        // disabled controls misleading and unexpectedly restored exposure
+        // when the master switch was turned back on.
+        if !settings.master {
+            settings.lan_enabled = false;
+            settings.public_enabled = false;
         }
         settings
     }
@@ -225,6 +229,10 @@ impl RemoteService {
             let mut inner = self.inner.lock().expect("remote poisoned");
             let mut settings = inner.settings.clone();
             settings.master = enabled;
+            if !enabled {
+                settings.lan_enabled = false;
+                settings.public_enabled = false;
+            }
             settings.save(&self.paths)?;
             inner.settings = settings;
         }
@@ -239,7 +247,10 @@ impl RemoteService {
     pub fn set_lan_enabled(&self, enabled: bool) -> AppResult<()> {
         if enabled {
             let master = self.inner.lock().expect("remote poisoned").settings.master;
-            if master && (self.lan_address)().is_none() {
+            if !master {
+                return Err(AppError::new("remoteUnavailable"));
+            }
+            if (self.lan_address)().is_none() {
                 return Err(AppError::new("remoteLanUnavailable"));
             }
         }
@@ -259,6 +270,9 @@ impl RemoteService {
     /// acknowledgement; the check lives here, server-side, so the UI cannot
     /// be tricked into skipping it.
     pub fn set_public_enabled(&self, enabled: bool, acknowledged: bool) -> AppResult<()> {
+        if enabled && !self.inner.lock().expect("remote poisoned").settings.master {
+            return Err(AppError::new("remoteUnavailable"));
+        }
         if enabled && !acknowledged {
             return Err(AppError::new("remoteDisclaimerRequired"));
         }
@@ -728,7 +742,7 @@ mod tests {
         let (_temp, service) = service();
         let snapshot = service.snapshot();
         assert!(!snapshot.master, "remote exposure is always opt-in");
-        assert!(snapshot.lan.enabled);
+        assert!(!snapshot.lan.enabled);
         assert!(snapshot.lan.available);
         assert!(!snapshot.public.enabled);
         assert!(is_valid_password(&snapshot.lan.password));
@@ -761,12 +775,28 @@ mod tests {
     }
 
     #[test]
-    fn master_off_stops_the_lan_listener() {
+    fn master_off_stops_access_and_clears_both_scope_switches() {
+        TUNNEL_WORKER_DISABLED.store(true, Ordering::SeqCst);
         let (_temp, service) = service();
         service.set_master(true).unwrap();
+        service.set_lan_enabled(true).unwrap();
+        service.set_public_enabled(true, true).unwrap();
         assert!(service.snapshot().lan.url.is_some());
+
         service.set_master(false).unwrap();
-        assert!(service.snapshot().lan.url.is_none());
+        let disabled = service.snapshot();
+        assert!(!disabled.master);
+        assert!(!disabled.lan.enabled);
+        assert!(disabled.lan.url.is_none());
+        assert!(!disabled.public.enabled);
+        assert_eq!(disabled.public.state, RemoteTunnelState::Off);
+
+        service.set_master(true).unwrap();
+        let reenabled = service.snapshot();
+        assert!(reenabled.master);
+        assert!(!reenabled.lan.enabled);
+        assert!(!reenabled.public.enabled);
+        assert!(reenabled.lan.url.is_none());
     }
 
     #[test]
@@ -775,7 +805,7 @@ mod tests {
         service.set_master(true).unwrap();
         let snapshot = service.snapshot();
         assert!(snapshot.master);
-        assert!(snapshot.lan.enabled);
+        assert!(!snapshot.lan.enabled);
         assert!(!snapshot.lan.available);
         assert!(snapshot.lan.url.is_none());
         assert!(
@@ -819,9 +849,12 @@ mod tests {
 
         available.store(true, Ordering::SeqCst);
         service.refresh_lan().unwrap();
-        let connected = service.snapshot();
-        assert!(connected.lan.available);
-        assert!(connected.lan.url.is_some());
+        let available_but_disabled = service.snapshot();
+        assert!(available_but_disabled.lan.available);
+        assert!(available_but_disabled.lan.url.is_none());
+
+        service.set_lan_enabled(true).unwrap();
+        assert!(service.snapshot().lan.url.is_some());
 
         available.store(false, Ordering::SeqCst);
         service.refresh_lan().unwrap();
@@ -841,9 +874,49 @@ mod tests {
     #[test]
     fn public_enable_requires_disclaimer_acknowledgement() {
         let (_temp, service) = service();
+        service.set_master(true).unwrap();
         let error = service.set_public_enabled(true, false).unwrap_err();
         assert_eq!(error.code, "remoteDisclaimerRequired");
         assert!(!service.snapshot().public.enabled);
+    }
+
+    #[test]
+    fn scopes_cannot_be_enabled_while_master_is_off() {
+        let (_temp, service) = service();
+        let lan_error = service.set_lan_enabled(true).unwrap_err();
+        let public_error = service.set_public_enabled(true, true).unwrap_err();
+
+        assert_eq!(lan_error.code, "remoteUnavailable");
+        assert_eq!(public_error.code, "remoteUnavailable");
+        assert!(!service.snapshot().lan.enabled);
+        assert!(!service.snapshot().public.enabled);
+    }
+
+    #[test]
+    fn legacy_disabled_master_does_not_restore_enabled_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path());
+        std::fs::create_dir_all(&paths.remote_dir).unwrap();
+        std::fs::write(
+            &paths.remote_settings_file,
+            r#"{"master":false,"lanEnabled":true,"publicEnabled":true,"lanPassword":"12345678","publicPassword":"87654321"}"#,
+        )
+        .unwrap();
+
+        let service = RemoteService::new_with_lan_address(
+            paths,
+            Arc::new(|| Some(Ipv4Addr::new(192, 168, 1, 20))),
+        )
+        .unwrap();
+        let disabled = service.snapshot();
+        assert!(!disabled.master);
+        assert!(!disabled.lan.enabled);
+        assert!(!disabled.public.enabled);
+
+        service.set_master(true).unwrap();
+        let reenabled = service.snapshot();
+        assert!(!reenabled.lan.enabled);
+        assert!(!reenabled.public.enabled);
     }
 
     #[test]
@@ -889,10 +962,9 @@ mod tests {
         let error = service.qr_svg(RemoteScope::Lan).unwrap_err();
         assert_eq!(error.code, "remoteUnavailable");
         service.set_master(true).unwrap();
-        if service.snapshot().lan.url.is_some() {
-            let svg = service.qr_svg(RemoteScope::Lan).unwrap();
-            assert!(svg.contains("<svg"), "{svg}");
-        }
+        service.set_lan_enabled(true).unwrap();
+        let svg = service.qr_svg(RemoteScope::Lan).unwrap();
+        assert!(svg.contains("<svg"), "{svg}");
     }
 
     #[test]
