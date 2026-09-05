@@ -60,6 +60,10 @@
       "shots.pluginAlt": "DSH Launcher 插件市场页面截图",
       "shots.pluginFeature": "发现与安装插件",
       "shots.pluginDesc": "搜索、筛选并查看插件详情，在来源与兼容性检查后安全安装或卸载。",
+      "shots.pet": "桌面宠物",
+      "shots.petAlt": "DSH Launcher 桌面宠物页面截图",
+      "shots.petFeature": "陪伴并跟随任务状态",
+      "shots.petDesc": "选择桌面伙伴，预览五种状态，并调整大小、气泡、动态效果和鼠标穿透。",
       "shots.remote": "远程访问",
       "shots.remoteAlt": "DSH Launcher 远程访问页面截图",
       "shots.remoteFeature": "在手机上使用 Harness",
@@ -74,8 +78,9 @@
       "shots.pagination": "选择功能截图",
       "shots.go1": "查看启动器截图",
       "shots.go2": "查看插件市场截图",
-      "shots.go3": "查看远程访问截图",
-      "shots.go4": "查看设置截图",
+      "shots.go3": "查看桌面宠物截图",
+      "shots.go4": "查看远程访问截图",
+      "shots.go5": "查看设置截图",
       "shots.status": "第 {current} 张，共 {total} 张",
       "shots.c1": "启动器窗口 · 中文界面（可在侧栏随时切换 English）",
       "shots.c2": "浏览器里的官方 Web UI · 完整模型与会话能力",
@@ -174,6 +179,10 @@
       "shots.pluginAlt": "DSH Launcher plugin marketplace screenshot",
       "shots.pluginFeature": "Discover and install plugins",
       "shots.pluginDesc": "Search, filter, and inspect plugins, then install or remove them after source and compatibility checks.",
+      "shots.pet": "Desktop Pet",
+      "shots.petAlt": "DSH Launcher Desktop Pet screenshot",
+      "shots.petFeature": "A companion that follows your work",
+      "shots.petDesc": "Choose a companion, preview five states, and adjust its size, status bubble, motion, and click-through behavior.",
       "shots.remote": "Remote access",
       "shots.remoteAlt": "DSH Launcher remote access screenshot",
       "shots.remoteFeature": "Use Harness from your phone",
@@ -188,8 +197,9 @@
       "shots.pagination": "Choose a feature screenshot",
       "shots.go1": "View launcher screenshot",
       "shots.go2": "View plugin marketplace screenshot",
-      "shots.go3": "View remote access screenshot",
-      "shots.go4": "View settings screenshot",
+      "shots.go3": "View Desktop Pet screenshot",
+      "shots.go4": "View remote access screenshot",
+      "shots.go5": "View settings screenshot",
       "shots.status": "Slide {current} of {total}",
       "shots.c1": "Launcher window · English UI (switch to 中文 anytime in the sidebar)",
       "shots.c2": "The official Web UI in the browser · full model and session capabilities",
@@ -318,7 +328,7 @@
     });
   }
 
-  /* ---------------- 四项核心功能轮播 ---------------- */
+  /* ---------------- 五项核心功能轮播 ---------------- */
 
   (function setupProductCarousel() {
     var carousel = document.getElementById("productCarousel");

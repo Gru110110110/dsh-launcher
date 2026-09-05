@@ -2,11 +2,15 @@
 
 [English](https://github.com/Gru110110110/deepseek-harness-desktop-launcher/blob/main/README.md) | 中文
 
-DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。桌面应用负责准备隔离的 Node.js/Harness 运行环境、启动 `dsh web`，并打开官方服务实际发布的 URL。
+想用 DeepSeek Harness，又不想先折腾 Node、npm 和启动命令？DSH Launcher 是围绕已发布 `@deepseek-ai/dsh` 构建的非官方桌面启动器，这些准备工作都由应用处理。下载安装后，双击即可准备经过校验的独立运行环境、启动官方 `dsh web`，并在你选择的浏览器里打开原版 Harness Web UI。
 
-应用以 React 负责表现层，以窄接口的 Tauri 适配层负责系统能力，以可复用的 Rust 核心负责业务规则。它不 fork、也不内嵌 Harness Web UI。
+启动管理、更新、插件市场、远程访问和桌面宠物都集中在一个窗口里。托管运行环境与现有 Harness 数据分开存放，部署失败时会保留仍可使用的旧环境。
 
-实现与运维细节见 [docs/IMPLEMENTATION.zh.md](docs/IMPLEMENTATION.zh.md)。
+前往 [DSH Launcher 官网](https://dsdesktop.com) 下载 macOS 或 Windows 版本。遇到问题或有新想法，欢迎加入 QQ 群 `1121216833` 反馈交流。
+
+<img src="screenshots/qq_group.jpg" alt="DSH Launcher QQ 群 1121216833 二维码" width="320" />
+
+技术架构、数据安全与发布流程见 [docs/IMPLEMENTATION.zh.md](docs/IMPLEMENTATION.zh.md)。
 
 ## 核心功能
 
@@ -27,6 +31,8 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 可以选择土拨鼠「麻薯」、橘猫「橘子」或章鱼「泡泡」作为伙伴。
 
 「桌面宠物」是一项完整内置功能：可以选择伙伴、预览五种状态，并调整大小、气泡、动态效果和鼠标穿透。独立的透明置顶窗口会实时跟随顶层 Harness 任务：仅在模型推理时显示思考，其余活跃阶段显示工作，并在空闲、等待用户或错误时切换到相应状态。快速更新会合并，并且只在动画完整播放一轮后切换，既避免闪动，也不会积压过时状态。宠物位置与偏好会跨启动保存，也可以直接从托盘菜单显示或隐藏。
+
+![DSH Launcher 桌面宠物](screenshots/ScreenShot_pet_zh.png)
 
 ### 在手机上使用 Harness
 

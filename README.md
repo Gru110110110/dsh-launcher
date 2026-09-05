@@ -2,11 +2,15 @@
 
 English | [中文](https://github.com/Gru110110110/deepseek-harness-desktop-launcher/blob/main/README.zh.md)
 
-DSH Launcher is an unofficial desktop launcher for the published `@deepseek-ai/dsh` package. The desktop application prepares an isolated Node.js/Harness runtime, starts `dsh web`, and opens the exact URL announced by the official service.
+Want to use DeepSeek Harness without first wrestling with Node, npm, and launch commands? DSH Launcher is an unofficial desktop launcher built around the published `@deepseek-ai/dsh` package, with that setup handled inside the app. Install it once, then double-click to prepare a verified, isolated runtime, start the official `dsh web`, and open the original Harness Web UI in your chosen browser.
 
-The application uses React for presentation, a narrow Tauri command/event adapter, and a reusable Rust core. It does not fork or embed the Harness Web UI.
+Launch management, updates, the plugin marketplace, remote access, and Desktop Pet all live in one window. The managed runtime stays separate from your existing Harness data, and a failed deployment preserves the working environment.
 
-Implementation and operations details live in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
+Download the macOS or Windows build from the [DSH Launcher website](https://dsdesktop.com). Questions, bug reports, and ideas are welcome in the QQ group `1121216833`.
+
+<img src="screenshots/qq_group.jpg" alt="QR code for the DSH Launcher QQ group 1121216833" width="320" />
+
+Technical architecture, data-safety guarantees, and release details live in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
 ## Core features
 
@@ -27,6 +31,8 @@ Search, filter, inspect, one-click install, and one-click uninstall Cordis and S
 Choose Mochi the marmot, Juzi the orange cat, or Bubbles the octopus.
 
 The first-class Desktop Pet page lets you choose a companion, preview its five states, and control its size, speech bubble, motion, and mouse click-through behavior. The separate transparent always-on-top pet window follows top-level Harness work in real time: idle, reasoning-only thinking, active work, waiting for you, or error. Rapid updates are coalesced and applied only between complete animation cycles, so state changes stay smooth without building a stale playback backlog. Its position and preferences persist across launches, and the tray menu can show or hide it without reopening the main window.
+
+![DSH Launcher desktop pet](screenshots/ScreenShot_pet_en.png)
 
 ### Use Harness from your phone
 

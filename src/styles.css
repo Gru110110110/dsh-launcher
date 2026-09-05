@@ -1831,7 +1831,10 @@ button:disabled {
 .pet-master-toggle {
   display: inline-flex;
   gap: 9px;
+  flex: 0 0 auto;
   align-items: center;
+  justify-content: center;
+  min-width: 104px;
   min-height: 40px;
   padding: 0 18px;
   border: 1px solid var(--border-strong);
@@ -1841,6 +1844,7 @@ button:disabled {
   box-shadow: var(--shadow);
   font-size: 13px;
   font-weight: 650;
+  white-space: nowrap;
   cursor: pointer;
 }
 

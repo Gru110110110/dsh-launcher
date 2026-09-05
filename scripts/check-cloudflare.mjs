@@ -172,14 +172,15 @@ const css = await read("public/style.css");
 const main = await read("public/main.js");
 
 if (
-  (html.match(/<figure\b[^>]*\bdata-carousel-slide\b/gu) ?? []).length !== 4 ||
-  (html.match(/<button\b[^>]*\bdata-carousel-to=/gu) ?? []).length !== 4
+  (html.match(/<figure\b[^>]*\bdata-carousel-slide\b/gu) ?? []).length !== 5 ||
+  (html.match(/<button\b[^>]*\bdata-carousel-to=/gu) ?? []).length !== 5
 ) {
-  throw new Error("Website feature carousel must contain exactly four slides");
+  throw new Error("Website feature carousel must contain exactly five slides");
 }
 for (const screenshot of [
   "ScreenShot",
   "ScreenShot_plugin",
+  "ScreenShot_pet",
   "ScreenShot_remote",
   "ScreenShot_settings",
 ]) {
