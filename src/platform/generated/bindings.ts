@@ -216,6 +216,18 @@ export type InstalledPlugin = {
   profile: string | null;
 };
 
+export type SkillSetupStep = {
+  /**
+   * Stable digest of the plugin id and exact reviewed command. The execute
+   * endpoint accepts this id rather than caller-provided command text.
+   */
+  id: string;
+  command: string;
+  canExecute: boolean;
+};
+
+export type SkillSetupExecutionResult = { ok: boolean; output: string };
+
 export type PluginSummary = {
   id: string;
   kind: PluginKind;
@@ -233,6 +245,7 @@ export type PluginSummary = {
   pushedAt: string | null;
   updatedAt: string | null;
   needsConfig: boolean;
+  setupSteps: Array<SkillSetupStep>;
   installMethod: string;
   installTarget: string;
   installProfile: string | null;
@@ -304,6 +317,11 @@ export type MarketOperationResult = {
    */
   profile: string | null;
   error: LauncherError | null;
+  /**
+   * Additional setup disclosed by an installed skill bundle. Cordis
+   * operations and skill removals leave this empty.
+   */
+  setupSteps: Array<SkillSetupStep>;
 };
 
 export type PendingMarketChange = {

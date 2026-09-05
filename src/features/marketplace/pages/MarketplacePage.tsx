@@ -21,6 +21,7 @@ import type {
   PendingVerification,
   InstalledPlugin,
   PluginSummary,
+  SkillSetupStep,
 } from "@/platform/generated/bindings";
 import { showTimedError } from "@/shared/errorToast";
 import type { Translate } from "@/shared/presentError";
@@ -47,20 +48,25 @@ import {
   type InstalledFilter,
 } from "../presentation";
 import { ConfirmInstallDialog } from "./ConfirmInstallDialog";
+import { SkillSetupDialog } from "./SkillSetupDialog";
 
 const SEARCH_DEBOUNCE_MS = 300;
 
 function PluginCard({
   plugin,
+  pendingActivation,
   busy,
   disabled,
   onInstall,
+  onSetup,
   onUninstall,
 }: {
   plugin: PluginSummary;
+  pendingActivation: boolean;
   busy: boolean;
   disabled: boolean;
   onInstall: (plugin: PluginSummary) => void;
+  onSetup: (plugin: PluginSummary) => void;
   onUninstall: (plugin: PluginSummary) => void;
 }) {
   const language = useLauncherSelector((snapshot) => snapshot.language);
@@ -92,7 +98,9 @@ function PluginCard({
               {t(
                 needsActivation
                   ? "market.card.installedElsewhere"
-                  : "market.card.installed",
+                  : pendingActivation
+                    ? "market.card.installedPending"
+                    : "market.card.installed",
               )}
             </span>
           )}
@@ -165,6 +173,18 @@ function PluginCard({
               {t("market.card.installToHarness")}
             </button>
           )}
+          {installed && plugin.kind === "skill" && plugin.needsConfig && (
+            <button
+              className="outline-button market-plugin-action-button"
+              type="button"
+              disabled={disabled}
+              onClick={() => {
+                onSetup(plugin);
+              }}
+            >
+              {t("market.card.configure")}
+            </button>
+          )}
           {installed ? (
             <button
               className="outline-button danger market-plugin-action-button"
@@ -227,6 +247,10 @@ export function MarketplacePage() {
     plugin: PluginSummary;
     detail?: string;
     force: boolean;
+  } | null>(null);
+  const [skillSetup, setSkillSetup] = useState<{
+    plugin: PluginSummary;
+    steps: SkillSetupStep[];
   } | null>(null);
   const dataToken = useRef(0);
   const compatToken = useRef(0);
@@ -575,7 +599,10 @@ export function MarketplacePage() {
     marketApi
       .inspect(plugin.id)
       .then((inspected) => {
-        if (installReviewState(inspected) === "normal") {
+        if (
+          installReviewState(inspected) === "normal" &&
+          !(inspected.kind === "skill" && inspected.needsConfig)
+        ) {
           install(inspected);
           return;
         }
@@ -625,6 +652,18 @@ export function MarketplacePage() {
           ),
           { id: `market-installed-${plugin.id}` },
         );
+        if (
+          plugin.kind === "skill" &&
+          (plugin.needsConfig || result.setupSteps.length > 0)
+        ) {
+          setSkillSetup({
+            plugin,
+            steps:
+              result.setupSteps.length > 0
+                ? result.setupSteps
+                : plugin.setupSteps,
+          });
+        }
         // Re-query to refresh installed badges.
         const query = buildQuery(pageNumber);
         runQuery(query);
@@ -908,11 +947,22 @@ export function MarketplacePage() {
           {items.map((plugin) => (
             <PluginCard
               plugin={plugin}
+              pendingActivation={
+                pending?.changes.some(
+                  (change) =>
+                    change.action === "install" &&
+                    change.pluginId === plugin.id &&
+                    change.profile === "web",
+                ) ?? false
+              }
               key={plugin.id}
               busy={busyPlugin === plugin.id}
               disabled={busyPlugin !== null || launcher.marketBusy}
               onInstall={(target) => {
                 prepareInstall(target);
+              }}
+              onSetup={(target) => {
+                setSkillSetup({ plugin: target, steps: target.setupSteps });
               }}
               onUninstall={(target) => {
                 if (target.installed !== null) {
@@ -1018,6 +1068,15 @@ export function MarketplacePage() {
             const { plugin, force } = conflict;
             setConflict(null);
             install(plugin, force);
+          }}
+        />
+      )}
+      {skillSetup !== null && (
+        <SkillSetupDialog
+          plugin={skillSetup.plugin}
+          steps={skillSetup.steps}
+          onClose={() => {
+            setSkillSetup(null);
           }}
         />
       )}

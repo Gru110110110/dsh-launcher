@@ -2839,6 +2839,7 @@ pub fn run() {
             commands::market_compatibility_batch,
             commands::market_inspect,
             commands::market_install,
+            commands::market_execute_skill_setup,
             commands::market_uninstall,
             commands::market_pending_verification,
             commands::market_rollback_pending,

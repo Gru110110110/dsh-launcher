@@ -61,6 +61,7 @@ fn staged_result(action: MarketOperationKind, profile: &str) -> MarketOperationR
         restart_required: true,
         profile: Some(profile.into()),
         error: None,
+        setup_steps: Vec::new(),
     }
 }
 

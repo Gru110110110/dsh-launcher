@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   catalogGenerationChanged,
   compatibilityPresentation,
+  cordisInstallSource,
   formatScore,
   formatStars,
   installedFilterValue,
@@ -16,6 +17,23 @@ import {
   pendingChangeLabels,
   shouldClearPendingVerification,
 } from "./presentation";
+
+describe("cordisInstallSource", () => {
+  it("distinguishes commit-pinned GitHub packages from npm packages", () => {
+    expect(
+      cordisInstallSource({
+        installTarget: "legacy-name",
+        installPackages: ["plugin-name@github:owner/repo#0123456789abcdef"],
+      }),
+    ).toBe("github");
+    expect(
+      cordisInstallSource({
+        installTarget: "plugin-name",
+        installPackages: ["plugin-name@1.2.3"],
+      }),
+    ).toBe("npm");
+  });
+});
 
 describe("needsHarnessInstall", () => {
   it("offers a single install action for an old standalone copy only", () => {

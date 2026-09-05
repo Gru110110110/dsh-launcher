@@ -88,6 +88,10 @@ const CORRUPT_PENDING_RETENTION: usize = 5;
 /// backgrounded grandchild that keeps the pipes open can delay EOF
 /// indefinitely, so this bounds the wait and returns whatever arrived.
 const READER_GRACE: Duration = Duration::from_secs(5);
+const SKILL_INSTALL_METADATA: &str = ".dsh-market-install.json";
+const MAX_SKILL_SETUP_STEPS: usize = 8;
+const MAX_SKILL_SETUP_COMMAND_BYTES: usize = 1_000;
+const SKILL_SETUP_OUTPUT_CHARS: usize = 8_000;
 
 // ---------------------------------------------------------------------------
 // Market data (serde-only, parsed from the dsh-market catalog)
@@ -295,6 +299,8 @@ pub struct PluginSummary {
     pub updated_at: Option<String>,
     pub needs_config: bool,
     #[serde(default)]
+    pub setup_steps: Vec<SkillSetupStep>,
+    #[serde(default)]
     pub install_method: String,
     pub install_target: String,
     pub install_profile: Option<String>,
@@ -313,6 +319,33 @@ pub struct PluginSummary {
     pub compatibility_detail: Option<String>,
     #[serde(default)]
     pub installed: Option<InstalledPlugin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSetupStep {
+    /// Stable digest of the plugin id and exact reviewed command. The execute
+    /// endpoint accepts this id rather than caller-provided command text.
+    pub id: String,
+    pub command: String,
+    pub can_execute: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSetupExecutionResult {
+    pub ok: bool,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillInstallMetadata {
+    schema_version: u32,
+    plugin_id: String,
+    commit: String,
+    #[serde(default)]
+    setup_steps: Vec<SkillSetupStep>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -421,6 +454,10 @@ pub struct MarketOperationResult {
     pub profile: Option<String>,
     #[serde(default)]
     pub error: Option<AppError>,
+    /// Additional setup disclosed by an installed skill bundle. Cordis
+    /// operations and skill removals leave this empty.
+    #[serde(default)]
+    pub setup_steps: Vec<SkillSetupStep>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -527,6 +564,11 @@ struct CachedCompatibility {
     info: CompatibilityInfo,
     source_binding: SourceBindingStatus,
     source_binding_detail: Option<String>,
+    /// Exact argument passed to pnpm after source resolution. Registry
+    /// packages carry an exact semver; GitHub packages carry an immutable
+    /// commit and an explicit dependency name.
+    #[serde(default)]
+    install_spec: Option<String>,
     #[serde(default)]
     resolved_packages: Vec<String>,
 }
@@ -537,6 +579,20 @@ struct RegistryPackageInfo {
     cordis_range: Option<String>,
     repository_id: Option<String>,
     repository_declared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubPackageSource {
+    repository: String,
+    revision: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GithubPackageInfo {
+    package_name: String,
+    package_version: String,
+    cordis_range: Option<String>,
+    patch_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -989,7 +1045,108 @@ impl Marketplace {
             PluginKind::CordisPlugin => {
                 self.install_cordis(&plugin, force, expected_version, service_running)
             }
-            PluginKind::Skill => self.install_skill(&plugin, expected_version),
+            PluginKind::Skill => {
+                let target_name =
+                    skill_install_dir_name(&plugin, &catalog.file).ok_or_else(|| {
+                        AppError::new("marketInstallFailed")
+                            .value("plugin", &plugin.name)
+                            .detail("catalog does not provide a safe skill directory name")
+                    })?;
+                self.install_skill(&plugin, &target_name, expected_version)
+            }
+        }
+    }
+
+    /// Execute one previously disclosed setup step for an installed skill.
+    /// The caller supplies only the stable step id; command text is loaded
+    /// from installation-owned metadata and parsed into argv without a shell.
+    pub fn execute_skill_setup(
+        &self,
+        plugin_id: &str,
+        step_id: &str,
+    ) -> AppResult<SkillSetupExecutionResult> {
+        let _guard = self.begin_operation()?;
+        self.initialize();
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("catalog poisoned")
+            .clone()
+            .ok_or_else(|| AppError::new("marketCatalogUnavailable"))?;
+        let plugin = catalog
+            .plugin(plugin_id)
+            .ok_or_else(|| AppError::new("marketPluginNotFound").value("plugin", plugin_id))?;
+        if PluginKind::parse(&plugin.kind) != PluginKind::Skill {
+            return Err(AppError::new("marketSkillSetupUnsupported").value("plugin", plugin_id));
+        }
+        let installed = self
+            .scan_installed(Some(&catalog.file))
+            .into_iter()
+            .find(|entry| {
+                entry.source == PluginSource::Skills
+                    && entry.plugin_id.as_deref() == Some(plugin_id)
+            })
+            .ok_or_else(|| AppError::new("marketNotInstalled").value("plugin", plugin_id))?;
+        let skill_dir = self.skills_dir().join(&installed.local_name);
+        if !skill_dir.join("SKILL.md").is_file() {
+            return Err(AppError::new("marketNotInstalled").value("plugin", plugin_id));
+        }
+        let metadata = read_skill_install_metadata(&skill_dir, plugin_id)?;
+        let step = metadata
+            .setup_steps
+            .iter()
+            .find(|step| step.id == step_id)
+            .ok_or_else(|| {
+                AppError::new("marketSkillSetupChanged").value("plugin", &plugin.name)
+            })?;
+        if !step.can_execute {
+            return Err(AppError::new("marketSkillSetupUnsupported").value("plugin", &plugin.name));
+        }
+        let invocation = parse_executable_skill_setup(&step.command).ok_or_else(|| {
+            AppError::new("marketSkillSetupChanged").value("plugin", &plugin.name)
+        })?;
+        let mut command = match invocation {
+            ExecutableSkillSetup::Python { program, args } => {
+                let mut command = new_command(program);
+                command.args(args);
+                command
+            }
+            ExecutableSkillSetup::Npm { args } => {
+                if !self.paths.node_bin.is_file() || !npm_cli(&self.paths.node_dir).is_file() {
+                    return Err(AppError::new("marketRuntimeUnavailable"));
+                }
+                let mut command = new_command(&self.paths.node_bin);
+                command.arg(npm_cli(&self.paths.node_dir)).args(args);
+                command
+            }
+        };
+        command
+            .current_dir(&skill_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        market_command_env(&mut command, &self.paths, &[]);
+        let result = run_child(command, INSTALL_TIMEOUT);
+        match result {
+            Ok((true, output)) => {
+                self.log_operation("setup-skill", &plugin.name, true, step_id);
+                Ok(SkillSetupExecutionResult {
+                    ok: true,
+                    output: tail(&output, SKILL_SETUP_OUTPUT_CHARS),
+                })
+            }
+            Ok((false, output)) => {
+                self.log_operation("setup-skill", &plugin.name, false, step_id);
+                Err(AppError::new("marketSkillSetupFailed")
+                    .value("plugin", &plugin.name)
+                    .detail(tail(&output, 800)))
+            }
+            Err(error) => {
+                self.log_operation("setup-skill", &plugin.name, false, step_id);
+                Err(AppError::new("marketSkillSetupFailed")
+                    .value("plugin", &plugin.name)
+                    .detail(error.safe_detail.unwrap_or(error.code)))
+            }
         }
     }
 
@@ -1080,6 +1237,7 @@ impl Marketplace {
                 && changed_profile.as_deref() == Some(DEFAULT_PROFILE),
             profile: changed_profile,
             error: None,
+            setup_steps: Vec::new(),
         })
     }
 
@@ -1395,6 +1553,31 @@ impl Marketplace {
     ) -> PluginSummary {
         let kind = PluginKind::parse(&plugin.kind);
         let compatibility = self.compatibility_summary(plugin, check_compatibility);
+        let installed = installed_index.for_plugin(plugin).cloned();
+        let mut setup_steps = if kind == PluginKind::Skill {
+            skill_setup_steps(plugin)
+        } else {
+            Vec::new()
+        };
+        if let Some(entry) = installed
+            .as_ref()
+            .filter(|entry| entry.source == PluginSource::Skills)
+        {
+            match read_skill_install_metadata(
+                &self.skills_dir().join(&entry.local_name),
+                &plugin.id,
+            ) {
+                Ok(metadata) => setup_steps = metadata.setup_steps,
+                Err(_) => {
+                    // Older installations have no immutable setup receipt.
+                    // Their commands remain useful to copy, but must never
+                    // acquire a direct-execution button retroactively.
+                    for step in &mut setup_steps {
+                        step.can_execute = false;
+                    }
+                }
+            }
+        }
         PluginSummary {
             id: plugin.id.clone(),
             kind,
@@ -1419,7 +1602,10 @@ impl Marketplace {
                 .install
                 .as_ref()
                 .and_then(|i| i.needs_config)
-                .unwrap_or(false),
+                .unwrap_or(false)
+                || (kind == PluginKind::Skill && skill_requires_external_setup(plugin))
+                || !setup_steps.is_empty(),
+            setup_steps,
             install_method: plugin
                 .install
                 .as_ref()
@@ -1444,15 +1630,8 @@ impl Marketplace {
                     .map(|plan| {
                         plan.packages
                             .into_iter()
-                            .map(|package| {
-                                resolved
-                                    .iter()
-                                    .find(|spec| {
-                                        normalize_package_spec(spec).as_deref() == Some(&package)
-                                    })
-                                    .cloned()
-                                    .unwrap_or(package)
-                            })
+                            .enumerate()
+                            .map(|(index, package)| resolved.get(index).cloned().unwrap_or(package))
                             .collect()
                     })
                     .unwrap_or_default()
@@ -1464,7 +1643,7 @@ impl Marketplace {
             score_explanation: plugin.score.as_ref().and_then(|s| s.explanation.clone()),
             compatibility: compatibility.compatibility,
             compatibility_detail: compatibility.compatibility_detail,
-            installed: installed_index.for_plugin(plugin).cloned(),
+            installed,
         }
     }
 
@@ -1477,7 +1656,12 @@ impl Marketplace {
         let (compatibility, install_version, source_binding, source_binding_detail) = match kind {
             PluginKind::Skill => (
                 CompatibilityInfo {
-                    status: CompatibilityStatus::Compatible,
+                    // A repository id can be source-bound without proving
+                    // that its bundle layout and local runtime requirements
+                    // are usable. Those are verified only after the immutable
+                    // tarball is selected, so the catalog card must not claim
+                    // compatibility in advance.
+                    status: CompatibilityStatus::Unknown,
                     detail: None,
                 },
                 None,
@@ -1688,22 +1872,24 @@ impl Marketplace {
             restart_required: service_running && plan.profile == DEFAULT_PROFILE,
             profile: Some(plan.profile),
             error: None,
+            setup_steps: Vec::new(),
         })
     }
 
     fn install_skill(
         &self,
         plugin: &MarketPlugin,
+        target_name: &str,
         expected_commit: Option<&str>,
     ) -> AppResult<MarketOperationResult> {
         // The catalog is external data: a name containing separators or `..`
         // must never influence where the extracted skill ends up.
-        if !valid_skill_dir_name(&plugin.name) {
+        if !valid_skill_dir_name(target_name) {
             return Err(AppError::new("marketInstallFailed")
                 .value("plugin", &plugin.name)
                 .detail("invalid skill directory name in catalog"));
         }
-        let target = self.skills_dir().join(&plugin.name);
+        let target = self.skills_dir().join(target_name);
         if target.exists() {
             return Err(AppError::new("marketAlreadyInstalled").value("plugin", &plugin.name));
         }
@@ -1714,20 +1900,34 @@ impl Marketplace {
         // Resolve and disclose an immutable commit before confirmation, then
         // verify that exact commit belongs to the repository. A moving default
         // branch must never change the artifact after user approval.
-        let commit = resolve_skill_commit(&repo, expected_commit)
-            .map_err(|error| error.value("plugin", &plugin.name))?;
+        let commit = match resolve_skill_commit(&repo, expected_commit) {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.log_operation("install-skill", &plugin.name, false, &error.to_string());
+                return Err(error.value("plugin", &plugin.name));
+            }
+        };
         let tarball_url = format!("https://codeload.github.com/{repo}/tar.gz/{commit}");
-        let bytes = fetch_bytes(
+        let bytes = match fetch_bytes(
             &tarball_url,
             CATALOG_FETCH_TIMEOUT,
             TARBALL_MAX_BYTES,
             "marketInstallFailed",
             "skill tarball",
-        )
-        .map_err(|error| error.value("plugin", &plugin.name))?;
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.log_operation("install-skill", &plugin.name, false, &error.to_string());
+                return Err(error.value("plugin", &plugin.name));
+            }
+        };
         let extract_root = self.catalog_dir().join("extract");
         let staging = extract_root.join(format!("{}-{}", plugin.name, process_timestamp()));
-        fs::create_dir_all(&staging).map_err(|error| AppError::io("createDirectory", &error))?;
+        if let Err(error) = fs::create_dir_all(&staging) {
+            let detail = format!("could not create skill staging directory: {error}");
+            self.log_operation("install-skill", &plugin.name, false, &detail);
+            return Err(AppError::io("createDirectory", &error).value("plugin", &plugin.name));
+        }
         if let Err(error) = extract_tarball(&bytes, &staging) {
             let _ = fs::remove_dir_all(&staging);
             let _ = fs::remove_dir(&extract_root);
@@ -1736,19 +1936,68 @@ impl Marketplace {
                 .value("plugin", &plugin.name)
                 .detail(error.to_string()));
         }
-        if !staging.join("SKILL.md").is_file() {
+        let skill_source = match resolve_skill_source(&staging) {
+            Ok(source) => source,
+            Err(detail) => {
+                self.log_operation("install-skill", &plugin.name, false, &detail);
+                let _ = fs::remove_dir_all(&staging);
+                let _ = fs::remove_dir(&extract_root);
+                return Err(AppError::new("marketInstallFailed")
+                    .value("plugin", &plugin.name)
+                    .detail(detail));
+            }
+        };
+        let setup_steps = merged_skill_setup_steps(plugin, &staging);
+        let metadata = SkillInstallMetadata {
+            schema_version: 1,
+            plugin_id: plugin.id.clone(),
+            commit: commit.clone(),
+            setup_steps: setup_steps.clone(),
+        };
+        let metadata_bytes = match serde_json::to_vec(&metadata) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.log_operation("install-skill", &plugin.name, false, &error.to_string());
+                let _ = fs::remove_dir_all(&staging);
+                let _ = fs::remove_dir(&extract_root);
+                return Err(AppError::from(error).value("plugin", &plugin.name));
+            }
+        };
+        let metadata_path = skill_source.join(SKILL_INSTALL_METADATA);
+        if metadata_path.exists()
+            && let Err(error) = fs::remove_file(&metadata_path)
+        {
+            let detail = format!("could not replace reserved skill metadata: {error}");
+            self.log_operation("install-skill", &plugin.name, false, &detail);
             let _ = fs::remove_dir_all(&staging);
             let _ = fs::remove_dir(&extract_root);
-            return Err(AppError::new("marketInstallFailed")
-                .value("plugin", &plugin.name)
-                .detail("skill repository does not contain a root SKILL.md"));
+            return Err(AppError::io("marketInstallFailed", &error).value("plugin", &plugin.name));
         }
-        fs::create_dir_all(self.skills_dir())
-            .map_err(|error| AppError::io("createDirectory", &error))?;
-        if let Err(error) = move_dir(&staging, &target) {
+        if let Err(error) = crate::paths::atomic_write(&metadata_path, &metadata_bytes) {
+            self.log_operation("install-skill", &plugin.name, false, &error.to_string());
             let _ = fs::remove_dir_all(&staging);
             let _ = fs::remove_dir(&extract_root);
-            return Err(AppError::io("marketInstallFailed", &error));
+            return Err(error.value("plugin", &plugin.name));
+        }
+        if let Err(error) = fs::create_dir_all(self.skills_dir()) {
+            let detail = format!("could not create skills directory: {error}");
+            self.log_operation("install-skill", &plugin.name, false, &detail);
+            let _ = fs::remove_dir_all(&staging);
+            let _ = fs::remove_dir(&extract_root);
+            return Err(AppError::io("createDirectory", &error).value("plugin", &plugin.name));
+        }
+        if let Err(error) = move_dir(&skill_source, &target) {
+            let detail = format!("could not publish skill bundle: {error}");
+            self.log_operation("install-skill", &plugin.name, false, &detail);
+            let _ = fs::remove_dir_all(&staging);
+            let _ = fs::remove_dir(&extract_root);
+            return Err(AppError::io("marketInstallFailed", &error).value("plugin", &plugin.name));
+        }
+        // A manifest-selected or uniquely discovered nested bundle leaves the
+        // rest of the repository in staging. It is not part of the installed
+        // skill and must not survive a successful publication.
+        if skill_source != staging {
+            let _ = fs::remove_dir_all(&staging);
         }
         // Best effort: drop the extract root when this staging dir was the
         // last thing in it.
@@ -1762,6 +2011,7 @@ impl Marketplace {
             restart_required: false,
             profile: None,
             error: None,
+            setup_steps,
         })
     }
 
@@ -1883,7 +2133,7 @@ impl Marketplace {
             .map(|pkg| {
                 normalize_package_spec(pkg).ok_or_else(|| {
                     AppError::new("marketProfileInvalid")
-                        .detail("operation target is not a registry package")
+                        .detail("operation target does not declare a safe package name")
                 })
             })
             .collect::<AppResult<Vec<_>>>()?;
@@ -1908,9 +2158,7 @@ impl Marketplace {
             if verb == "add" && baseline.dependencies.contains_key(target) {
                 // Completing a partially installed plan must not upgrade or
                 // overwrite an already present package.
-                if read_installed_version(&source, target).as_deref()
-                    != pkg.strip_prefix(&format!("{target}@"))
-                {
+                if !installed_package_matches_spec(&source, target, pkg) {
                     return Err(AppError::new("marketAlreadyInstalled").value("plugin", target));
                 }
                 continue;
@@ -2005,10 +2253,7 @@ impl Marketplace {
                         {
                             continue;
                         }
-                        let expected = pkg.strip_prefix(&format!("{target}@"));
-                        if expected.is_none()
-                            || read_installed_version(&candidate, &target).as_deref() != expected
-                        {
+                        if !installed_package_matches_spec(&candidate, &target, pkg) {
                             return Err(
                                 AppError::new("marketPackageChanged").value("plugin", target)
                             );
@@ -2814,6 +3059,18 @@ impl PluginIndex {
                 plugin.full_name.to_lowercase(),
                 &plugin.id,
             );
+            if PluginKind::parse(&plugin.kind) == PluginKind::Skill {
+                if let Some(base_name) = skill_base_dir_name(plugin) {
+                    insert_unique_binding(&mut index.by_name, base_name.to_lowercase(), &plugin.id);
+                }
+                if let Some(qualified_name) = qualified_skill_dir_name(plugin) {
+                    insert_unique_binding(
+                        &mut index.by_name,
+                        qualified_name.to_lowercase(),
+                        &plugin.id,
+                    );
+                }
+            }
             for package_name in install_plan(plugin)
                 .map(|plan| plan.packages)
                 .unwrap_or_default()
@@ -3106,7 +3363,7 @@ fn install_plan_from_command(command: &str) -> Option<InstallPlan> {
             }
             _ if token.starts_with('#') && add => break,
             _ if add => {
-                let package = normalize_package_spec(token)?;
+                let package = normalize_catalog_install_spec(token)?;
                 if !packages.contains(&package) {
                     packages.push(package);
                 }
@@ -3164,6 +3421,9 @@ fn install_package_name(plugin: &MarketPlugin) -> Option<String> {
 }
 
 fn package_matches_plugin_identity(plugin: &MarketPlugin, package_name: &str) -> bool {
+    if let Some(source) = parse_github_package_source(package_name) {
+        return source.repository.eq_ignore_ascii_case(&plugin.id);
+    }
     let package_name = package_name.to_lowercase();
     let package_base = package_name
         .rsplit_once('/')
@@ -3175,6 +3435,40 @@ fn package_matches_plugin_identity(plugin: &MarketPlugin, package_name: &str) ->
         .map(str::to_lowercase)
         .filter_map(|name| normalize_package_spec(&name))
         .any(|identity| identity == package_name || identity == package_base)
+}
+
+/// Catalog commands may name either an npm registry package or a GitHub
+/// repository. GitHub refs are deliberately limited to an optional full
+/// commit SHA; moving branches and tags are resolved through the GitHub API
+/// and replaced with a commit before installation.
+fn normalize_catalog_install_spec(spec: &str) -> Option<String> {
+    if let Some(source) = parse_github_package_source(spec) {
+        let suffix = source
+            .revision
+            .map(|revision| format!("#{revision}"))
+            .unwrap_or_default();
+        return Some(format!("github:{}{suffix}", source.repository));
+    }
+    normalize_package_spec(spec)
+}
+
+fn parse_github_package_source(spec: &str) -> Option<GithubPackageSource> {
+    let spec = spec.trim().trim_matches(['"', '\'', '`']);
+    let value = spec.strip_prefix("github:")?;
+    let (repository, revision) = value
+        .split_once('#')
+        .map_or((value, None), |(repository, revision)| {
+            (repository, Some(revision))
+        });
+    if !valid_github_repo_id(repository)
+        || revision.is_some_and(|revision| !valid_commit_sha(revision))
+    {
+        return None;
+    }
+    Some(GithubPackageSource {
+        repository: repository.to_owned(),
+        revision: revision.map(str::to_owned),
+    })
 }
 
 fn sanitize_catalog(catalog: &mut MarketCatalogFile) -> AppResult<()> {
@@ -3194,7 +3488,7 @@ fn sanitize_catalog(catalog: &mut MarketCatalogFile) -> AppResult<()> {
             && valid_github_repo_id(&plugin.id)
             && catalog_source_matches_id(plugin)
             && match plugin.kind.as_str() {
-                "skill" => valid_skill_dir_name(&plugin.name),
+                "skill" => skill_base_dir_name(plugin).is_some(),
                 "cordis-plugin" => install_plan(plugin).is_some(),
                 _ => false,
             };
@@ -3352,6 +3646,36 @@ fn normalize_package_spec(spec: &str) -> Option<String> {
     }
 }
 
+fn pinned_github_install_spec(spec: &str) -> Option<(String, GithubPackageSource)> {
+    let target = normalize_package_spec(spec)?;
+    let source = spec.strip_prefix(&format!("{target}@"))?;
+    let source = parse_github_package_source(source)?;
+    source.revision.as_ref()?;
+    Some((target, source))
+}
+
+fn installed_package_matches_spec(profile_dir: &Path, target: &str, spec: &str) -> bool {
+    if let Some((resolved_target, source)) = pinned_github_install_spec(spec) {
+        if resolved_target != target || !package_declares_bundle(profile_dir, target) {
+            return false;
+        }
+        let Ok(manifest) = read_manifest(&profile_dir.join("package.json")) else {
+            return false;
+        };
+        let Some(saved) = manifest.dependencies.get(target) else {
+            return false;
+        };
+        let Some((repository, revision)) = saved.rsplit_once('#') else {
+            return false;
+        };
+        return revision == source.revision.as_deref().unwrap_or_default()
+            && normalize_github_repository(repository)
+                .is_some_and(|repository| repository.eq_ignore_ascii_case(&source.repository));
+    }
+    read_installed_version(profile_dir, target).as_deref()
+        == spec.strip_prefix(&format!("{target}@"))
+}
+
 /// One npm package-name part (the unscoped name, or a scope without its
 /// leading `@`): lowercase url-safe characters, starting with a letter or
 /// digit. `~` is tolerated for legacy packages; anything else — uppercase,
@@ -3392,6 +3716,398 @@ fn percent_decode(value: &str) -> String {
 fn valid_skill_dir_name(name: &str) -> bool {
     let mut components = Path::new(name).components();
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+/// Prefer the catalog display name for backwards compatibility, but tolerate
+/// catalogs that accidentally use `owner/repo` as the display name by falling
+/// back to the already source-bound repository name.
+fn skill_base_dir_name(plugin: &MarketPlugin) -> Option<&str> {
+    [plugin.name.as_str(), plugin.repo.as_str()]
+        .into_iter()
+        .find(|name| valid_skill_dir_name(name))
+}
+
+fn qualified_skill_dir_name(plugin: &MarketPlugin) -> Option<String> {
+    let base = skill_base_dir_name(plugin)?;
+    let qualified = format!("{base}--{}", plugin.owner);
+    valid_skill_dir_name(&qualified).then_some(qualified)
+}
+
+/// Two repositories may publish the same display name. Installing both into
+/// that name would make the second fail and the installed scan could not tell
+/// which catalog entry owns the first. Only collisions receive an
+/// owner-qualified directory, preserving legacy paths for unique entries.
+fn skill_install_dir_name(plugin: &MarketPlugin, catalog: &MarketCatalogFile) -> Option<String> {
+    let base = skill_base_dir_name(plugin)?;
+    let collisions = catalog
+        .plugins
+        .iter()
+        .filter(|candidate| PluginKind::parse(&candidate.kind) == PluginKind::Skill)
+        .filter_map(skill_base_dir_name)
+        .filter(|candidate| candidate.eq_ignore_ascii_case(base))
+        .take(2)
+        .count();
+    if collisions > 1 {
+        qualified_skill_dir_name(plugin)
+    } else {
+        Some(base.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutableSkillSetup {
+    Python { program: String, args: Vec<String> },
+    Npm { args: Vec<String> },
+}
+
+/// The market's README scraper also captures clone/install alternatives. The
+/// launcher already installs the skill bundle itself, so expose only commands
+/// that provision an additional runtime or dependency.
+fn skill_setup_steps(plugin: &MarketPlugin) -> Vec<SkillSetupStep> {
+    let mut steps = Vec::new();
+    for command in plugin
+        .install
+        .iter()
+        .flat_map(|install| &install.commands)
+        .flat_map(|command| split_setup_alternatives(command))
+    {
+        if is_external_setup_command(&command)
+            && let Some(step) = build_skill_setup_step(&plugin.id, &command)
+            && !steps
+                .iter()
+                .any(|existing: &SkillSetupStep| existing.command == step.command)
+        {
+            steps.push(step);
+            if steps.len() == MAX_SKILL_SETUP_STEPS {
+                break;
+            }
+        }
+    }
+    steps
+}
+
+fn skill_requires_external_setup(plugin: &MarketPlugin) -> bool {
+    !skill_setup_steps(plugin).is_empty()
+}
+
+fn merged_skill_setup_steps(plugin: &MarketPlugin, repository_root: &Path) -> Vec<SkillSetupStep> {
+    let mut steps = skill_setup_steps(plugin);
+    for step in skill_manifest_setup_steps(&plugin.id, repository_root) {
+        if !steps
+            .iter()
+            .any(|existing| existing.command == step.command)
+        {
+            steps.push(step);
+            if steps.len() == MAX_SKILL_SETUP_STEPS {
+                break;
+            }
+        }
+    }
+    steps
+}
+
+/// A small structured convention used by newer skills. For example,
+/// `runtime.pythonPackage: "pptx-designer"` becomes a disclosed pip command.
+/// Free-form manifest scripts remain copy-only through the catalog path.
+fn skill_manifest_setup_steps(plugin_id: &str, repository_root: &Path) -> Vec<SkillSetupStep> {
+    let manifest_path = repository_root.join("skill.json");
+    let Ok(metadata) = fs::metadata(&manifest_path) else {
+        return Vec::new();
+    };
+    if !metadata.is_file() || metadata.len() > MARKET_MANIFEST_MAX_BYTES as u64 {
+        return Vec::new();
+    }
+    let Ok(bytes) = fs::read(manifest_path) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    let Some(package) = manifest
+        .get("runtime")
+        .and_then(|runtime| runtime.get("pythonPackage"))
+        .and_then(|package| package.as_str())
+        .filter(|package| safe_python_requirement(package))
+    else {
+        return Vec::new();
+    };
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    build_skill_setup_step(plugin_id, &format!("{python} -m pip install {package}"))
+        .into_iter()
+        .collect()
+}
+
+fn safe_python_requirement(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '-' | '_' | '.' | '[' | ']' | '<' | '>' | '=' | '!' | '~' | ',' | '+'
+                )
+        })
+}
+
+fn build_skill_setup_step(plugin_id: &str, command: &str) -> Option<SkillSetupStep> {
+    let command = command.trim();
+    if command.is_empty()
+        || command.len() > MAX_SKILL_SETUP_COMMAND_BYTES
+        || command.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(SkillSetupStep {
+        id: sha256_bytes(format!("{plugin_id}\0{command}").as_bytes()),
+        command: command.to_owned(),
+        can_execute: parse_executable_skill_setup(command).is_some(),
+    })
+}
+
+fn split_setup_alternatives(command: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let chars = command.char_indices().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < chars.len() {
+        let (byte_index, character) = chars[index];
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+        } else if quote.is_none()
+            && character == '|'
+            && chars.get(index + 1).is_some_and(|(_, next)| *next == '|')
+        {
+            parts.push(command[start..byte_index].trim().to_owned());
+            start = chars[index + 1].0 + 1;
+            index += 1;
+        }
+        index += 1;
+    }
+    parts.push(command[start..].trim().to_owned());
+    parts.into_iter().filter(|part| !part.is_empty()).collect()
+}
+
+fn is_external_setup_command(command: &str) -> bool {
+    if parse_executable_skill_setup(command).is_some() {
+        return true;
+    }
+    let lower = command.trim().to_ascii_lowercase();
+    [
+        "python ",
+        "python3 ",
+        "uv ",
+        "curl ",
+        "wget ",
+        "bash ",
+        "sh ",
+        "powershell ",
+        "pwsh ",
+        "brew ",
+        "apt ",
+        "apt-get ",
+        "winget ",
+        "cargo install ",
+        "go install ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+fn parse_executable_skill_setup(command: &str) -> Option<ExecutableSkillSetup> {
+    let tokens = tokenize_setup_command(command)?;
+    let (program, rest) = tokens.split_first()?;
+    match program.as_str() {
+        "pip" | "pip3" => {
+            validate_pip_install(rest)?;
+            Some(ExecutableSkillSetup::Python {
+                program: program.clone(),
+                args: rest.to_vec(),
+            })
+        }
+        "python" | "python3"
+            if rest.first().map(String::as_str) == Some("-m")
+                && rest.get(1).map(String::as_str) == Some("pip") =>
+        {
+            validate_pip_install(&rest[2..])?;
+            Some(ExecutableSkillSetup::Python {
+                program: program.clone(),
+                args: rest.to_vec(),
+            })
+        }
+        "npm" => {
+            validate_npm_install(rest)?;
+            Some(ExecutableSkillSetup::Npm {
+                args: rest.to_vec(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn tokenize_setup_command(command: &str) -> Option<Vec<String>> {
+    if command.is_empty() || command.len() > MAX_SKILL_SETUP_COMMAND_BYTES {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    for character in command.chars() {
+        if let Some(expected) = quote {
+            if character == expected {
+                quote = None;
+            } else if character.is_control() {
+                return None;
+            } else {
+                token.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            character if character.is_whitespace() => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            '|' | ';' | '&' | '>' | '<' | '$' | '`' | '(' | ')' | '\\' => return None,
+            character if character.is_control() => return None,
+            character => token.push(character),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn validate_pip_install(args: &[String]) -> Option<()> {
+    if args.first().map(String::as_str) != Some("install") {
+        return None;
+    }
+    let forbidden = ["--target", "--prefix", "--root", "--cache-dir"];
+    if args.iter().any(|argument| {
+        forbidden.iter().any(|flag| {
+            argument == flag
+                || argument
+                    .strip_prefix(flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    }) {
+        return None;
+    }
+    validate_setup_file_flags(
+        &args[1..],
+        &[
+            "-r",
+            "--requirement",
+            "-c",
+            "--constraint",
+            "-e",
+            "--editable",
+        ],
+    )
+}
+
+fn validate_setup_file_flags(args: &[String], flags: &[&str]) -> Option<()> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if let Some(flag) = flags.iter().find(|flag| argument == **flag) {
+            let path = args.get(index + 1)?;
+            if !safe_relative_setup_path(path) {
+                return None;
+            }
+            let _ = flag;
+            index += 2;
+            continue;
+        }
+        for flag in flags {
+            if let Some(path) = argument.strip_prefix(&format!("{flag}="))
+                && !safe_relative_setup_path(path)
+            {
+                return None;
+            }
+        }
+        index += 1;
+    }
+    Some(())
+}
+
+fn validate_npm_install(args: &[String]) -> Option<()> {
+    if !matches!(args.first().map(String::as_str), Some("install" | "i")) {
+        return None;
+    }
+    let forbidden = ["-g", "--global", "--prefix", "--workspace", "--workspaces"];
+    if args.iter().skip(1).any(|argument| {
+        forbidden.iter().any(|flag| {
+            argument == flag
+                || argument
+                    .strip_prefix(flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    }) {
+        return None;
+    }
+    for argument in args.iter().skip(1) {
+        if (argument.starts_with('.')
+            || argument.starts_with('/')
+            || argument.starts_with('~')
+            || argument.contains(":\\"))
+            && !safe_relative_setup_path(argument)
+        {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn safe_relative_setup_path(value: &str) -> bool {
+    if value.is_empty() || value.starts_with('~') || value.starts_with('%') {
+        return false;
+    }
+    let path = Path::new(value);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
+fn read_skill_install_metadata(
+    skill_dir: &Path,
+    expected_plugin_id: &str,
+) -> AppResult<SkillInstallMetadata> {
+    let path = skill_dir.join(SKILL_INSTALL_METADATA);
+    let metadata =
+        fs::metadata(&path).map_err(|error| AppError::io("marketSkillSetupUnavailable", &error))?;
+    if !metadata.is_file() || metadata.len() > MARKET_MANIFEST_MAX_BYTES as u64 {
+        return Err(AppError::new("marketSkillSetupUnavailable"));
+    }
+    let receipt: SkillInstallMetadata = serde_json::from_slice(
+        &fs::read(path).map_err(|error| AppError::io("marketSkillSetupUnavailable", &error))?,
+    )
+    .map_err(|error| AppError::new("marketSkillSetupUnavailable").detail(error.to_string()))?;
+    if receipt.schema_version != 1
+        || receipt.plugin_id != expected_plugin_id
+        || receipt.setup_steps.len() > MAX_SKILL_SETUP_STEPS
+        || receipt.setup_steps.iter().any(|step| {
+            build_skill_setup_step(expected_plugin_id, &step.command).as_ref() != Some(step)
+        })
+    {
+        return Err(AppError::new("marketSkillSetupUnavailable"));
+    }
+    Ok(receipt)
 }
 
 fn valid_profile_dir_name(name: &str) -> bool {
@@ -3722,7 +4438,7 @@ fn validate_candidate_profile_many(
         .map(|spec| {
             normalize_package_spec(spec).ok_or_else(|| {
                 AppError::new("marketProfileInvalid")
-                    .detail("operation target is not a registry package")
+                    .detail("operation target does not declare a safe package name")
             })
         })
         .collect::<AppResult<HashSet<_>>>()?;
@@ -4096,8 +4812,12 @@ fn fetch_bytes_with(
         })?
         .error_for_status()
         .map_err(|error| {
-            AppError::new("marketNetworkFailed")
-                .detail(crate::network::sanitize_detail(&error.to_string()))
+            let status_code = if code == "marketSourceUnavailable" {
+                code
+            } else {
+                "marketNetworkFailed"
+            };
+            AppError::new(status_code).detail(crate::network::sanitize_detail(&error.to_string()))
         })?;
     if let Some(length) = response.content_length()
         && usize::try_from(length).unwrap_or(usize::MAX) > max_bytes
@@ -4256,53 +4976,70 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn fetch_default_branch(repo: &str) -> AppResult<String> {
+fn fetch_default_branch_with(
+    repo: &str,
+    client: Option<&reqwest::blocking::Client>,
+) -> AppResult<String> {
     let url = format!("{GITHUB_API}/repos/{repo}");
-    let bytes = fetch_bytes(
+    let bytes = fetch_bytes_with(
+        client,
         &url,
         REGISTRY_TIMEOUT,
         1024 * 1024,
-        "marketNetworkFailed",
+        "marketSourceUnavailable",
         "github response",
     )?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::new("marketSourceMetadataInvalid").detail(error.to_string()))?;
     value
         .get("default_branch")
         .and_then(|v| v.as_str())
         .map(str::to_owned)
-        .ok_or_else(|| AppError::new("marketNetworkFailed").detail("default branch missing"))
+        .ok_or_else(|| {
+            AppError::new("marketSourceMetadataInvalid").detail("default branch missing")
+        })
 }
 
-fn resolve_skill_commit(repo: &str, expected: Option<&str>) -> AppResult<String> {
+fn resolve_repository_commit_with(
+    repo: &str,
+    expected: Option<&str>,
+    client: Option<&reqwest::blocking::Client>,
+) -> AppResult<String> {
     let revision = match expected {
         Some(commit) if valid_commit_sha(commit) => commit.to_owned(),
         Some(_) => {
             return Err(AppError::new("marketInstallFailed")
-                .detail("confirmed skill revision is not a commit SHA"));
+                .detail("confirmed repository revision is not a commit SHA"));
         }
-        None => fetch_default_branch(repo)?,
+        None => fetch_default_branch_with(repo, client)?,
     };
     let url = format!("{GITHUB_API}/repos/{repo}/commits/{revision}");
-    let bytes = fetch_bytes(
+    let bytes = fetch_bytes_with(
+        client,
         &url,
         REGISTRY_TIMEOUT,
         2 * 1024 * 1024,
-        "marketNetworkFailed",
+        "marketSourceUnavailable",
         "github commit metadata",
     )?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::new("marketSourceMetadataInvalid").detail(error.to_string()))?;
     let commit = value
         .get("sha")
         .and_then(|value| value.as_str())
         .filter(|value| valid_commit_sha(value))
-        .ok_or_else(|| AppError::new("marketNetworkFailed").detail("commit SHA missing"))?;
+        .ok_or_else(|| AppError::new("marketSourceMetadataInvalid").detail("commit SHA missing"))?;
     if let Some(expected) = expected
         && commit != expected
     {
         return Err(AppError::new("marketInstallFailed")
-            .detail("confirmed skill revision does not belong to the repository"));
+            .detail("confirmed revision does not belong to the repository"));
     }
     Ok(commit.to_owned())
+}
+
+fn resolve_skill_commit(repo: &str, expected: Option<&str>) -> AppResult<String> {
+    resolve_repository_commit_with(repo, expected, None)
 }
 
 fn fetch_compatibility_entry_with(
@@ -4334,7 +5071,8 @@ fn aggregate_compatibility(
             entry
                 .package_version
                 .as_ref()
-                .map(|version| format!("{}@{version}", entry.package_name))
+                .and(entry.install_spec.as_ref())
+                .cloned()
         })
         .collect();
     let source_failure = entries
@@ -4366,6 +5104,7 @@ fn aggregate_compatibility(
                 "cordis": cordis_version,
                 "packages": entries.iter().map(|entry| serde_json::json!({
                     "name": entry.package_name, "version": entry.package_version,
+                    "installSpec": entry.install_spec,
                     "source": entry.source_binding, "sourceDetail": entry.source_binding_detail,
                     "compatibility": entry.info,
                 })).collect::<Vec<_>>()
@@ -4436,6 +5175,7 @@ fn aggregate_compatibility(
             plan.is_none()
                 .then(|| "catalog has no supported installation plan".into())
         },
+        install_spec: None,
     }
 }
 
@@ -4447,6 +5187,15 @@ fn fetch_package_compatibility(
 ) -> CachedCompatibility {
     let cordis_version = installed_cordis_version(paths);
     let checked_at_ms = now_ms();
+    if let Some(source) = parse_github_package_source(package_name) {
+        return fetch_github_package_compatibility(
+            plugin,
+            &source,
+            cordis_version,
+            checked_at_ms,
+            client,
+        );
+    }
     let registry = fetch_registry_package_info_with(package_name, client);
     let expected_repository = if matches!(
         package_name,
@@ -4456,49 +5205,91 @@ fn fetch_package_compatibility(
     } else {
         &plugin.id
     };
-    let (package_version, info, source_binding, source_binding_detail) = match registry {
-        Ok(registry) => {
-            let (source_binding, source_binding_detail) = match registry.repository_id.as_deref() {
-                Some(repository) if repository.eq_ignore_ascii_case(expected_repository) => {
-                    (SourceBindingStatus::Verified, None)
+    let (package_version, info, source_binding, source_binding_detail, install_spec) =
+        match registry {
+            Ok(registry) => {
+                let (source_binding, source_binding_detail) = match registry
+                    .repository_id
+                    .as_deref()
+                {
+                    Some(repository) if repository.eq_ignore_ascii_case(expected_repository) => {
+                        (SourceBindingStatus::Verified, None)
+                    }
+                    Some(repository) => (
+                        SourceBindingStatus::Mismatch,
+                        Some(format!(
+                            "npm package points to https://github.com/{repository}, catalog points to https://github.com/{}",
+                            expected_repository
+                        )),
+                    ),
+                    None if registry.repository_declared => (
+                        SourceBindingStatus::Mismatch,
+                        Some("npm package repository is not a valid GitHub repository".into()),
+                    ),
+                    None => (
+                        SourceBindingStatus::Unknown,
+                        Some("npm package does not declare a GitHub repository".into()),
+                    ),
+                };
+                let info = evaluate_cordis_compatibility(
+                    cordis_version.as_deref(),
+                    registry.cordis_range.as_deref(),
+                );
+                (
+                    Some(registry.latest_version.clone()),
+                    info,
+                    source_binding,
+                    source_binding_detail,
+                    Some(format!("{package_name}@{}", registry.latest_version)),
+                )
+            }
+            Err(error)
+                if plugin
+                    .install
+                    .as_ref()
+                    .is_none_or(|install| install.commands.is_empty()) =>
+            {
+                let fallback = fetch_github_package_compatibility(
+                    plugin,
+                    &GithubPackageSource {
+                        repository: plugin.id.clone(),
+                        revision: None,
+                    },
+                    cordis_version.clone(),
+                    checked_at_ms,
+                    client,
+                );
+                if fallback.install_spec.is_some() {
+                    return fallback;
                 }
-                Some(repository) => (
-                    SourceBindingStatus::Mismatch,
-                    Some(format!(
-                        "npm package points to https://github.com/{repository}, catalog points to https://github.com/{}",
-                        expected_repository
-                    )),
-                ),
-                None if registry.repository_declared => (
-                    SourceBindingStatus::Mismatch,
-                    Some("npm package repository is not a valid GitHub repository".into()),
-                ),
-                None => (
+                let registry_detail = error.safe_detail.unwrap_or(error.code);
+                let github_detail = fallback
+                    .source_binding_detail
+                    .unwrap_or_else(|| "repository is not an installable DSH bundle".into());
+                (
+                    None,
+                    CompatibilityInfo {
+                        status: CompatibilityStatus::Unknown,
+                        detail: Some(
+                            "registry metadata unavailable; GitHub fallback invalid".into(),
+                        ),
+                    },
                     SourceBindingStatus::Unknown,
-                    Some("npm package does not declare a GitHub repository".into()),
-                ),
-            };
-            let info = evaluate_cordis_compatibility(
-                cordis_version.as_deref(),
-                registry.cordis_range.as_deref(),
-            );
-            (
-                Some(registry.latest_version),
-                info,
-                source_binding,
-                source_binding_detail,
-            )
-        }
-        Err(error) => (
-            None,
-            CompatibilityInfo {
-                status: CompatibilityStatus::Unknown,
-                detail: Some("registry metadata unavailable".into()),
-            },
-            SourceBindingStatus::Unknown,
-            error.safe_detail,
-        ),
-    };
+                    Some(format!("npm: {registry_detail}; GitHub: {github_detail}")),
+                    None,
+                )
+            }
+            Err(error) => (
+                None,
+                CompatibilityInfo {
+                    status: CompatibilityStatus::Unknown,
+                    detail: Some("registry metadata unavailable".into()),
+                },
+                SourceBindingStatus::Unknown,
+                error.safe_detail,
+                None,
+            ),
+        };
     CachedCompatibility {
         package_name: package_name.into(),
         resolved_packages: Vec::new(),
@@ -4508,6 +5299,72 @@ fn fetch_package_compatibility(
         info,
         source_binding,
         source_binding_detail,
+        install_spec,
+    }
+}
+
+fn fetch_github_package_compatibility(
+    plugin: &MarketPlugin,
+    source: &GithubPackageSource,
+    cordis_version: Option<String>,
+    checked_at_ms: u64,
+    client: Option<&reqwest::blocking::Client>,
+) -> CachedCompatibility {
+    if !source.repository.eq_ignore_ascii_case(&plugin.id) {
+        return CachedCompatibility {
+            package_name: source.repository.clone(),
+            package_version: None,
+            cordis_version,
+            checked_at_ms,
+            info: CompatibilityInfo {
+                status: CompatibilityStatus::Unknown,
+                detail: Some("GitHub source does not match the catalog repository".into()),
+            },
+            source_binding: SourceBindingStatus::Mismatch,
+            source_binding_detail: Some(format!(
+                "GitHub source {} does not match catalog source {}",
+                source.repository, plugin.id
+            )),
+            install_spec: None,
+            resolved_packages: Vec::new(),
+        };
+    }
+    match fetch_github_package_info_with(source, client) {
+        Ok((package, commit)) => {
+            let info = evaluate_cordis_compatibility(
+                cordis_version.as_deref(),
+                package.cordis_range.as_deref(),
+            );
+            let install_spec = format!(
+                "{}@github:{}#{commit}",
+                package.package_name, source.repository
+            );
+            CachedCompatibility {
+                package_name: package.package_name,
+                package_version: Some(package.package_version),
+                cordis_version,
+                checked_at_ms,
+                info,
+                source_binding: SourceBindingStatus::Verified,
+                source_binding_detail: Some(format!("GitHub source pinned to {}", &commit[..12])),
+                install_spec: Some(install_spec),
+                resolved_packages: Vec::new(),
+            }
+        }
+        Err(error) => CachedCompatibility {
+            package_name: source.repository.clone(),
+            package_version: None,
+            cordis_version,
+            checked_at_ms,
+            info: CompatibilityInfo {
+                status: CompatibilityStatus::Unknown,
+                detail: Some("GitHub bundle metadata unavailable or invalid".into()),
+            },
+            source_binding: SourceBindingStatus::Unknown,
+            source_binding_detail: Some(error.safe_detail.unwrap_or(error.code)),
+            install_spec: None,
+            resolved_packages: Vec::new(),
+        },
     }
 }
 
@@ -4558,7 +5415,7 @@ fn validate_install_metadata(
         || verified.resolved_packages.is_empty()
         || verified.source_binding == SourceBindingStatus::NotChecked
     {
-        return Err(AppError::new("marketNetworkFailed")
+        return Err(AppError::new("marketInstallMetadataUnavailable")
             .value("plugin", plugin_name)
             .detail("complete package versions could not be resolved; retry before installing"));
     }
@@ -4664,11 +5521,125 @@ fn fetch_registry_package_info_with(
         &url,
         REGISTRY_TIMEOUT,
         8 * 1024 * 1024,
-        "marketNetworkFailed",
+        "marketSourceUnavailable",
         "registry response",
     )?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::new("marketSourceMetadataInvalid").detail(error.to_string()))?;
     registry_package_info(&value)
+}
+
+fn fetch_github_package_info_with(
+    source: &GithubPackageSource,
+    client: Option<&reqwest::blocking::Client>,
+) -> AppResult<(GithubPackageInfo, String)> {
+    let commit =
+        resolve_repository_commit_with(&source.repository, source.revision.as_deref(), client)?;
+    let manifest_url = format!(
+        "https://raw.githubusercontent.com/{}/{commit}/package.json",
+        source.repository
+    );
+    let bytes = fetch_bytes_with(
+        client,
+        &manifest_url,
+        REGISTRY_TIMEOUT,
+        MARKET_MANIFEST_MAX_BYTES,
+        "marketSourceUnavailable",
+        "GitHub package manifest",
+    )?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        AppError::new("marketSourceMetadataInvalid")
+            .detail(format!("GitHub package.json is invalid: {error}"))
+    })?;
+    let info = github_package_info(&value)?;
+    let patch_url = format!(
+        "https://raw.githubusercontent.com/{}/{commit}/{}",
+        source.repository, info.patch_path
+    );
+    // A manifest that points at a missing patch is not a usable bundle. Read
+    // only a bounded object here; the candidate composition remains the final
+    // authority after pnpm installs the commit-pinned source.
+    fetch_bytes_with(
+        client,
+        &patch_url,
+        REGISTRY_TIMEOUT,
+        4 * 1024 * 1024,
+        "marketSourceUnavailable",
+        "GitHub bundle patch",
+    )?;
+    Ok((info, commit))
+}
+
+fn github_package_info(value: &serde_json::Value) -> AppResult<GithubPackageInfo> {
+    let declared_name = value
+        .get("name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            AppError::new("marketSourceMetadataInvalid")
+                .detail("GitHub package.json does not declare a valid npm package name")
+        })?;
+    let package_name = normalize_package_spec(declared_name)
+        .filter(|name| name == declared_name)
+        .filter(|name| !name.starts_with("@deepseek-ai/"))
+        .ok_or_else(|| {
+            AppError::new("marketSourceMetadataInvalid")
+                .detail("GitHub package.json does not declare a safe third-party package name")
+        })?;
+    let package_version = value
+        .get("version")
+        .and_then(|value| value.as_str())
+        .filter(|version| semver::Version::parse(version).is_ok())
+        .ok_or_else(|| {
+            AppError::new("marketSourceMetadataInvalid")
+                .detail("GitHub package.json does not declare an exact semver version")
+        })?
+        .to_owned();
+    let patch_path = value
+        .get("dsh")
+        .and_then(|value| value.get("bundle"))
+        .and_then(|value| value.get("patch"))
+        .and_then(|value| value.as_str())
+        .filter(|path| safe_bundle_patch_path(path))
+        .ok_or_else(|| {
+            AppError::new("marketSourceMetadataInvalid")
+                .detail("GitHub package.json does not declare a safe dsh.bundle.patch")
+        })?
+        .to_owned();
+    let peers = value.get("peerDependencies");
+    let cordis_range = ["@deepseek-ai/cordis", "cordis"]
+        .iter()
+        .find_map(|key| {
+            peers
+                .and_then(|value| value.get(key))
+                .and_then(|value| value.as_str())
+        })
+        .map(str::to_owned);
+    Ok(GithubPackageInfo {
+        package_name,
+        package_version,
+        cordis_range,
+        patch_path,
+    })
+}
+
+fn safe_bundle_patch_path(value: &str) -> bool {
+    if value.is_empty()
+        || value.starts_with('~')
+        || value.contains(['?', '#', '%', '\\'])
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '/' | '-' | '_' | '.')
+        })
+    {
+        return false;
+    }
+    let path = Path::new(value);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::CurDir | Component::Normal(_)))
+        && path
+            .components()
+            .any(|component| matches!(component, Component::Normal(_)))
 }
 
 fn registry_package_info(value: &serde_json::Value) -> AppResult<RegistryPackageInfo> {
@@ -4676,15 +5647,19 @@ fn registry_package_info(value: &serde_json::Value) -> AppResult<RegistryPackage
         .get("dist-tags")
         .and_then(|t| t.get("latest"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::new("marketNetworkFailed").detail("registry dist-tags missing"))?;
+        .ok_or_else(|| {
+            AppError::new("marketSourceMetadataInvalid").detail("registry dist-tags missing")
+        })?;
     semver::Version::parse(latest).map_err(|_| {
-        AppError::new("marketNetworkFailed")
+        AppError::new("marketSourceMetadataInvalid")
             .detail("registry latest is not an exact semver version")
     })?;
     let latest_manifest = value
         .get("versions")
         .and_then(|v| v.get(latest))
-        .ok_or_else(|| AppError::new("marketNetworkFailed").detail("latest manifest missing"))?;
+        .ok_or_else(|| {
+            AppError::new("marketSourceMetadataInvalid").detail("latest manifest missing")
+        })?;
     let peers = latest_manifest.get("peerDependencies");
     let cordis_range = ["@deepseek-ai/cordis", "cordis"]
         .iter()
@@ -5096,6 +6071,87 @@ fn extract_tarball(bytes: &[u8], dest: &Path) -> AppResult<()> {
     Ok(())
 }
 
+/// Select the directory that represents one installable skill bundle.
+///
+/// Older catalog entries are repositories whose root is already the bundle.
+/// Newer repositories may carry tooling and examples around a nested bundle;
+/// `skill.json.entrypoint` is authoritative for those. As a compatibility
+/// fallback, a repository with exactly one SKILL.md is unambiguous. Repositories
+/// containing several skills must declare which one the catalog entry means.
+fn resolve_skill_source(staging: &Path) -> Result<PathBuf, String> {
+    let root_entrypoint = staging.join("SKILL.md");
+    if root_entrypoint.is_file() {
+        return Ok(staging.to_owned());
+    }
+
+    let manifest_path = staging.join("skill.json");
+    if manifest_path.is_file() {
+        let metadata = fs::metadata(&manifest_path)
+            .map_err(|error| format!("could not inspect skill.json: {error}"))?;
+        if metadata.len() > MARKET_MANIFEST_MAX_BYTES as u64 {
+            return Err("skill.json exceeds the size limit".into());
+        }
+        let bytes = fs::read(&manifest_path)
+            .map_err(|error| format!("could not read skill.json: {error}"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("skill.json is invalid: {error}"))?;
+        if let Some(entrypoint) = manifest.get("entrypoint") {
+            let entrypoint = entrypoint
+                .as_str()
+                .ok_or_else(|| "skill.json entrypoint must be a string".to_owned())?;
+            let relative = safe_skill_entrypoint(entrypoint)?;
+            let candidate = staging.join(relative);
+            if !candidate.is_file() {
+                return Err("skill.json entrypoint does not point to an existing SKILL.md".into());
+            }
+            return candidate
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "skill.json entrypoint has no bundle directory".into());
+        }
+    }
+
+    let mut entrypoints = walkdir::WalkDir::new(staging)
+        .follow_links(false)
+        .into_iter()
+        .map(|entry| entry.map_err(|error| format!("could not inspect skill bundle: {error}")))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| entry.file_type().is_file() && entry.file_name() == "SKILL.md")
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    entrypoints.sort();
+    match entrypoints.as_slice() {
+        [] => Err("skill repository does not contain a SKILL.md".into()),
+        [entrypoint] => entrypoint
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "SKILL.md has no bundle directory".into()),
+        _ => Err(
+            "skill repository contains multiple SKILL.md files; declare skill.json entrypoint"
+                .into(),
+        ),
+    }
+}
+
+fn safe_skill_entrypoint(value: &str) -> Result<PathBuf, String> {
+    let path = Path::new(value);
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => safe.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("skill.json entrypoint escapes the repository".into());
+            }
+        }
+    }
+    if safe.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+        return Err("skill.json entrypoint must point to SKILL.md".into());
+    }
+    Ok(safe)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5242,13 +6298,27 @@ mod tests {
                 .profile,
             "web"
         );
+        assert_eq!(
+            install_plan_from_command("dsh plugin --profile web add github:owner/repo")
+                .unwrap()
+                .packages,
+            ["github:owner/repo"]
+        );
+        assert_eq!(
+            install_plan_from_command(
+                "dsh plugin add github:owner/repo#1111111111111111111111111111111111111111"
+            )
+            .unwrap()
+            .packages,
+            ["github:owner/repo#1111111111111111111111111111111111111111"]
+        );
         for command in [
             "dsh plugin --profile ../escape add alpha beta",
             "dsh plugin --profile C:\\escape add alpha",
             "dsh plugin --profile <name> add alpha",
             "dsh plugin --profile add alpha",
             "dsh plugin add alpha ./local",
-            "dsh plugin add alpha github:owner/repo",
+            "dsh plugin add github:owner/repo#moving-tag",
             "dsh plugin add alpha && pnpm add beta",
             "dsh plugin add alpha --dir /tmp/escape",
             "echo add alpha beta",
@@ -5261,6 +6331,7 @@ mod tests {
         CachedCompatibility {
             package_name: name.into(),
             package_version: Some("1.0.0".into()),
+            install_spec: Some(format!("{name}@1.0.0")),
             resolved_packages: Vec::new(),
             cordis_version: Some("4.0.0".into()),
             checked_at_ms: now_ms(),
@@ -5371,7 +6442,7 @@ mod tests {
             validate_install_metadata("trading", true, &incomplete)
                 .unwrap_err()
                 .code,
-            "marketNetworkFailed"
+            "marketInstallMetadataUnavailable"
         );
     }
 
@@ -5503,6 +6574,48 @@ if (root / 'fail').exists(): sys.exit(7)
                     .to_string_lossy()
                     .starts_with(".trading-web.market-rejected-"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_bundle_install_stays_commit_pinned_through_the_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let marketplace = fake_marketplace(temp.path());
+        let sha = "1".repeat(40);
+        let spec = format!("mrd-bundle@github:Owner/repo#{sha}");
+        let change = PendingMarketChange {
+            plugin_id: "Owner/repo".into(),
+            name: "mrd-bundle".into(),
+            action: MarketOperationKind::Install,
+            profile: Some("github-test".into()),
+        };
+
+        marketplace
+            .mutate_profile_packages("github-test", "add", std::slice::from_ref(&spec), &change)
+            .unwrap();
+
+        let profile = marketplace.profile_dir("github-test");
+        let manifest = read_manifest(&profile.join("package.json")).unwrap();
+        assert_eq!(
+            manifest.dependencies.get("mrd-bundle"),
+            Some(&format!("github:Owner/repo#{sha}"))
+        );
+        assert!(manifest.bundles.contains(&"mrd-bundle".into()));
+        assert!(installed_package_matches_spec(
+            &profile,
+            "mrd-bundle",
+            &spec
+        ));
+        let args: Vec<String> = serde_json::from_str(
+            fs::read_to_string(temp.path().join("calls.jsonl"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(args.contains(&spec));
+        assert!(args.contains(&"--ignore-scripts".into()));
     }
 
     #[cfg(unix)]
@@ -5860,6 +6973,100 @@ if (root / 'fail').exists(): sys.exit(7)
     }
 
     #[test]
+    fn github_install_sources_are_canonical_and_commit_only() {
+        assert_eq!(
+            parse_github_package_source("github:Owner/repo"),
+            Some(GithubPackageSource {
+                repository: "Owner/repo".into(),
+                revision: None,
+            })
+        );
+        assert_eq!(
+            pinned_github_install_spec(
+                "bundle-name@github:Owner/repo#1111111111111111111111111111111111111111"
+            ),
+            Some((
+                "bundle-name".into(),
+                GithubPackageSource {
+                    repository: "Owner/repo".into(),
+                    revision: Some("1111111111111111111111111111111111111111".into()),
+                }
+            ))
+        );
+        for invalid in [
+            "github:owner/repo#main",
+            "github:owner/repo#v1.0.0",
+            "github:owner/repo/child",
+            "github:owner/repo;touch-owned",
+        ] {
+            assert_eq!(parse_github_package_source(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn github_package_manifest_must_be_a_real_dsh_bundle() {
+        let valid = serde_json::json!({
+            "name": "mrd-bundle",
+            "version": "1.3.2",
+            "peerDependencies": { "cordis": "^4.0.0" },
+            "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+        });
+        let info = github_package_info(&valid).expect("valid bundle");
+        assert_eq!(info.package_name, "mrd-bundle");
+        assert_eq!(info.package_version, "1.3.2");
+        assert_eq!(info.cordis_range.as_deref(), Some("^4.0.0"));
+        assert_eq!(info.patch_path, "./cordis.patch.yml");
+
+        let missing_bundle = serde_json::json!({
+            "name": "ordinary-app", "version": "1.0.0", "private": true
+        });
+        assert_eq!(
+            github_package_info(&missing_bundle).unwrap_err().code,
+            "marketSourceMetadataInvalid"
+        );
+        let escaping = serde_json::json!({
+            "name": "bad-bundle", "version": "1.0.0",
+            "dsh": { "bundle": { "patch": "../outside.yml" } }
+        });
+        assert!(github_package_info(&escaping).is_err());
+        let foundation_collision = serde_json::json!({
+            "name": "@deepseek-ai/dsh-web-app", "version": "1.0.0",
+            "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+        });
+        assert!(github_package_info(&foundation_collision).is_err());
+    }
+
+    #[test]
+    fn installed_github_bundle_must_keep_the_confirmed_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sha = "1".repeat(40);
+        fs::write(
+            temp.path().join("package.json"),
+            format!(
+                r#"{{"dependencies":{{"mrd-bundle":"github:Owner/repo#{sha}"}},"dsh":{{"profile":{{"bundles":["mrd-bundle"]}}}}}}"#
+            ),
+        )
+        .expect("profile manifest");
+        fs::create_dir_all(temp.path().join("node_modules/mrd-bundle")).expect("package dir");
+        fs::write(
+            temp.path().join("node_modules/mrd-bundle/package.json"),
+            r#"{"name":"mrd-bundle","version":"9.9.9","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}"#,
+        )
+        .expect("package manifest");
+        let spec = format!("mrd-bundle@github:Owner/repo#{sha}");
+        assert!(installed_package_matches_spec(
+            temp.path(),
+            "mrd-bundle",
+            &spec
+        ));
+        assert!(!installed_package_matches_spec(
+            temp.path(),
+            "mrd-bundle",
+            &format!("mrd-bundle@github:Owner/repo#{}", "2".repeat(40))
+        ));
+    }
+
+    #[test]
     fn automatic_recovery_never_removes_harness_runtime_packages() {
         assert_eq!(
             recoverable_incompatible_package("dsh-better-sidebar"),
@@ -5939,6 +7146,75 @@ if (root / 'fail').exists(): sys.exit(7)
         assert_eq!(
             safe_relative_path(Path::new("repo-main/SKILL.md")).expect("file"),
             Some(PathBuf::from("SKILL.md"))
+        );
+    }
+
+    #[test]
+    fn skill_source_supports_root_manifest_and_unique_nested_layouts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("skill")).expect("root dirs");
+        fs::write(root.join("SKILL.md"), "# root").expect("root skill");
+        fs::write(root.join("skill/SKILL.md"), "# nested").expect("nested skill");
+        assert_eq!(resolve_skill_source(&root).expect("root source"), root);
+
+        let manifest = temp.path().join("manifest");
+        fs::create_dir_all(manifest.join("skill/references")).expect("manifest dirs");
+        fs::write(
+            manifest.join("skill.json"),
+            r#"{"entrypoint":"skill/SKILL.md"}"#,
+        )
+        .expect("manifest");
+        fs::write(manifest.join("skill/SKILL.md"), "# manifest").expect("manifest skill");
+        assert_eq!(
+            resolve_skill_source(&manifest).expect("manifest source"),
+            manifest.join("skill")
+        );
+
+        let unique = temp.path().join("unique");
+        fs::create_dir_all(unique.join("packages/example")).expect("unique dirs");
+        fs::write(unique.join("packages/example/SKILL.md"), "# unique").expect("unique skill");
+        assert_eq!(
+            resolve_skill_source(&unique).expect("unique source"),
+            unique.join("packages/example")
+        );
+    }
+
+    #[test]
+    fn skill_source_rejects_unsafe_missing_and_ambiguous_layouts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let unsafe_manifest = temp.path().join("unsafe");
+        fs::create_dir_all(&unsafe_manifest).expect("unsafe dir");
+        fs::write(
+            unsafe_manifest.join("skill.json"),
+            r#"{"entrypoint":"../SKILL.md"}"#,
+        )
+        .expect("unsafe manifest");
+        assert!(
+            resolve_skill_source(&unsafe_manifest)
+                .expect_err("unsafe entrypoint")
+                .contains("escapes")
+        );
+
+        let missing = temp.path().join("missing");
+        fs::create_dir_all(&missing).expect("missing dir");
+        assert!(
+            resolve_skill_source(&missing)
+                .expect_err("missing entrypoint")
+                .contains("does not contain")
+        );
+
+        let ambiguous = temp.path().join("ambiguous");
+        fs::create_dir_all(ambiguous.join("one")).expect("first dir");
+        fs::create_dir_all(ambiguous.join("two")).expect("second dir");
+        fs::write(ambiguous.join("one/SKILL.md"), "# one").expect("first skill");
+        fs::write(ambiguous.join("two/SKILL.md"), "# two").expect("second skill");
+        assert!(
+            resolve_skill_source(&ambiguous)
+                .expect_err("ambiguous entrypoint")
+                .contains("multiple")
         );
     }
 
@@ -6506,7 +7782,7 @@ if (root / 'fail').exists(): sys.exit(7)
             vec!["x/gamma", "x/alpha"]
         );
         assert!(results.iter().all(|result| {
-            result.compatibility == CompatibilityStatus::Compatible
+            result.compatibility == CompatibilityStatus::Unknown
                 && result.source_binding == SourceBindingStatus::Verified
         }));
     }
@@ -6552,6 +7828,166 @@ if (root / 'fail').exists(): sys.exit(7)
             !valid_skill_dir_name("a\\b"),
             "should reject windows separator"
         );
+    }
+
+    #[test]
+    fn skill_install_names_recover_bad_display_names_and_disambiguate_collisions() {
+        let mut recovered = plugin("Haniubub/seo-toolkit", "Haniubub/seo-toolkit", 1, None);
+        recovered.kind = "skill".into();
+        let mut first = plugin("one/dsh-model-routing", "dsh-model-routing", 1, None);
+        first.kind = "skill".into();
+        let mut second = plugin("two/dsh-model-routing", "dsh-model-routing", 1, None);
+        second.kind = "skill".into();
+        let catalog = catalog(vec![recovered.clone(), first.clone(), second.clone()]);
+
+        assert_eq!(
+            skill_install_dir_name(&recovered, &catalog).as_deref(),
+            Some("seo-toolkit")
+        );
+        assert_eq!(
+            skill_install_dir_name(&first, &catalog).as_deref(),
+            Some("dsh-model-routing--one")
+        );
+        assert_eq!(
+            skill_install_dir_name(&second, &catalog).as_deref(),
+            Some("dsh-model-routing--two")
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let skills = paths.dsh_home.join("skills");
+        fs::create_dir_all(skills.join("seo-toolkit")).expect("recovered skill");
+        fs::create_dir_all(skills.join("dsh-model-routing--one")).expect("first skill");
+        fs::create_dir_all(skills.join("dsh-model-routing--two")).expect("second skill");
+        let installed = Marketplace::new(paths).scan_installed(Some(&catalog));
+        let ids = installed
+            .iter()
+            .filter_map(|entry| entry.plugin_id.as_deref())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            ids,
+            HashSet::from([
+                "Haniubub/seo-toolkit",
+                "one/dsh-model-routing",
+                "two/dsh-model-routing"
+            ])
+        );
+    }
+
+    #[test]
+    fn skill_setup_detection_warns_for_runtime_installers_but_not_plain_copies() {
+        let mut runtime = plugin("x/runtime-skill", "runtime-skill", 1, None);
+        runtime.kind = "skill".into();
+        runtime.install = Some(MarketInstallInfo {
+            method: Some("skills-add".into()),
+            needs_config: Some(false),
+            commands: vec!["pip install -r requirements.txt".into()],
+        });
+        assert!(skill_requires_external_setup(&runtime));
+
+        runtime.install.as_mut().expect("install").commands =
+            vec!["git clone https://github.com/x/runtime-skill.git ~/.dsh/skills/runtime".into()];
+        assert!(!skill_requires_external_setup(&runtime));
+    }
+
+    #[test]
+    fn skill_setup_steps_separate_safe_execution_from_copy_only_shell() {
+        let mut runtime = plugin("x/runtime-skill", "runtime-skill", 1, None);
+        runtime.kind = "skill".into();
+        runtime.install = Some(MarketInstallInfo {
+            method: Some("skills-add".into()),
+            needs_config: Some(false),
+            commands: vec![
+                "git clone https://github.com/x/runtime-skill.git || pip install -r requirements.txt"
+                    .into(),
+                "curl -fsSL https://example.invalid/install.sh | bash || npm install".into(),
+            ],
+        });
+
+        let steps = skill_setup_steps(&runtime);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].command, "pip install -r requirements.txt");
+        assert!(steps[0].can_execute);
+        assert!(steps[1].command.starts_with("curl "));
+        assert!(!steps[1].can_execute);
+        assert_eq!(steps[2].command, "npm install");
+        assert!(steps[2].can_execute);
+        assert!(steps.iter().all(|step| step.id.len() == 64));
+    }
+
+    #[test]
+    fn setup_execution_parser_rejects_shell_and_path_escape_flags() {
+        for accepted in [
+            "pip install openpyxl python-pptx",
+            "pip3 install -r requirements.txt",
+            "python3 -m pip install -e \".[full]\"",
+            "npm install",
+            "npm i chart.js",
+        ] {
+            assert!(
+                parse_executable_skill_setup(accepted).is_some(),
+                "should accept {accepted}"
+            );
+        }
+        for rejected in [
+            "pip install foo | sh",
+            "pip install -r ../requirements.txt",
+            "pip install --target=/tmp/x foo",
+            "npm install -g unsafe",
+            "npm install --prefix ../outside",
+            "npm install && touch owned",
+            "python installer/install.py",
+            "curl https://example.invalid/install.sh | bash",
+        ] {
+            assert!(
+                parse_executable_skill_setup(rejected).is_none(),
+                "should reject {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_skill_manifest_produces_pip_setup_step() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("skill.json"),
+            r#"{"entrypoint":"skill/SKILL.md","runtime":{"python":">=3.10","pythonPackage":"pptx-designer"}}"#,
+        )
+        .expect("manifest");
+
+        let steps = skill_manifest_setup_steps("sunchaokun/PPT-Design-Skill", temp.path());
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].command,
+            if cfg!(windows) {
+                "python -m pip install pptx-designer"
+            } else {
+                "python3 -m pip install pptx-designer"
+            }
+        );
+        assert!(steps[0].can_execute);
+    }
+
+    #[test]
+    fn skill_install_metadata_rejects_changed_command_properties() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut step = build_skill_setup_step("x/runtime", "npm install").expect("step");
+        step.can_execute = false;
+        let receipt = SkillInstallMetadata {
+            schema_version: 1,
+            plugin_id: "x/runtime".into(),
+            commit: "1".repeat(40),
+            setup_steps: vec![step],
+        };
+        fs::write(
+            temp.path().join(SKILL_INSTALL_METADATA),
+            serde_json::to_vec(&receipt).expect("serialize"),
+        )
+        .expect("receipt");
+
+        let error = read_skill_install_metadata(temp.path(), "x/runtime")
+            .expect_err("changed receipt must fail");
+        assert_eq!(error.code, "marketSkillSetupUnavailable");
     }
 
     #[test]
@@ -6649,6 +8085,8 @@ if (root / 'fail').exists(): sys.exit(7)
     #[test]
     fn catalog_sanitization_keeps_safe_entries_and_drops_unsafe_targets() {
         let valid = plugin("x/alpha", "alpha", 1, None);
+        let mut recovered_skill = plugin("owner/skill-name", "owner/skill-name", 1, None);
+        recovered_skill.kind = "skill".into();
         let mut invalid = plugin("x/bad", "--dir=/tmp/escape", 1, None);
         invalid.homepage = None;
         invalid.install = None;
@@ -6657,11 +8095,12 @@ if (root / 'fail').exists(): sys.exit(7)
         let mut input = MarketCatalogFile {
             schema_version: 2,
             generated_at: None,
-            plugins: vec![valid, invalid, redirected],
+            plugins: vec![valid, recovered_skill, invalid, redirected],
         };
         sanitize_catalog(&mut input).expect("sanitize");
-        assert_eq!(input.plugins.len(), 1);
+        assert_eq!(input.plugins.len(), 2);
         assert_eq!(input.plugins[0].id, "x/alpha");
+        assert_eq!(input.plugins[1].id, "owner/skill-name");
     }
 
     #[test]
@@ -6670,6 +8109,7 @@ if (root / 'fail').exists(): sys.exit(7)
             resolved_packages: Vec::new(),
             package_name: "alpha".into(),
             package_version: Some("1.0.0".into()),
+            install_spec: Some("alpha@1.0.0".into()),
             cordis_version: Some("1.2.3".into()),
             checked_at_ms: 1_000,
             info: CompatibilityInfo {
@@ -6732,6 +8172,7 @@ if (root / 'fail').exists(): sys.exit(7)
             resolved_packages: vec!["alpha@1.0.0".into()],
             package_name: "alpha".into(),
             package_version: Some("1.0.0".into()),
+            install_spec: Some("alpha@1.0.0".into()),
             cordis_version: Some("4.0.1".into()),
             checked_at_ms: 1,
             info: CompatibilityInfo {
@@ -6766,7 +8207,7 @@ if (root / 'fail').exists(): sys.exit(7)
             validate_install_metadata("alpha", true, &verified)
                 .unwrap_err()
                 .code,
-            "marketNetworkFailed"
+            "marketInstallMetadataUnavailable"
         );
         verified.package_version = Some("1.0.0".into());
         verified.resolved_packages.clear();
@@ -7403,7 +8844,10 @@ if (root / 'fail').exists(): sys.exit(7)
             "dist-tags": { "latest": "github:attacker/repo" },
             "versions": { "github:attacker/repo": {} }
         });
-        assert!(registry_package_info(&invalid).is_err());
+        assert_eq!(
+            registry_package_info(&invalid).unwrap_err().code,
+            "marketSourceMetadataInvalid"
+        );
     }
 
     #[test]

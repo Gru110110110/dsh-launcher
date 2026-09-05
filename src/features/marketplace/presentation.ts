@@ -111,6 +111,16 @@ export function compatibilityPresentation(
   }
 }
 
+export function cordisInstallSource(
+  plugin: Pick<PluginSummary, "installTarget" | "installPackages">,
+): "github" | "npm" {
+  return [plugin.installTarget, ...plugin.installPackages].some((target) =>
+    target.toLowerCase().includes("github:"),
+  )
+    ? "github"
+    : "npm";
+}
+
 export function formatStars(stars: number): string {
   if (stars >= 1000) return `${(stars / 1000).toFixed(1)}k`;
   return String(stars);

@@ -11,7 +11,7 @@ use dsh_core::{
         CompatibilityInfo, CompatibilityStatus, InstalledPlugin, MarketCatalogState,
         MarketOperationKind, MarketOperationResult, MarketPage, MarketQuery, MarketSort,
         PendingMarketChange, PendingVerification, PluginCompatibility, PluginKind, PluginSource,
-        PluginSummary, SourceBindingStatus,
+        PluginSummary, SkillSetupExecutionResult, SkillSetupStep, SourceBindingStatus,
     },
     pet::{
         PetBridgeStatus, PetPosition, PetPreferences, PetPreferencesPatch, PetProgress,
@@ -56,6 +56,8 @@ fn main() {
         SourceBindingStatus::decl(),
         CompatibilityInfo::decl(),
         InstalledPlugin::decl(),
+        SkillSetupStep::decl(),
+        SkillSetupExecutionResult::decl(),
         PluginSummary::decl(),
         PluginCompatibility::decl(),
         MarketSort::decl(),

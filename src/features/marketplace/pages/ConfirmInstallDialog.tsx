@@ -4,13 +4,21 @@ import { useTranslation } from "react-i18next";
 import { useLauncherSelector } from "@/platform/launcherStore";
 import type { PluginSummary } from "@/platform/generated/bindings";
 
-import { installReviewState } from "../presentation";
+import { cordisInstallSource, installReviewState } from "../presentation";
+import { SkillSetupGuidance } from "./SkillSetupGuidance";
 
-const BINDING_TRANSLATION_KEYS = {
+const NPM_BINDING_TRANSLATION_KEYS = {
   notChecked: "market.install.binding.notChecked",
   verified: "market.install.binding.verified",
   mismatch: "market.install.binding.mismatch",
   unknown: "market.install.binding.unknown",
+} as const satisfies Record<PluginSummary["sourceBinding"], string>;
+
+const GITHUB_BINDING_TRANSLATION_KEYS = {
+  notChecked: "market.install.binding.githubNotChecked",
+  verified: "market.install.binding.githubVerified",
+  mismatch: "market.install.binding.githubMismatch",
+  unknown: "market.install.binding.githubUnknown",
 } as const satisfies Record<PluginSummary["sourceBinding"], string>;
 
 export function ConfirmInstallDialog({
@@ -121,7 +129,9 @@ export function ConfirmInstallDialog({
           {t(
             plugin.kind === "skill"
               ? "market.install.binding.skill"
-              : BINDING_TRANSLATION_KEYS[plugin.sourceBinding],
+              : cordisInstallSource(plugin) === "github"
+                ? GITHUB_BINDING_TRANSLATION_KEYS[plugin.sourceBinding]
+                : NPM_BINDING_TRANSLATION_KEYS[plugin.sourceBinding],
           )}
         </p>
         {installReviewState(plugin) === "blocked" && (
@@ -147,6 +157,9 @@ export function ConfirmInstallDialog({
           detail !== plugin.compatibilityDetail && (
             <p className="market-dialog-detail">{detail}</p>
           )}
+        {plugin.kind === "skill" && plugin.needsConfig && (
+          <SkillSetupGuidance plugin={plugin} context="beforeInstall" />
+        )}
         <footer className="market-dialog-actions">
           <button
             ref={cancelButton}

@@ -9,6 +9,7 @@ import type {
   PluginCompatibility,
   PluginKind,
   PluginSummary,
+  SkillSetupExecutionResult,
 } from "./generated/bindings";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -34,6 +35,11 @@ export const marketApi = {
       pluginId,
       force,
       expectedVersion,
+    }),
+  executeSkillSetup: (pluginId: string, stepId: string) =>
+    command<SkillSetupExecutionResult>("market_execute_skill_setup", {
+      pluginId,
+      stepId,
     }),
   uninstall: (pluginId: string, target: InstalledPlugin | null) =>
     command<MarketOperationResult>("market_uninstall", { pluginId, target }),
@@ -153,7 +159,17 @@ function devPlugin(
     curated: false,
     pushedAt: null,
     updatedAt: "2026-08-20T00:00:00Z",
-    needsConfig: false,
+    needsConfig: kind === "skill" && name === "chart-render",
+    setupSteps:
+      kind === "skill" && name === "chart-render"
+        ? [
+            {
+              id: "dev-chart-render-setup",
+              command: "python3 -m pip install matplotlib",
+              canExecute: true,
+            },
+          ]
+        : [],
     installMethod: kind === "cordisPlugin" ? "pnpm-profile" : "skills-add",
     installTarget: kind === "cordisPlugin" ? name : id,
     installProfile: kind === "cordisPlugin" ? "web" : null,
@@ -281,7 +297,12 @@ if (!isTauri) {
       restartRequired: false,
       profile,
       error: null,
+      setupSteps: plugin.setupSteps,
     };
+  };
+  marketApi.executeSkillSetup = async () => {
+    await delay(null, 800);
+    return { ok: true, output: "Dependencies installed." };
   };
   marketApi.uninstall = async (pluginId: string) => {
     await delay(null, 600);
@@ -295,6 +316,7 @@ if (!isTauri) {
       restartRequired: false,
       profile,
       error: null,
+      setupSteps: [],
     };
   };
   marketApi.pendingVerification = () => delay<PendingVerification | null>(null);

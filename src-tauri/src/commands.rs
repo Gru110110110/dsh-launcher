@@ -6,7 +6,7 @@ use dsh_core::{
     balance::BalanceSnapshot,
     marketplace::{
         CompatibilityInfo, InstalledPlugin, MarketCatalogState, MarketOperationResult, MarketPage,
-        MarketQuery, PendingVerification, PluginSummary,
+        MarketQuery, PendingVerification, PluginSummary, SkillSetupExecutionResult,
     },
     pet::{PetPreferencesPatch, PetSnapshot},
 };
@@ -365,6 +365,21 @@ pub async fn market_install(
                 )?;
                 market.activate_operation_while_guarded(result, service)
             })
+        })
+        .await,
+    )
+}
+
+#[tauri::command]
+pub async fn market_execute_skill_setup(
+    plugin_id: String,
+    step_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<SkillSetupExecutionResult, AppError> {
+    let state = Arc::clone(state.inner());
+    flatten_blocking_result(
+        tauri::async_runtime::spawn_blocking(move || {
+            state.marketplace.execute_skill_setup(&plugin_id, &step_id)
         })
         .await,
     )

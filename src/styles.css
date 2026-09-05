@@ -1446,6 +1446,132 @@ button:disabled {
   margin-top: 18px;
 }
 
+.market-setup-dialog {
+  width: min(620px, 100%);
+}
+
+.market-setup-guidance {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, #c98a12 35%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, #c98a12 6%, var(--surface));
+}
+
+.market-setup-guidance-header {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  color: #b7790c;
+  font-size: 13px;
+}
+
+.market-setup-guidance-copy {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.market-setup-list {
+  display: grid;
+  gap: 9px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.market-setup-list li {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.market-setup-list code,
+.market-setup-confirm-command {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.market-setup-step-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.market-setup-step-actions button,
+.market-setup-docs-button {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  min-height: 29px;
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+.market-setup-copy-only {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.market-setup-docs-button {
+  margin-top: 10px;
+  padding-inline: 0;
+  border: 0;
+  background: transparent;
+  color: var(--brand);
+  cursor: pointer;
+}
+
+.market-setup-docs-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.market-setup-confirm-command {
+  display: block;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--control);
+}
+
+.market-setup-output {
+  margin-top: 12px;
+}
+
+.market-setup-output strong {
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.market-setup-output pre {
+  max-height: 180px;
+  margin: 7px 0 0;
+  overflow: auto;
+  padding: 9px;
+  border-radius: 8px;
+  background: var(--control);
+  color: var(--muted);
+  font:
+    11.5px/1.5 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
 .primary-button.danger-button {
   background: var(--danger);
 }
