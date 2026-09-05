@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "count": 2,
+  "count": 3,
   "pets": [
     {
       "id": "marmot",
@@ -56,6 +56,28 @@
       "description": {
         "zh": "十橘九胖。平时爱搭不理，一旦检测到报错就会第一时间跳上键盘凑热闹。",
         "en": "Nine out of ten orange cats are chubby. Usually aloof, but the moment an error pops up, Juzi is first to hop onto the keyboard and join the commotion."
+      },
+      "animations": {
+        "waiting": "waiting.json",
+        "error": "error.json",
+        "working": "working.json",
+        "thinking": "thinking.json",
+        "idle": "idle.json"
+      }
+    },
+    {
+      "id": "octopus",
+      "nickname": { "zh": "泡泡", "en": "Bubbles" },
+      "name": { "zh": "章鱼", "en": "Octopus" },
+      "folder": "octopus",
+      "tags": [
+        { "zh": "聪明", "en": "Clever" },
+        { "zh": "多手多脚", "en": "Many helping arms" },
+        { "zh": "爱好：收集贝壳", "en": "Loves collecting seashells" }
+      ],
+      "description": {
+        "zh": "八条触手可以同时做八件事，是并行任务的最佳搭档。思考时会吐出一串小泡泡。",
+        "en": "Eight arms can tackle eight things at once, making Bubbles the perfect partner for parallel tasks. When thinking, it blows a string of tiny bubbles."
       },
       "animations": {
         "waiting": "waiting.json",

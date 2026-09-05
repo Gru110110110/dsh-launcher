@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import { EyeOff } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { petApi } from "@/platform/petApi";
 import { usePetSnapshot } from "@/platform/petStore";
@@ -15,6 +16,10 @@ export function PetWindow() {
   const syncQueue = useRef(Promise.resolve());
   const initialPosition = useRef(launcher.pet.position);
   const positioned = useRef(false);
+  const [contextMenu, setContextMenu] = useState<{
+    left: number;
+    top: number;
+  } | null>(null);
   const selected = findPet(launcher.pet.selectedPetId);
   const active = launcher.pet.enabled && launcher.phase === "ready";
 
@@ -24,6 +29,22 @@ export function PetWindow() {
       document.documentElement.classList.remove("pet-window-root");
     };
   }, []);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const dismiss = () => {
+      setContextMenu(null);
+    };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") dismiss();
+    };
+    window.addEventListener("blur", dismiss);
+    window.addEventListener("keydown", dismissOnEscape);
+    return () => {
+      window.removeEventListener("blur", dismiss);
+      window.removeEventListener("keydown", dismissOnEscape);
+    };
+  }, [contextMenu]);
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
@@ -99,6 +120,8 @@ export function PetWindow() {
     <main
       className="desktop-pet"
       onPointerDown={(event) => {
+        if ((event.target as Element).closest(".pet-context-menu")) return;
+        setContextMenu(null);
         if (
           event.button !== 0 ||
           launcher.pet.clickThrough ||
@@ -108,6 +131,23 @@ export function PetWindow() {
         void import("@tauri-apps/api/window").then(({ getCurrentWindow }) =>
           getCurrentWindow().startDragging(),
         );
+      }}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        if (launcher.pet.clickThrough) return;
+        const margin = 8;
+        const menuWidth = 136;
+        const menuHeight = 42;
+        setContextMenu({
+          left: Math.max(
+            margin,
+            Math.min(event.clientX, window.innerWidth - menuWidth - margin),
+          ),
+          top: Math.max(
+            margin,
+            Math.min(event.clientY, window.innerHeight - menuHeight - margin),
+          ),
+        });
       }}
     >
       <PetRenderer
@@ -120,6 +160,33 @@ export function PetWindow() {
         transitionMode="cycle-boundary"
         className="pet-window-renderer"
       />
+      {contextMenu && (
+        <div
+          className="pet-context-menu"
+          role="menu"
+          style={contextMenu}
+          onPointerDown={(event) => {
+            event.stopPropagation();
+          }}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            autoFocus
+            onClick={() => {
+              setContextMenu(null);
+              void petApi
+                .patchPreferences({ enabled: false })
+                .catch((error: unknown) => {
+                  console.error("Desktop pet could not be hidden", error);
+                });
+            }}
+          >
+            <EyeOff size={15} aria-hidden />
+            {t("pet.hideAction")}
+          </button>
+        </div>
+      )}
     </main>
   );
 }

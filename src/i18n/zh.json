@@ -553,6 +553,7 @@
   "pet.subtitle": "挑选一只小伙伴住在桌面上，它会跟随 Agent 的状态一起等待、思考和工作。",
   "pet.visible": "宠物显示中",
   "pet.hidden": "宠物已隐藏",
+  "pet.hideAction": "隐藏宠物",
   "pet.choose": "选择宠物",
   "pet.currentState": "当前状态 · {{state}}",
   "pet.previewState": "预览宠物状态",

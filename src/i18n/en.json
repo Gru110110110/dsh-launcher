@@ -553,6 +553,7 @@
   "pet.subtitle": "Choose a little companion to live on your desktop. It will wait, think, and work, matching your Agent's status.",
   "pet.visible": "Pet is visible",
   "pet.hidden": "Pet is hidden",
+  "pet.hideAction": "Hide pet",
   "pet.choose": "Choose a pet",
   "pet.currentState": "Current state · {{state}}",
   "pet.previewState": "Preview pet state",

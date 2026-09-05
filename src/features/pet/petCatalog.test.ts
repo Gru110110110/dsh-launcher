@@ -40,6 +40,11 @@ describe("desktop pet catalog", () => {
         expect(data.layers).toBeInstanceOf(Array);
         expect(data.assets?.length).toBeGreaterThan(0);
         for (const asset of data.assets ?? []) {
+          if ("layers" in asset) {
+            expect(asset.layers).toBeInstanceOf(Array);
+            expect(asset.p).toBeUndefined();
+            continue;
+          }
           expect(asset.u).toBe("");
           expect(asset.p).toEqual(expect.any(String));
           expect(asset.p).not.toBe("");
