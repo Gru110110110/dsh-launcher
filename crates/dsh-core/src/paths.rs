@@ -39,6 +39,14 @@ pub struct ApplicationPaths {
     pub balance_bridge_dir: PathBuf,
     pub balance_bridge_module: PathBuf,
     pub pet_bridge_module: PathBuf,
+    /// Node-visible module root holding `@dsh-desktop/<bridge>` packages. The
+    /// injected include row resolves its bare bridge names from here, which is
+    /// what lets the Harness plugin inventory title each row with a bridge name
+    /// instead of the staged module path.
+    pub balance_bridge_modules_dir: PathBuf,
+    /// Generated Cordis entry lists mounted behind the hidden include row.
+    pub bridges_entry_list: PathBuf,
+    pub balance_only_entry_list: PathBuf,
     pub balance_bridge_overlay: PathBuf,
     pub balance_only_overlay: PathBuf,
     pub balance_bridge_preflight: PathBuf,
@@ -106,6 +114,15 @@ impl ApplicationPaths {
                 .join("balance")
                 .join("bridge")
                 .join("pet-bridge.mjs"),
+            balance_bridge_modules_dir: app_home
+                .join("balance")
+                .join("bridge")
+                .join("node_modules"),
+            bridges_entry_list: app_home.join("balance").join("bridge").join("bridges.json"),
+            balance_only_entry_list: app_home
+                .join("balance")
+                .join("bridge")
+                .join("balance-only.json"),
             balance_bridge_overlay: app_home
                 .join("balance")
                 .join("bridge")
@@ -207,6 +224,21 @@ mod tests {
             paths
                 .pet_bridge_module
                 .ends_with("balance/bridge/pet-bridge.mjs")
+        );
+        assert!(
+            paths
+                .balance_bridge_modules_dir
+                .ends_with("balance/bridge/node_modules")
+        );
+        assert!(
+            paths
+                .bridges_entry_list
+                .ends_with("balance/bridge/bridges.json")
+        );
+        assert!(
+            paths
+                .balance_only_entry_list
+                .ends_with("balance/bridge/balance-only.json")
         );
         assert!(!paths.balance_bridge_dir.starts_with(&paths.dsh_home));
         assert!(!paths.remote_dir.starts_with(&paths.dsh_home));

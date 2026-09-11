@@ -10,7 +10,7 @@ use std::{
     fs,
     io::Read,
     net::{Ipv4Addr, TcpListener},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Mutex,
     thread,
@@ -31,6 +31,24 @@ use crate::{
 
 const BALANCE_BRIDGE_SOURCE: &str = include_str!("../bridge/balance-bridge.mjs");
 const PET_BRIDGE_SOURCE: &str = include_str!("../bridge/pet-bridge.mjs");
+
+/// Launcher-owned package scope for the injected bridges. The Harness settings
+/// plugin inventory titles a row by trimming a recognized specifier prefix
+/// (`@scope/name` becomes `name`); an absolute file URL has no prefix to trim
+/// and is listed as the staged path, so the bridges are mounted through these
+/// packages instead. The bare specifiers resolve from the `node_modules` of
+/// the staged bridge directory, which the include row below makes the base of
+/// its own entry list.
+const BRIDGE_PACKAGE_SCOPE: &str = "@dsh-desktop";
+const BALANCE_BRIDGE_PACKAGE: &str = "balance-bridge";
+const PET_BRIDGE_PACKAGE: &str = "pet-bridge";
+/// Loader entry ids inside the mounted entry lists.
+const BALANCE_BRIDGE_ENTRY_ID: &str = "balance-bridge";
+const PET_BRIDGE_ENTRY_ID: &str = "pet-bridge";
+/// The one include row the overlay inserts. It carries `group: true`, and the
+/// plugin inventory skips group rows, so only the named bridges it mounts are
+/// listed as plugins.
+const BRIDGES_INCLUDE_ID: &str = "dsh-desktop-bridges";
 
 pub const BALANCE_LISTEN_ENV: &str = "DSH_DESKTOP_BALANCE_LISTEN";
 pub const BALANCE_TOKEN_ENV: &str = "DSH_DESKTOP_BALANCE_TOKEN";
@@ -159,9 +177,7 @@ impl BalanceLaunchPlan {
 #[serde(rename_all = "camelCase")]
 struct PreflightCache {
     harness_version: String,
-    balance_module_sha256: String,
-    pet_module_sha256: Option<String>,
-    overlay_sha256: String,
+    staging_sha256: String,
 }
 
 /// Prepare the optional bridge. Failure disables balance without blocking the
@@ -183,17 +199,20 @@ fn prepare_balance_launch_inner(paths: &ApplicationPaths) -> AppResult<BalanceLa
         &paths.balance_bridge_module,
         "balanceBridgeSyntaxInvalid",
     )?;
+    stage_bridge_package(paths, BALANCE_BRIDGE_PACKAGE, "balance-bridge.mjs")?;
     let balance_only_overlay = stage_overlay(paths, false)?;
-    let pet_supported =
-        match stage_module(&paths.pet_bridge_module, PET_BRIDGE_SOURCE).and_then(|()| {
+    let pet_supported = match stage_module(&paths.pet_bridge_module, PET_BRIDGE_SOURCE)
+        .and_then(|()| {
             syntax_check_module(paths, &paths.pet_bridge_module, "petBridgeSyntaxInvalid")
-        }) {
-            Ok(()) => true,
-            Err(error) => {
-                log::warn!("pet bridge staging failed; continuing with balance only: {error}");
-                false
-            }
-        };
+        })
+        .and_then(|()| stage_bridge_package(paths, PET_BRIDGE_PACKAGE, "pet-bridge.mjs"))
+    {
+        Ok(()) => true,
+        Err(error) => {
+            log::warn!("pet bridge staging failed; continuing with balance only: {error}");
+            false
+        }
+    };
     let mut overlay = if pet_supported {
         match stage_overlay(paths, true) {
             Ok(overlay) => overlay,
@@ -207,8 +226,9 @@ fn prepare_balance_launch_inner(paths: &ApplicationPaths) -> AppResult<BalanceLa
     } else {
         balance_only_overlay.clone()
     };
-    if !overlay_preflight(paths, &overlay)? {
-        if overlay != balance_only_overlay && overlay_preflight(paths, &balance_only_overlay)? {
+    let include_pet = overlay != balance_only_overlay;
+    if !overlay_preflight(paths, &overlay, include_pet)? {
+        if include_pet && overlay_preflight(paths, &balance_only_overlay, false)? {
             overlay = balance_only_overlay.clone();
         } else {
             return Ok(BalanceLaunchPlan::disabled(
@@ -254,72 +274,164 @@ fn prepare_balance_launch_inner(paths: &ApplicationPaths) -> AppResult<BalanceLa
 }
 
 fn stage_module(path: &Path, source: &str) -> AppResult<()> {
+    stage_bytes(path, source.as_bytes())
+}
+
+/// Write bytes only when they differ, so an unchanged launch keeps file
+/// timestamps and the preflight cache valid.
+fn stage_bytes(path: &Path, bytes: &[u8]) -> AppResult<()> {
     let current = fs::read(path).unwrap_or_default();
-    if current != source.as_bytes() {
-        atomic_write(path, source.as_bytes())?;
+    if current != bytes {
+        atomic_write(path, bytes)?;
     }
     Ok(())
 }
 
-fn syntax_check_module(
-    paths: &ApplicationPaths,
-    module: &Path,
-    code: &'static str,
-) -> AppResult<()> {
-    let mut command = new_command(&paths.node_bin);
-    command.arg("--check").arg(module);
-    run_quiet(&mut command, SYNTAX_CHECK_TIMEOUT)
-        .map_err(|error| AppError::new(code).detail(error.to_string()))
+/// One `@dsh-desktop/<bridge>` package directory inside the staged module root.
+fn bridge_package_dir(paths: &ApplicationPaths, package: &str) -> PathBuf {
+    paths
+        .balance_bridge_modules_dir
+        .join(BRIDGE_PACKAGE_SCOPE)
+        .join(package)
 }
 
-fn stage_overlay(paths: &ApplicationPaths, include_pet: bool) -> AppResult<std::path::PathBuf> {
-    let balance_url = url::Url::from_file_path(&paths.balance_bridge_module)
-        .map_err(|_| AppError::new("invalidPath"))?;
-    let mut overlay = format!(
+fn bridge_package_manifest(paths: &ApplicationPaths, package: &str) -> PathBuf {
+    bridge_package_dir(paths, package).join("package.json")
+}
+
+fn bridge_package_index(paths: &ApplicationPaths, package: &str) -> PathBuf {
+    bridge_package_dir(paths, package).join("index.mjs")
+}
+
+/// Stage one bridge module as a resolvable package. The package only re-exports
+/// the module staged beside it; `package.json` gives the Harness plugin
+/// inventory the non-empty name and version it requires, and the specifier it
+/// reports for an active plugin.
+fn stage_bridge_package(
+    paths: &ApplicationPaths,
+    package: &str,
+    module_file: &str,
+) -> AppResult<()> {
+    let manifest = serde_json::json!({
+        "name": format!("{BRIDGE_PACKAGE_SCOPE}/{package}"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "private": true,
+        "type": "module",
+        "exports": { ".": "./index.mjs" },
+    });
+    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    manifest_bytes.push(b'\n');
+    stage_bytes(&bridge_package_manifest(paths, package), &manifest_bytes)?;
+    let index = format!(
+        "// Generated by DSH Launcher; do not edit.\n\
+         // The bridge module is staged beside this package and mounted through the\n\
+         // package name so the Harness plugin inventory lists a bridge name rather\n\
+         // than the staged file path.\n\
+         export * from \"../../../{module_file}\";\n"
+    );
+    stage_bytes(&bridge_package_index(paths, package), index.as_bytes())?;
+    Ok(())
+}
+
+/// Stage the Cordis entry list the overlay's include row mounts. Bare bridge
+/// specifiers in it resolve from the staged `node_modules`, whose directory is
+/// the include's own base URL.
+fn stage_entry_list(paths: &ApplicationPaths, include_pet: bool) -> AppResult<PathBuf> {
+    let mut entries = vec![serde_json::json!({
+        "id": BALANCE_BRIDGE_ENTRY_ID,
+        "name": format!("{BRIDGE_PACKAGE_SCOPE}/{BALANCE_BRIDGE_PACKAGE}"),
+    })];
+    if include_pet {
+        entries.push(serde_json::json!({
+            "id": PET_BRIDGE_ENTRY_ID,
+            "name": format!("{BRIDGE_PACKAGE_SCOPE}/{PET_BRIDGE_PACKAGE}"),
+        }));
+    }
+    let mut body = serde_json::to_vec_pretty(&serde_json::Value::Array(entries))?;
+    body.push(b'\n');
+    let path = if include_pet {
+        &paths.bridges_entry_list
+    } else {
+        &paths.balance_only_entry_list
+    };
+    stage_bytes(path, &body)?;
+    Ok(path.clone())
+}
+
+fn stage_overlay(paths: &ApplicationPaths, include_pet: bool) -> AppResult<PathBuf> {
+    let entry_list = stage_entry_list(paths, include_pet)?;
+    let entry_list_url =
+        url::Url::from_file_path(&entry_list).map_err(|_| AppError::new("invalidPath"))?;
+    let overlay = format!(
         "# DSH Launcher bridge overlay. Generated on service start; do not edit.\n\
          # Injected through `dsh web --patch`; it never changes the user's Harness profile.\n\
+         # The include row is a group, so the Harness plugin inventory lists only the\n\
+         # named bridge plugins it mounts.\n\
          - insert:\n\
-         \x20   - id: dsh-desktop-balance-bridge\n\
-         \x20     name: \"{balance_url}\"\n"
+         \x20   - id: {BRIDGES_INCLUDE_ID}\n\
+         \x20     group: true\n\
+         \x20     name: \"cordis:include\"\n\
+         \x20     config:\n\
+         \x20       path: \"{entry_list_url}\"\n"
     );
-    if include_pet {
-        let pet_url = url::Url::from_file_path(&paths.pet_bridge_module)
-            .map_err(|_| AppError::new("invalidPath"))?;
-        overlay.push_str(&format!(
-            "\x20   - id: dsh-desktop-pet-bridge\n\x20     name: \"{pet_url}\"\n"
-        ));
-    }
     let path = if include_pet {
         &paths.balance_bridge_overlay
     } else {
         &paths.balance_only_overlay
     };
-    let current = fs::read(path).unwrap_or_default();
-    if current != overlay.as_bytes() {
-        atomic_write(path, overlay.as_bytes())?;
-    }
+    stage_bytes(path, overlay.as_bytes())?;
     Ok(path.clone())
 }
 
-fn overlay_preflight(paths: &ApplicationPaths, overlay: &Path) -> AppResult<bool> {
+/// Digest every staged bridge artifact that boot consumes, so a changed module,
+/// entry list, package, or overlay invalidates the cached preflight.
+fn staging_sha256(
+    paths: &ApplicationPaths,
+    overlay: &Path,
+    include_pet: bool,
+) -> AppResult<String> {
+    let mut artifacts = vec![
+        paths.balance_bridge_module.clone(),
+        bridge_package_manifest(paths, BALANCE_BRIDGE_PACKAGE),
+        bridge_package_index(paths, BALANCE_BRIDGE_PACKAGE),
+        if include_pet {
+            paths.bridges_entry_list.clone()
+        } else {
+            paths.balance_only_entry_list.clone()
+        },
+        overlay.to_path_buf(),
+    ];
+    if include_pet {
+        artifacts.push(paths.pet_bridge_module.clone());
+        artifacts.push(bridge_package_manifest(paths, PET_BRIDGE_PACKAGE));
+        artifacts.push(bridge_package_index(paths, PET_BRIDGE_PACKAGE));
+    }
+    let mut hasher = Sha256::new();
+    for artifact in artifacts {
+        hasher.update(fs::read(&artifact)?);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn overlay_preflight(
+    paths: &ApplicationPaths,
+    overlay: &Path,
+    include_pet: bool,
+) -> AppResult<bool> {
     let cache_key = PreflightCache {
         harness_version: crate::runtime::installed_version(paths).unwrap_or_default(),
-        balance_module_sha256: hex::encode(Sha256::digest(BALANCE_BRIDGE_SOURCE.as_bytes())),
-        pet_module_sha256: fs::read_to_string(overlay)
-            .ok()
-            .filter(|value| value.contains("dsh-desktop-pet-bridge"))
-            .map(|_| hex::encode(Sha256::digest(PET_BRIDGE_SOURCE.as_bytes()))),
-        overlay_sha256: hex::encode(Sha256::digest(fs::read(overlay)?)),
+        staging_sha256: staging_sha256(paths, overlay, include_pet)?,
     };
     if let Ok(bytes) = fs::read(&paths.balance_bridge_preflight)
         && serde_json::from_slice::<PreflightCache>(&bytes).is_ok_and(|cached| {
             cached.harness_version == cache_key.harness_version
-                && cached.balance_module_sha256 == cache_key.balance_module_sha256
-                && cached.pet_module_sha256 == cache_key.pet_module_sha256
-                && cached.overlay_sha256 == cache_key.overlay_sha256
+                && cached.staging_sha256 == cache_key.staging_sha256
         })
     {
         return Ok(true);
+    }
+    if !bridge_packages_resolve(paths, include_pet) {
+        return Ok(false);
     }
     let mut command = new_command(&paths.node_bin);
     command
@@ -337,6 +449,39 @@ fn overlay_preflight(paths: &ApplicationPaths, overlay: &Path) -> AppResult<bool
         serde_json::to_vec(&cache_key)?.as_slice(),
     )?;
     Ok(true)
+}
+
+/// Import each mounted bridge exactly as the Loader will: through the staged
+/// package name with the staged bridge directory as the base. A package the
+/// Harness cannot resolve would otherwise fail its boot audit, so the launcher
+/// drops the overlay instead of letting the bridge prevent the workspace from
+/// starting.
+fn bridge_packages_resolve(paths: &ApplicationPaths, include_pet: bool) -> bool {
+    let mut packages = vec![BALANCE_BRIDGE_PACKAGE];
+    if include_pet {
+        packages.push(PET_BRIDGE_PACKAGE);
+    }
+    packages.into_iter().all(|package| {
+        let specifier = format!("{BRIDGE_PACKAGE_SCOPE}/{package}");
+        let mut command = new_command(&paths.node_bin);
+        command
+            .arg("--input-type=module")
+            .arg("--eval")
+            .arg(format!("await import({specifier:?});"))
+            .current_dir(&paths.balance_bridge_dir);
+        run_quiet(&mut command, SYNTAX_CHECK_TIMEOUT).is_ok()
+    })
+}
+
+fn syntax_check_module(
+    paths: &ApplicationPaths,
+    module: &Path,
+    code: &'static str,
+) -> AppResult<()> {
+    let mut command = new_command(&paths.node_bin);
+    command.arg("--check").arg(module);
+    run_quiet(&mut command, SYNTAX_CHECK_TIMEOUT)
+        .map_err(|error| AppError::new(code).detail(error.to_string()))
 }
 
 fn run_quiet(command: &mut Command, timeout: Duration) -> AppResult<()> {
@@ -667,5 +812,63 @@ mod tests {
         assert_eq!(snapshot.detail.as_deref(), Some("balanceBridgeUnavailable"));
         assert!(snapshot.total_balance.is_none());
         assert!(snapshot.currency.is_none());
+    }
+
+    #[test]
+    fn staged_bridges_mount_as_named_packages_behind_one_hidden_include() {
+        let home = tempfile::tempdir().expect("temporary desktop home");
+        let paths = ApplicationPaths::from_home(home.path());
+        stage_module(&paths.balance_bridge_module, BALANCE_BRIDGE_SOURCE).unwrap();
+        stage_module(&paths.pet_bridge_module, PET_BRIDGE_SOURCE).unwrap();
+        stage_bridge_package(&paths, BALANCE_BRIDGE_PACKAGE, "balance-bridge.mjs").unwrap();
+        stage_bridge_package(&paths, PET_BRIDGE_PACKAGE, "pet-bridge.mjs").unwrap();
+
+        let overlay = stage_overlay(&paths, true).unwrap();
+        let overlay_text = fs::read_to_string(&overlay).unwrap();
+        // The overlay never names a staged file path: it mounts one hidden
+        // include row, and the plugin inventory lists only what the entry list
+        // mounts under a bridge package name.
+        assert!(overlay_text.contains(&format!("id: {BRIDGES_INCLUDE_ID}")));
+        assert!(overlay_text.contains("group: true"));
+        assert!(overlay_text.contains("name: \"cordis:include\""));
+        assert!(!overlay_text.contains(".mjs"));
+        assert!(overlay != paths.balance_only_overlay);
+
+        let combined: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.bridges_entry_list).unwrap()).unwrap();
+        let rows = combined.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], BALANCE_BRIDGE_ENTRY_ID);
+        assert_eq!(rows[0]["name"], "@dsh-desktop/balance-bridge");
+        assert_eq!(rows[1]["id"], PET_BRIDGE_ENTRY_ID);
+        assert_eq!(rows[1]["name"], "@dsh-desktop/pet-bridge");
+
+        // The Harness plugin inventory reads each row's title by trimming the
+        // `@scope/` prefix, so the mounted specifier must stay scoped and bare.
+        for row in rows {
+            let name = row["name"].as_str().unwrap();
+            assert!(name.starts_with(&format!("{BRIDGE_PACKAGE_SCOPE}/")));
+            assert_eq!(name.matches('/').count(), 1);
+            assert_eq!(name.split_once('/').unwrap().1, row["id"].as_str().unwrap());
+        }
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(bridge_package_manifest(&paths, BALANCE_BRIDGE_PACKAGE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["name"], "@dsh-desktop/balance-bridge");
+        assert!(manifest["version"].as_str().is_some_and(|v| !v.is_empty()));
+        let index = fs::read_to_string(bridge_package_index(&paths, BALANCE_BRIDGE_PACKAGE))
+            .expect("staged package entry point");
+        assert!(index.contains("export * from \"../../../balance-bridge.mjs\";"));
+
+        let balance_only = stage_overlay(&paths, false).unwrap();
+        let balance_only_text = fs::read_to_string(&balance_only).unwrap();
+        assert!(balance_only_text.contains("balance-only.json"));
+        let balance_only_rows: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.balance_only_entry_list).unwrap()).unwrap();
+        let balance_only_rows = balance_only_rows.as_array().unwrap();
+        assert_eq!(balance_only_rows.len(), 1);
+        assert_eq!(balance_only_rows[0]["id"], BALANCE_BRIDGE_ENTRY_ID);
     }
 }
