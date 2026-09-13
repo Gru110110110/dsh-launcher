@@ -97,7 +97,15 @@ const SKILL_SETUP_OUTPUT_CHARS: usize = 8_000;
 // Market data (serde-only, parsed from the dsh-market catalog)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MarketCatalogFile {
     #[serde(default)]
@@ -140,32 +148,32 @@ impl std::ops::Deref for LoadedCatalog {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MarketPlugin {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub owner: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub repo: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub full_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub stars: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub description: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub description_zh: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub tags: Vec<String>,
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
     pub license: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub curated: bool,
     #[serde(default)]
     pub pushed_at: Option<String>,
@@ -177,7 +185,7 @@ pub(crate) struct MarketPlugin {
     pub score: Option<MarketScore>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MarketInstallInfo {
     #[serde(default)]
@@ -188,11 +196,11 @@ pub(crate) struct MarketInstallInfo {
     /// `dsh plugin --profile web add dsh-better-sidebar@latest`). The
     /// catalog name is a display name and can differ in case from the real
     /// npm package, so these commands are the most faithful spec source.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub commands: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MarketScore {
     #[serde(default)]
     pub total: Option<f32>,
@@ -4908,11 +4916,13 @@ fn build_marketplace_publication(
     trust: CatalogTrustMeta,
     current_manifest: Option<&[u8]>,
 ) -> AppResult<Option<PreparedMarketPublication>> {
-    let parsed: MarketCatalogFile = serde_json::from_slice(catalog)
+    let mut sanitized: MarketCatalogFile = serde_json::from_slice(catalog)
         .map_err(|error| AppError::new("marketCatalogInvalid").detail(error.to_string()))?;
-    let generated_at = parsed.generated_at.clone();
-    let mut sanitized = parsed;
     sanitize_catalog(&mut sanitized)?;
+    let generated_at = sanitized.generated_at.clone();
+    let published_catalog = serde_json::to_vec(&sanitized)
+        .map_err(|error| AppError::new("marketCatalogInvalid").detail(error.to_string()))?;
+    let published_sha256 = sha256_bytes(&published_catalog);
 
     let current = current_manifest
         .map(serde_json::from_slice::<MarketPublicationManifest>)
@@ -4920,7 +4930,10 @@ fn build_marketplace_publication(
         .map_err(|error| AppError::new("marketCatalogInvalid").detail(error.to_string()))?;
     if let Some(current) = current.as_ref() {
         validate_publication_manifest(current)?;
-        if current.commit == trust.commit && current.sha256 == trust.sha256 {
+        // A Git commit is immutable. The publication bytes are a normalized,
+        // safe projection of that commit's catalog and therefore have a
+        // different digest from the upstream source bytes.
+        if current.commit == trust.commit {
             return Ok(None);
         }
     }
@@ -4941,10 +4954,10 @@ fn build_marketplace_publication(
             slot: slot.into(),
             generated_at,
             published_at,
-            sha256: trust.sha256,
-            size: catalog.len() as u64,
+            sha256: published_sha256,
+            size: published_catalog.len() as u64,
         },
-        catalog: catalog.to_vec(),
+        catalog: published_catalog,
     }))
 }
 
@@ -7631,6 +7644,47 @@ if (root / 'fail').exists(): sys.exit(7)
     }
 
     #[test]
+    fn catalog_json_treats_null_defaultable_fields_as_defaults() {
+        let json = r#"{
+          "schemaVersion": 2,
+          "plugins": [{
+            "id": "x/y", "type": "cordis-plugin", "name": "y",
+            "owner": "x", "repo": "y", "fullName": "x/y",
+            "stars": null, "description": null, "descriptionZh": null,
+            "tags": null, "curated": null,
+            "install": {"commands": null}
+          }]
+        }"#;
+
+        let mut catalog: MarketCatalogFile = serde_json::from_str(json).expect("catalog parses");
+        sanitize_catalog(&mut catalog).expect("catalog sanitizes");
+        let plugin = &catalog.plugins[0];
+        assert_eq!(plugin.stars, 0);
+        assert!(plugin.description.is_empty());
+        assert!(plugin.description_zh.is_empty());
+        assert!(plugin.tags.is_empty());
+        assert!(!plugin.curated);
+        assert!(
+            plugin
+                .install
+                .as_ref()
+                .expect("install")
+                .commands
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn catalog_json_keeps_identity_fields_strict() {
+        let json = r#"{
+          "schemaVersion": 2,
+          "plugins": [{"id": null, "type": "cordis-plugin", "name": "y"}]
+        }"#;
+
+        assert!(serde_json::from_str::<MarketCatalogFile>(json).is_err());
+    }
+
+    #[test]
     fn refresh_while_loading_reports_loading_instead_of_failing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = ApplicationPaths::from_home(temp.path().join("home"));
@@ -8881,7 +8935,11 @@ if (root / 'fail').exists(): sys.exit(7)
           "plugins": [{
             "id": "x/y", "type": "cordis-plugin", "name": "y",
             "owner": "x", "repo": "y", "fullName": "x/y",
+            "descriptionZh": null,
             "homepage": "https://www.npmjs.com/package/y"
+          }, {
+            "id": "unsafe", "type": "cordis-plugin", "name": "unsafe",
+            "owner": "x", "repo": "unsafe", "fullName": "x/unsafe"
           }]
         }"#;
         crate::paths::atomic_write(&marketplace.catalog_file(), bytes).expect("catalog");
@@ -8947,6 +9005,13 @@ if (root / 'fail').exists(): sys.exit(7)
             .expect("publication")
             .expect("changed");
         assert_eq!(first.manifest.slot, "a");
+        assert_eq!(first.manifest.size, first.catalog.len() as u64);
+        assert_eq!(first.manifest.sha256, sha256_bytes(&first.catalog));
+        assert_ne!(first.catalog, bytes);
+        let published: MarketCatalogFile =
+            serde_json::from_slice(&first.catalog).expect("published catalog");
+        assert_eq!(published.plugins.len(), 1);
+        assert!(published.plugins[0].description_zh.is_empty());
         let current = serde_json::to_vec(&first.manifest).expect("manifest");
         assert!(
             build_marketplace_publication(bytes, trust.clone(), Some(&current))
