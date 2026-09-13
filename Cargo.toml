@@ -37,6 +37,9 @@ walkdir = "2.5"
 windows-sys = { version = "0.61", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 zip = { version = "5.1", default-features = false, features = ["deflate"] }
 
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = true

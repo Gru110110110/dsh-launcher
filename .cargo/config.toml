@@ -1,0 +1,5 @@
+# Cargo 自动缓存回收（cargo >= 1.84）
+# 每次运行 cargo 时，若距离上次检查超过 auto-clean-frequency，
+# 自动删除 target/ 中超过 30 天未被使用的旧产物（含版本更新后残留的旧 .rlib）。
+[cache]
+auto-clean-frequency = "1 day"
