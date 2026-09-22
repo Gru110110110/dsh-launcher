@@ -1,6 +1,7 @@
 // Minimal DSH Launcher balance bridge running inside the existing Harness
-// process, resolves credentials through ctx.credentials, and exposes only a
-// sanitized balance result over a token-guarded loopback endpoint.
+// process, reads the DeepSeek endpoint through whichever settings API the
+// Harness exposes, resolves credentials through ctx.credentials, and exposes
+// only a sanitized balance result over a token-guarded loopback endpoint.
 
 import crypto from "node:crypto";
 import http from "node:http";
@@ -9,6 +10,14 @@ import https from "node:https";
 export const name = "dsh-desktop-balance-bridge";
 
 const BALANCE_URL = "https://api.deepseek.com/user/balance";
+const OFFICIAL_BASE_URL = "https://api.deepseek.com";
+/** Harness settings namespace (profile entry id) holding the DeepSeek provider config. */
+const DEEPSEEK_SETTINGS_NS = "llm-deepseek";
+/** Trusted environment-layer variable naming the DeepSeek endpoint. */
+const BASE_URL_ENV = "DEEPSEEK_BASE_URL";
+/** Credential reference the Harness resolves when the settings select no other. */
+const DEFAULT_API_KEY_REF = "DEEPSEEK_API_KEY";
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const BALANCE_TIMEOUT_MS = 10_000;
 const BALANCE_MAX_BODY = 64 * 1024;
 // Keep the bridge cache below the desktop's five-minute polling interval so
@@ -33,30 +42,105 @@ function assertBalanceUrl(url) {
   return parsed;
 }
 
-function configuredDeepSeekBaseUrl(ctx) {
+/**
+ * Read the `llm-deepseek` settings section through whichever settings API the
+ * running Harness exposes.
+ *
+ * Harness <= 0.1.6 resolved one namespace through `settings.get(ns)`. Harness
+ * 0.1.7 replaced that service with profile-patch forms read through
+ * `settings.describe()`, whose rows are keyed by the profile entry id; the old
+ * call throws there, so both shapes must be handled here.
+ *
+ * @param ctx - the bridge plugin context.
+ * @returns the configured section; `undefined` when nothing overrides the
+ * endpoint; `null` when a settings service is mounted but exposes no known read
+ * API, so the effective endpoint cannot be proven.
+ */
+function readDeepSeekSettings(ctx) {
+  let settings;
   try {
-    const configured = typeof ctx?.get === "function"
-      ? ctx.get("settings")?.get("llm-deepseek")?.baseURL
-      : undefined;
-    if (typeof configured === "string" && configured.length > 0) return configured;
+    settings = typeof ctx?.get === "function" ? ctx.get("settings") : undefined;
   } catch {
     return null;
   }
+  if (settings === undefined || settings === null) return undefined;
+  if (typeof settings.get === "function") {
+    const section = settings.get(DEEPSEEK_SETTINGS_NS);
+    return section === undefined || section === null ? undefined : section;
+  }
+  if (typeof settings.describe === "function") {
+    const rows = settings.describe();
+    const row = Array.isArray(rows)
+      ? rows.find((candidate) => candidate?.ns === DEEPSEEK_SETTINGS_NS)
+      : undefined;
+    return row?.value ?? row?.base ?? undefined;
+  }
+  return null;
+}
+
+/** The endpoint override carried by one settings section, if it has a usable one. */
+function sectionBaseUrl(section) {
+  if (section === undefined) return undefined;
+  if (section === null) return null;
+  const configured = section.baseURL;
+  if (typeof configured === "string") return configured.length > 0 ? configured : undefined;
+  if (configured === undefined || configured === null) return undefined;
+  // An override this bridge cannot read as a URL is not an official endpoint.
+  return null;
+}
+
+/** The credential reference one settings section selects, or the public default. */
+function sectionApiKeyEnv(section) {
+  const configured = section === undefined || section === null ? undefined : section.apiKeyEnv;
+  return typeof configured === "string" && ENV_NAME_RE.test(configured)
+    ? configured
+    : DEFAULT_API_KEY_REF;
+}
+
+/** The trusted environment-layer endpoint, then the public default. */
+function environmentBaseUrl(ctx) {
   try {
     const env = typeof ctx?.get === "function" ? ctx.get("launchEnvironment") : undefined;
     const configured = env && typeof env.get === "function"
-      ? env.get("DEEPSEEK_BASE_URL")?.value
-      : process.env.DEEPSEEK_BASE_URL;
+      ? env.get(BASE_URL_ENV)?.value
+      : process.env[BASE_URL_ENV];
     if (typeof configured === "string" && configured.length > 0) return configured;
   } catch {
     return null;
   }
-  return "https://api.deepseek.com";
+  return OFFICIAL_BASE_URL;
 }
 
-function isOfficialDeepSeekEndpoint(ctx) {
+/** Resolve the endpoint from one already-read settings section. */
+function baseUrlOfSection(ctx, section) {
+  const configured = sectionBaseUrl(section);
+  return configured !== undefined ? configured : environmentBaseUrl(ctx);
+}
+
+/**
+ * The endpoint the Harness would use for DeepSeek.
+ *
+ * An unknown settings API returns `null` instead of guessing: the balance query
+ * must never send a possibly custom-gateway credential to the public API.
+ *
+ * @param ctx - the bridge plugin context.
+ * @returns the configured base URL, the trusted environment override, or the
+ * public default; `null` when the endpoint cannot be proven official.
+ */
+function configuredDeepSeekBaseUrl(ctx) {
+  let section;
   try {
-    const url = new URL(configuredDeepSeekBaseUrl(ctx));
+    section = readDeepSeekSettings(ctx);
+  } catch {
+    return null;
+  }
+  return baseUrlOfSection(ctx, section);
+}
+
+/** Whether one base URL is the official DeepSeek origin. */
+function isOfficialDeepSeekUrl(value) {
+  try {
+    const url = new URL(value);
     return url.protocol === "https:"
       && url.hostname === "api.deepseek.com"
       && (url.port === "" || url.port === "443")
@@ -65,6 +149,11 @@ function isOfficialDeepSeekEndpoint(ctx) {
   } catch {
     return false;
   }
+}
+
+/** Whether the endpoint the Harness resolves for DeepSeek is the official one. */
+function isOfficialDeepSeekEndpoint(ctx) {
+  return isOfficialDeepSeekUrl(configuredDeepSeekBaseUrl(ctx));
 }
 
 function checkBalanceStatus(statusCode) {
@@ -254,21 +343,29 @@ function parseListenAddr(raw) {
     : null;
 }
 
-const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-async function resolveApiKey(ctx) {
-  if (!isOfficialDeepSeekEndpoint(ctx)) {
+async function resolveApiKey(ctx, log = () => {}) {
+  let section;
+  try {
+    section = readDeepSeekSettings(ctx);
+  } catch {
+    section = null;
+  }
+  const baseURL = baseUrlOfSection(ctx, section);
+  if (baseURL === null) {
+    // A mounted settings service exposed no read API this bridge understands,
+    // so the endpoint cannot be proven official. Report that truthfully and
+    // refuse, rather than querying the public API with a foreign credential.
+    log("warn", "balance-bridge: the Harness settings API could not be read; balance unavailable");
+    const error = new Error("the DeepSeek endpoint could not be determined");
+    error.code = "balanceUnavailable";
+    throw error;
+  }
+  if (!isOfficialDeepSeekUrl(baseURL)) {
     const error = new Error("balance unavailable for a non-official endpoint");
     error.code = "balanceNonOfficialEndpoint";
     throw error;
   }
-  let ref = "DEEPSEEK_API_KEY";
-  try {
-    const configured = typeof ctx.get === "function"
-      ? ctx.get("settings")?.get("llm-deepseek")?.apiKeyEnv
-      : undefined;
-    if (typeof configured === "string" && ENV_NAME_RE.test(configured)) ref = configured;
-  } catch { /* default ref */ }
+  const ref = sectionApiKeyEnv(section);
   try {
     const credentials = typeof ctx.get === "function" ? ctx.get("credentials") : undefined;
     if (credentials && typeof credentials.resolve === "function") {
@@ -303,7 +400,7 @@ export async function apply(ctx) {
       return;
     }
     const manager = createBalanceManager({
-      resolveKey: () => resolveApiKey(ctx),
+      resolveKey: () => resolveApiKey(ctx, log),
       transport: defaultBalanceTransport,
     });
     const server = createBalanceServer({
@@ -343,7 +440,10 @@ export const __testing = {
   defaultBalanceTransport,
   fetchBalanceWithTransport,
   isOfficialDeepSeekEndpoint,
+  isOfficialDeepSeekUrl,
   parseListenAddr,
+  readDeepSeekSettings,
+  resolveApiKey,
   sanitizeDetail,
   validateBalancePayload,
 };

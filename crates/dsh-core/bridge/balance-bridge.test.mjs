@@ -14,6 +14,7 @@ const {
   fetchBalanceWithTransport,
   isOfficialDeepSeekEndpoint,
   parseListenAddr,
+  resolveApiKey,
   sanitizeDetail,
   validateBalancePayload,
 } = __testing;
@@ -162,16 +163,96 @@ describe("balance cache", () => {
 });
 
 describe("endpoint configuration", () => {
-  it("recognizes only the official DeepSeek endpoint", () => {
-    const context = (baseURL) => ({
-      get(key) {
-        if (key === "settings") return { get: () => ({ baseURL }) };
-        return undefined;
-      },
-    });
+  // Harness <= 0.1.6 resolved a settings namespace through `settings.get(ns)`.
+  const legacySettings = (baseURL, apiKeyEnv) => ({
+    get: () => ({ baseURL, ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }) }),
+  });
+  // Harness 0.1.7 replaced that service with profile-patch forms keyed by entry id.
+  const formsSettings = (value) => ({
+    describe: () => [
+      { ns: "some-other-plugin", value: { baseURL: "https://relay.example" } },
+      { ns: "llm-deepseek", value },
+    ],
+  });
+  const contextFor = (settings) => ({
+    get(key) {
+      if (key === "settings") return settings;
+      return undefined;
+    },
+  });
+
+  it("recognizes only the official DeepSeek endpoint through the legacy settings API", () => {
+    const context = (baseURL) => contextFor(legacySettings(baseURL));
     expect(configuredDeepSeekBaseUrl(context("https://api.deepseek.com"))).toBe("https://api.deepseek.com");
     expect(isOfficialDeepSeekEndpoint(context("https://api.deepseek.com"))).toBe(true);
     expect(isOfficialDeepSeekEndpoint(context("https://gateway.example"))).toBe(false);
+  });
+
+  it("reads the profile-patch form API shipped with Harness 0.1.7", () => {
+    const official = contextFor(formsSettings({
+      apiKeyEnv: "DEEPSEEK_API_KEY",
+      baseURL: "https://api.deepseek.com",
+    }));
+    expect(configuredDeepSeekBaseUrl(official)).toBe("https://api.deepseek.com");
+    expect(isOfficialDeepSeekEndpoint(official)).toBe(true);
+
+    const custom = contextFor(formsSettings({ baseURL: "https://relay.example/v1" }));
+    expect(configuredDeepSeekBaseUrl(custom)).toBe("https://relay.example/v1");
+    expect(isOfficialDeepSeekEndpoint(custom)).toBe(false);
+  });
+
+  it("falls back to the public default whenever no endpoint is configured", () => {
+    for (const context of [
+      contextFor(legacySettings(undefined)),
+      contextFor(formsSettings({})),
+      { get: () => undefined },
+    ]) {
+      expect(configuredDeepSeekBaseUrl(context)).toBe("https://api.deepseek.com");
+      expect(isOfficialDeepSeekEndpoint(context)).toBe(true);
+    }
+  });
+
+  it("reports an unreadable settings API as unavailable, never as a custom endpoint", async () => {
+    // Harness 0.1.7 renamed the settings read API; a future rename or a broken
+    // provider must not surface as "you configured a custom API address".
+    const unknownApi = contextFor({});
+    expect(configuredDeepSeekBaseUrl(unknownApi)).toBeNull();
+    await expect(resolveApiKey(unknownApi)).rejects.toMatchObject({ code: "balanceUnavailable" });
+
+    const throwing = contextFor({ describe: () => { throw new Error("settings offline"); } });
+    expect(configuredDeepSeekBaseUrl(throwing)).toBeNull();
+    await expect(resolveApiKey(throwing)).rejects.toMatchObject({ code: "balanceUnavailable" });
+  });
+
+  it("refuses a custom endpoint before resolving any credential", async () => {
+    const resolve = vi.fn();
+    const context = {
+      get(key) {
+        if (key === "settings") return formsSettings({ baseURL: "https://relay.example" });
+        if (key === "credentials") return { resolve };
+        return undefined;
+      },
+    };
+    await expect(resolveApiKey(context)).rejects.toMatchObject({ code: "balanceNonOfficialEndpoint" });
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("resolves the credential reference the settings select on both APIs", async () => {
+    const resolve = vi.fn(async () => ({ value: "fake-key" }));
+    const context = (settings) => ({
+      get(key) {
+        if (key === "settings") return settings;
+        if (key === "credentials") return { resolve };
+        return undefined;
+      },
+    });
+    await expect(resolveApiKey(context(legacySettings("https://api.deepseek.com", "LEGACY_KEY"))))
+      .resolves.toBe("fake-key");
+    await expect(resolveApiKey(context(formsSettings({
+      baseURL: "https://api.deepseek.com",
+      apiKeyEnv: "FORMS_KEY",
+    })))).resolves.toBe("fake-key");
+    expect(resolve.mock.calls.map(([ref]) => ref)).toEqual(["LEGACY_KEY", "FORMS_KEY"]);
   });
 
   it("parses only exact IPv4 loopback addresses", () => {
