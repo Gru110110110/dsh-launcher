@@ -1,6 +1,14 @@
 // DSH Launcher desktop-pet bridge. It runs inside the Harness host, reduces
-// session events to a bounded five-state snapshot, and exposes only sanitized
-// state over a token-protected loopback endpoint.
+// durable session events plus live assistant-stream frames to a bounded
+// five-state snapshot, and exposes only sanitized state over a token-protected
+// loopback endpoint.
+//
+// Harness <= 0.1.2 appended every live model chunk as an `assistant/chunk`
+// session event (`{ turn, step, chunk }`). Harness >= 0.1.3 removed that event
+// from the session vocabulary and publishes the same chunks only as
+// agent-scoped `agent/assistant-stream` frames (`{ agent, frame }`, where a
+// frame is `start` | `chunk` | `end`). Reading both keeps the reasoning-driven
+// thinking state working across the supported version range.
 
 import crypto from "node:crypto";
 import http from "node:http";
@@ -151,11 +159,7 @@ export class PetReducer {
         break;
       case "assistant/chunk":
         if (!record.turnActive || record.openTools.size > 0) return undefined;
-        if (isReasoningChunk(event.data?.chunk)) {
-          this.#update(record, PetState.THINKING, "thinking");
-        } else {
-          this.#update(record, PetState.WORKING, "model-output");
-        }
+        this.#applyChunk(record, event.data?.chunk);
         break;
       case "assistant/message":
         if (!record.turnActive || record.openTools.size > 0) return undefined;
@@ -230,6 +234,33 @@ export class PetReducer {
     return this.#render();
   }
 
+  /**
+   * Reduce one live `agent/assistant-stream` frame. Harness >= 0.1.3 publishes
+   * model chunks only through this agent-scoped notification, so the
+   * reasoning-driven thinking state depends on reading it; the frame carries
+   * its own agent, whose session identifies the pet record.
+   *
+   * @param agent - the agent whose attempt emitted the frame.
+   * @param frame - `{ type: "start" | "chunk" | "end", ... }`; only `chunk`
+   *   frames carry model output.
+   * @returns the next snapshot, or undefined when nothing observable changed.
+   */
+  handleAssistantStream(agent, frame) {
+    const session = agent?.session;
+    if (!session || isSubagent(session)) return undefined;
+    if (frame?.type !== "chunk") return undefined;
+    const chunk = frame.chunk;
+    if (!chunk || typeof chunk.type !== "string") return undefined;
+    const record = this.#record(sessionIdOf(session));
+    record.project = projectNameOf(session, undefined) ?? record.project;
+    // A live frame is proof that a turn is streaming, so a bridge that attached
+    // mid-turn still reduces its chunks.
+    record.turnActive = true;
+    if (record.openTools.size > 0) return undefined;
+    this.#applyChunk(record, chunk);
+    return this.#render();
+  }
+
   #record(id) {
     let record = this.sessions.get(id);
     if (record) return record;
@@ -256,6 +287,15 @@ export class PetReducer {
       this.#update(record, PetState.WORKING, phase, toolActivity(toolName), toolName);
     } else {
       this.#update(record, PetState.WORKING, phase);
+    }
+  }
+
+  /** Fold one model stream chunk into the record's live state. */
+  #applyChunk(record, chunk) {
+    if (isReasoningChunk(chunk)) {
+      this.#update(record, PetState.THINKING, "thinking");
+    } else {
+      this.#update(record, PetState.WORKING, "model-output");
     }
   }
 
@@ -432,6 +472,18 @@ export async function apply(ctx) {
         log("error", `pet-bridge: session event failed: ${boundedText(error?.message, 120) ?? "unknown"}`);
       }
     }, { global: true });
+    // Harness >= 0.1.3 removed the `assistant/chunk` session event; live model
+    // chunks arrive only here. Older Harnesses never emit this name, so the
+    // subscription is inert there and the session-event path above carries the
+    // reasoning signal.
+    const offStream = ctx.on?.("agent/assistant-stream", ({ agent, frame } = {}) => {
+      try {
+        const next = reducer.handleAssistantStream(agent, frame);
+        if (next) bridge.publish(next);
+      } catch (error) {
+        log("error", `pet-bridge: assistant stream failed: ${boundedText(error?.message, 120) ?? "unknown"}`);
+      }
+    }, { global: true });
     const offDisposed = ctx.on?.("session/disposed", (session) => {
       try {
         const next = reducer.disposeSession(session);
@@ -442,6 +494,7 @@ export async function apply(ctx) {
     }, { global: true });
     ctx.effect?.(() => () => {
       offEvent?.();
+      offStream?.();
       offDisposed?.();
       try { bridge.server.close(); } catch { /* best effort */ }
     });

@@ -43,12 +43,12 @@
 
 桌面宠物是 DSH Launcher 的一等功能，不是需要用户安装的 Harness 插件。功能按六层完整落地：
 
-- **M0 — 状态契约：**单一 reducer 把顶层 Harness 会话事件归并为且仅归并为五种公开状态（`waiting`、`error`、`working`、`thinking`、`idle`）。询问用户或请求审批进入等待，只有 reasoning 流片段进入思考，其余活跃阶段（包括模型正文输出、工具调用生成、命令执行和查找）均进入工作，失败进入错误，正常完成或中止进入空闲。多个会话并行时优先级为等待 → 错误 → 工作 → 思考 → 空闲；子 Agent 不会覆盖顶层状态。
-- **M1 — Harness bridge：**自包含的 `pet-bridge.mjs` 与既有余额桥一起暂存，并通过自动生成的 `dsh web --patch` overlay 注入。overlay 只插入一行隐藏的 group include，其入口列表把两个桥分别挂载为暂存的 `@dsh-desktop/<bridge>` 包，因此 Harness 插件列表显示为 `balance-bridge` 与 `pet-bridge`，而不是暂存模块路径；裸包名从暂存的 `node_modules` 解析，两个 overlay 变体各自只列出本次启动真正启用的桥。桥只通过随机令牌保护的回环 SSE 端点发布长度受限、经过净化的活动元数据；令牌只留在子进程环境中，不进入 URL 或前端 payload。
+- **M0 — 状态契约：**单一 reducer 把顶层 Harness 会话事件归并为且仅归并为五种公开状态（`waiting`、`error`、`working`、`thinking`、`idle`）。询问用户或请求审批进入等待，只有 reasoning 流片段（无论来自旧版 `assistant/chunk` 会话事件还是当前的实时 assistant 流）进入思考，其余活跃阶段（包括模型正文输出、工具调用生成、命令执行和查找）均进入工作，失败进入错误，正常完成或中止进入空闲。多个会话并行时优先级为等待 → 错误 → 工作 → 思考 → 空闲；子 Agent 不会覆盖顶层状态。
+- **M1 — Harness bridge：**自包含的 `pet-bridge.mjs` 与既有余额桥一起暂存，并通过自动生成的 `dsh web --patch` overlay 注入。overlay 只插入一行隐藏的 group include，其入口列表把两个桥分别挂载为暂存的 `@dsh-desktop/<bridge>` 包，因此 Harness 插件列表显示为 `balance-bridge` 与 `pet-bridge`，而不是暂存模块路径；裸包名从暂存的 `node_modules` 解析，两个 overlay 变体各自只列出本次启动真正启用的桥。桥归并两路 Harness 信号：承载轮次、步骤、消息、工具、审批和待办生命周期的持久化 `session/event` 事件，以及承载模型输出的实时 `agent/assistant-stream` 帧。Harness 0.1.2 及更早版本把每个实时模型片段追加为 `assistant/chunk` 会话事件；0.1.3 移除了该事件，只把同样的片段作为 Agent 作用域的 `agent/assistant-stream` 帧（`{ agent, frame }`）发布，因此 reasoning 的读取同时覆盖两路来源，思考状态在两种 Harness 世代下都可用。桥只通过随机令牌保护的回环 SSE 端点发布长度受限、经过净化的活动元数据；令牌只留在子进程环境中，不进入 URL 或前端 payload。
 - **M2 — 桌面服务：**`dsh-core::pet` 严格解析带版本的 snapshot，拒绝未知字段、超限文本和非法进度，通过有上限的退避自动重连，并用类型化 Tauri 命令和 `pet://state` 发布 connected/stale/unavailable 连接健康度。如果组合 overlay 启动失败，会先用仅余额桥的 overlay 重试一次，再降级到不打补丁的 Harness，确保可选宠物永远不会阻断工作台启动。
 - **M3 — 宠物窗口：**Tauri 创建独立的透明、无边框、始终置顶窗口。React 渲染器按需加载 Lottie，并使用单槽最新状态队列：实时动画至少完整播放一轮，相同或已经过时的待播状态会合并，只在轮次边界切换，没有新状态时原动画无重载循环；减弱动态和手动预览仍即时更新。动画、气泡、CSS 状态和无障碍文案始终同步。用户可拖动整个窗口，物理屏幕坐标会持久化，恢复时会限制在当前可用显示器范围内，Harness 未就绪时窗口自动隐藏。鼠标穿透作用于整个窗口，并始终可在主应用的「桌面宠物」页关闭。
 - **M4 — 产品控制：**功能注册表拥有侧边栏入口与路由。页面可以选择目录中的宠物、独立预览五态而不改写实时状态、控制显隐/气泡/尺寸/减弱动态/鼠标穿透，并显示 bridge 健康度。偏好原子保存到 `preferences.json`；旧版配置加载后默认关闭宠物。托盘菜单同步提供显隐操作。
-- **M5 — 目录与验证：**内置资源统一位于仓库根目录 `pets/`。`pets/config.json` 声明 `count`，并为每个实体提供中英双语昵称、物种名、多个标签、简介、可选的逐状态气泡文字、资源文件夹及五个动画文件。缺少气泡配置时回退到 Launcher 的双语默认文案。目录、reducer、事件序号重置、严格 payload、偏好、IPC 生成、lint、构建和 Rust 测试共同覆盖该功能。
+- **M5 — 目录与验证：**内置资源统一位于仓库根目录 `pets/`。`pets/config.json` 声明 `count`，并为每个实体提供中英双语昵称、物种名、多个标签、简介、可选的逐状态气泡文字、资源文件夹及五个动画文件。缺少气泡配置时回退到 Launcher 的双语默认文案。目录、reducer、事件序号重置、跨版本片段来源、严格 payload、偏好、IPC 生成、lint、构建和 Rust 测试共同覆盖该功能。
 
 目录包含 Gru 提供的土拨鼠「麻薯」（`marmot`，仍为默认宠物）、橘猫「橘子」（`orange-cat`）和章鱼「泡泡」（`octopus`）。运行时打包仅纳入每只宠物的五个 Lottie JSON 及其引用的 PNG 分层，不包含生成器、QA 结果或预览工具。橘子原样使用提供的 v4 五态资源包，保留资源说明中已知的等待动画尾巴接缝，气泡使用双语默认文案。泡泡使用提供的 `octopus-pet-v1/release-v3/octopus-pet` 五态资源包，将内嵌 PNG 按原始字节拆出至各状态图片目录，并调整 JSON 图片引用以适配现有加载器；图层、预合成和时间轴保持不变，气泡使用双语默认文案。目录测试逐一解析每只宠物各状态的图片资源，检查缺失分层。这些视觉素材不适用仓库的 MIT 许可，只能依据 `pets/ASSET-LICENSE.md` 用于及再分发于非商业用途；商业使用必须事先取得 Gru 的书面许可。
 

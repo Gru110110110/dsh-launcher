@@ -1,13 +1,24 @@
-import { expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, test } from "vitest";
+import net from "node:net";
 
 import {
   PetReducer,
   PetState,
+  apply,
   createPetServer,
   __testing,
 } from "./pet-bridge.mjs";
 
 const session = { header: { id: "top" }, cwd: "/tmp/demo" };
+const agentFor = (header, cwd) => ({ session: { header, cwd } });
+const chunkFrame = (chunk) => ({
+  type: "chunk",
+  attemptId: "attempt",
+  revision: 1,
+  index: 0,
+  time: 1,
+  chunk,
+});
 
 test("reduces the five public states", () => {
   const reducer = new PetReducer();
@@ -95,6 +106,69 @@ test("shows thinking only for reasoning stream chunks", () => {
       block: { type: "reasoning", text: "done" },
     }),
   ).toBe(PetState.WORKING);
+});
+
+test("shows thinking for live assistant-stream frames", () => {
+  const reducer = new PetReducer();
+  const agent = agentFor({ id: "top" }, "/tmp/demo");
+
+  expect(
+    reducer.handleAssistantStream(agent, { type: "start", turn: 1, step: 1 }),
+  ).toBeUndefined();
+  expect(
+    reducer.handleAssistantStream(
+      agent,
+      chunkFrame({ type: "block-start", index: 0, blockType: "reasoning" }),
+    ),
+  ).toMatchObject({ state: PetState.THINKING, phase: "thinking" });
+  expect(
+    reducer.handleAssistantStream(
+      agent,
+      chunkFrame({ type: "text-delta", index: 1, text: "answering" }),
+    ),
+  ).toMatchObject({ state: PetState.WORKING, phase: "model-output" });
+  expect(
+    reducer.handleAssistantStream(
+      agent,
+      chunkFrame({ type: "reasoning-delta", index: 2, text: "reconsidering" }),
+    ),
+  ).toMatchObject({ state: PetState.THINKING });
+  expect(
+    reducer.handleAssistantStream(agent, {
+      type: "end",
+      attemptId: "attempt",
+      revision: 4,
+      index: 3,
+      outcome: { kind: "committed", eventType: "assistant/message", seq: 9 },
+    }),
+  ).toBeUndefined();
+});
+
+test("live frames ignore subagents and open tools but still reduce a mid-turn session", () => {
+  const reason = chunkFrame({ type: "reasoning-delta", index: 0, text: "hmm" });
+
+  expect(
+    new PetReducer().handleAssistantStream(
+      agentFor({ id: "child", origin: "subagent" }, "/tmp/demo"),
+      reason,
+    ),
+  ).toBeUndefined();
+
+  const busy = new PetReducer();
+  busy.handle(session, { type: "turn/start" });
+  busy.handle(session, {
+    type: "tool/call",
+    data: { name: "shell", callId: "a" },
+  });
+  expect(
+    busy.handleAssistantStream(agentFor({ id: "top" }, "/tmp/demo"), reason),
+  ).toBeUndefined();
+
+  // A session first seen through its own stream still reports reasoning.
+  const joined = new PetReducer();
+  expect(
+    joined.handleAssistantStream(agentFor({ id: "late", cwd: "/tmp/late" }), reason),
+  ).toMatchObject({ state: PetState.THINKING, project: "late" });
 });
 
 test("keeps non-reasoning active phases working", () => {
@@ -231,4 +305,74 @@ test("loopback server hides its token and streams versioned snapshots", async ()
     controller.abort();
     await new Promise((resolve) => bridge.server.close(resolve));
   }
+});
+
+describe("bridge activation", () => {
+  const envKeys = ["DSH_DESKTOP_PET_LISTEN", "DSH_DESKTOP_PET_TOKEN"];
+  const old = {};
+
+  beforeEach(() => {
+    for (const key of envKeys) {
+      old[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+  afterEach(() => {
+    for (const key of envKeys) {
+      if (old[key] === undefined) delete process.env[key];
+      else process.env[key] = old[key];
+    }
+  });
+
+  it("activates cleanly without bridge environment", async () => {
+    await expect(apply({ logger: {} })).resolves.toBeUndefined();
+  });
+
+  it("publishes the thinking state from a live assistant-stream frame", async () => {
+    const probe = net.createServer();
+    await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const { port } = probe.address();
+    await new Promise((resolve) => probe.close(resolve));
+
+    const token = "7".repeat(64);
+    process.env.DSH_DESKTOP_PET_LISTEN = `127.0.0.1:${String(port)}`;
+    process.env.DSH_DESKTOP_PET_TOKEN = token;
+
+    const listeners = new Map();
+    let dispose;
+    const ctx = {
+      on(event, handler) {
+        listeners.set(event, handler);
+        return () => listeners.delete(event);
+      },
+      effect(factory) {
+        dispose = factory();
+      },
+      logger: {},
+    };
+    await apply(ctx);
+    expect(typeof dispose).toBe("function");
+    expect(listeners.has("agent/assistant-stream")).toBe(true);
+
+    const agent = agentFor({ id: "top" }, "/tmp/demo");
+    listeners.get("session/event")(agent.session, { type: "turn/start" });
+    listeners.get("agent/assistant-stream")({
+      agent,
+      frame: chunkFrame({ type: "reasoning-delta", index: 0, text: "hmm" }),
+    });
+
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${String(port)}/pet/state`,
+        { headers: { "x-dsh-pet-token": token } },
+      );
+      expect(await response.json()).toMatchObject({
+        state: PetState.THINKING,
+        phase: "thinking",
+        project: "demo",
+      });
+    } finally {
+      dispose();
+    }
+  });
 });
