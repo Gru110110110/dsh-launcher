@@ -285,6 +285,7 @@
   "error.writeFailed": "无法保存应用数据：{{detail}}",
   "error.invalidData": "已保存的应用数据无效：{{detail}}",
   "error.io": "本地文件操作失败：{{detail}}",
+  "error.ioPath": "无法访问 {{path}}：{{detail}}",
   "error.configurationChanged": "导入期间配置已变化，现有内容已保留",
   "error.migrationNotAvailable": "当前没有待处理的数据迁移",
   "error.migrationBusy": "另一个启动器实例正在迁移本地数据",

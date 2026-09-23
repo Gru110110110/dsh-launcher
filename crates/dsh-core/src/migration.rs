@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use fs2::FileExt;
+use fs2::{FileExt, lock_contended_error};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -357,9 +357,15 @@ impl MigrationService {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(&self.paths.migration_lock)?;
-        file.try_lock_exclusive()
-            .map_err(|_| AppError::new("migrationBusy"))?;
+            .open(&self.paths.migration_lock)
+            .map_err(|error| AppError::io_path(&self.paths.migration_lock, &error))?;
+        file.try_lock_exclusive().map_err(|error| {
+            if error.raw_os_error() == lock_contended_error().raw_os_error() {
+                AppError::new("migrationBusy")
+            } else {
+                AppError::io_path(&self.paths.migration_lock, &error)
+            }
+        })?;
         Ok(file)
     }
 
@@ -403,7 +409,7 @@ fn read_journal(path: &Path) -> AppResult<Option<Journal>> {
             .map(Some)
             .map_err(|error| AppError::new("migrationJournalInvalid").detail(error.to_string())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(AppError::io_path(path, &error)),
     }
 }
 
@@ -757,6 +763,28 @@ fn sync_tree(path: &Path) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inaccessible_migration_lock_identifies_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        fs::create_dir(&paths.migration_lock).unwrap();
+        let service = MigrationService::isolated(
+            paths.clone(),
+            temp.path().join("source"),
+            temp.path().join("cc-switch"),
+        );
+
+        let error = service.recover().unwrap_err();
+
+        assert_eq!(error.code, "ioPath");
+        assert_eq!(
+            error.values.get("path"),
+            Some(&paths.migration_lock.display().to_string())
+        );
+        assert!(paths.migration_lock.is_dir());
+    }
 
     #[test]
     fn migration_requires_approval_and_keeps_verified_backup() {

@@ -25,8 +25,12 @@ impl BoundedLog {
             .create(true)
             .append(true)
             .read(true)
-            .open(path)?;
-        let length = file.metadata()?.len();
+            .open(path)
+            .map_err(|error| AppError::io_path(path, &error))?;
+        let length = file
+            .metadata()
+            .map_err(|error| AppError::io_path(path, &error))?
+            .len();
         Ok(Self {
             file,
             length,
@@ -66,7 +70,7 @@ pub(crate) fn trim_log_tail(path: &Path, limit: u64) -> AppResult<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(AppError::io_path(path, &error)),
     };
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(AppError::new("logPathUnsafe").value("path", path.display()));
@@ -76,10 +80,12 @@ pub(crate) fn trim_log_tail(path: &Path, limit: u64) -> AppResult<()> {
     }
     let keep = usize::try_from(limit).map_err(|_| AppError::new("logLimitInvalid"))?;
     let offset = i64::try_from(limit).map_err(|_| AppError::new("logLimitInvalid"))?;
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::End(-offset))?;
+    let mut file = File::open(path).map_err(|error| AppError::io_path(path, &error))?;
+    file.seek(SeekFrom::End(-offset))
+        .map_err(|error| AppError::io_path(path, &error))?;
     let mut tail = vec![0_u8; keep];
-    file.read_exact(&mut tail)?;
+    file.read_exact(&mut tail)
+        .map_err(|error| AppError::io_path(path, &error))?;
     atomic_write(path, &tail)
 }
 

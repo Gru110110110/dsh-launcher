@@ -156,8 +156,9 @@ pub fn rollback_harness_runtime(
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&paths.deployment_lock)?;
-    acquire_lock(&lock_file, &controller)?;
+        .open(&paths.deployment_lock)
+        .map_err(|error| AppError::io_path(&paths.deployment_lock, &error))?;
+    acquire_lock(&lock_file, &paths.deployment_lock, &controller)?;
     let result = (|| {
         recover_interrupted(paths)?;
         let previous_dsh = paths.runtime_dir.join("dsh.previous");
@@ -781,8 +782,9 @@ pub fn deploy_runtime(
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&paths.deployment_lock)?;
-    acquire_lock(&lock_file, controller)?;
+        .open(&paths.deployment_lock)
+        .map_err(|error| AppError::io_path(&paths.deployment_lock, &error))?;
+    acquire_lock(&lock_file, &paths.deployment_lock, controller)?;
     let result = (|| {
         recover_interrupted(paths)?;
         recover_valid_previous(paths)?;
@@ -920,8 +922,9 @@ pub fn recover_prepared_harness_update(paths: &ApplicationPaths) -> AppResult<Op
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&paths.deployment_lock)?;
-    acquire_lock(&lock_file, &controller)?;
+        .open(&paths.deployment_lock)
+        .map_err(|error| AppError::io_path(&paths.deployment_lock, &error))?;
+    acquire_lock(&lock_file, &paths.deployment_lock, &controller)?;
     let result = match prepared_harness_update(paths) {
         Ok(Some(prepared)) => {
             let active_is_same_or_newer = installed_version(paths)
@@ -958,8 +961,9 @@ pub fn discard_prepared_harness_update(paths: &ApplicationPaths) -> AppResult<()
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&paths.deployment_lock)?;
-    acquire_lock(&lock_file, &controller)?;
+        .open(&paths.deployment_lock)
+        .map_err(|error| AppError::io_path(&paths.deployment_lock, &error))?;
+    acquire_lock(&lock_file, &paths.deployment_lock, &controller)?;
     let result = (|| {
         remove_owned(&paths.pending_harness_update_file)?;
         remove_owned(&paths.pending_dsh_dir)
@@ -987,8 +991,9 @@ pub fn prepare_harness_update(
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&paths.deployment_lock)?;
-    acquire_lock(&lock_file, controller)?;
+        .open(&paths.deployment_lock)
+        .map_err(|error| AppError::io_path(&paths.deployment_lock, &error))?;
+    acquire_lock(&lock_file, &paths.deployment_lock, controller)?;
     let result = (|| {
         recover_interrupted(paths)?;
         if prepared_harness_update(paths).ok().flatten().as_deref() == Some(version.as_str()) {
@@ -1048,8 +1053,9 @@ pub fn activate_prepared_harness_update(
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&paths.deployment_lock)?;
-    acquire_lock(&lock_file, controller)?;
+        .open(&paths.deployment_lock)
+        .map_err(|error| AppError::io_path(&paths.deployment_lock, &error))?;
+    acquire_lock(&lock_file, &paths.deployment_lock, controller)?;
     let result = (|| {
         recover_interrupted(paths)?;
         let version = prepared_harness_update(paths)?
@@ -1933,7 +1939,9 @@ fn recover_interrupted(paths: &ApplicationPaths) -> AppResult<()> {
             fs::rename(previous, active)?;
         }
     }
-    for entry in fs::read_dir(&paths.runtime_dir)? {
+    for entry in fs::read_dir(&paths.runtime_dir)
+        .map_err(|error| AppError::io_path(&paths.runtime_dir, &error))?
+    {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with("node.staging-")
@@ -1982,7 +1990,7 @@ fn prune_npm_cache_at(cache_dir: &Path, threshold: u64) -> AppResult<bool> {
 }
 
 fn cleanup_expired_npm_caches(cache_dir: &Path) -> AppResult<()> {
-    for entry in fs::read_dir(cache_dir)? {
+    for entry in fs::read_dir(cache_dir).map_err(|error| AppError::io_path(cache_dir, &error))? {
         let entry = entry?;
         if entry
             .file_name()
@@ -2029,7 +2037,7 @@ fn prune_old_node_archives(cache_dir: &Path, keep: &str) -> AppResult<()> {
 }
 
 fn prune_stale_harness_archives(cache_dir: &Path) -> AppResult<()> {
-    for entry in fs::read_dir(cache_dir)? {
+    for entry in fs::read_dir(cache_dir).map_err(|error| AppError::io_path(cache_dir, &error))? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with("harness.staging-") && name.ends_with(".tgz") {
@@ -2844,20 +2852,20 @@ fn windows_process_entries() -> std::io::Result<Vec<(u32, u32)>> {
     Ok(entries)
 }
 
-fn acquire_lock(file: &File, controller: &DeploymentController) -> AppResult<()> {
+fn acquire_lock(file: &File, path: &Path, controller: &DeploymentController) -> AppResult<()> {
     let deadline = Instant::now() + Duration::from_secs(15 * 60);
-    let contended = lock_contended_error().kind();
+    let contended = lock_contended_error().raw_os_error();
     loop {
         controller.check()?;
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == contended && Instant::now() < deadline => {
+            Err(error) if error.raw_os_error() == contended && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(200))
             }
-            Err(error) if error.kind() == contended => {
+            Err(error) if error.raw_os_error() == contended => {
                 return Err(AppError::new("deploymentBusy"));
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(AppError::io_path(path, &error)),
         }
     }
 }

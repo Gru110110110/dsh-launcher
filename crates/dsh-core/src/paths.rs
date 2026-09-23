@@ -175,18 +175,25 @@ pub fn dirs_home() -> AppResult<PathBuf> {
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| AppError::new("invalidPath"))?;
-    std::fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    std::fs::create_dir_all(parent).map_err(|error| AppError::io_path(parent, &error))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| AppError::io_path(parent, &error))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o600))?;
     }
-    temporary.as_file_mut().write_all(bytes)?;
-    temporary.as_file_mut().sync_all()?;
+    temporary
+        .as_file_mut()
+        .write_all(bytes)
+        .map_err(|error| AppError::io_path(path, &error))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| AppError::io_path(path, &error))?;
     temporary
         .persist(path)
-        .map_err(|e| AppError::io("writeFailed", &e.error))?;
+        .map_err(|error| AppError::io_path(path, &error.error))?;
     Ok(())
 }
 
@@ -253,5 +260,21 @@ mod tests {
                 .cc_switch_import_marker
                 .ends_with(".cc-switch-import-v2")
         );
+    }
+
+    #[test]
+    fn failed_atomic_write_identifies_the_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("existing-directory");
+        std::fs::create_dir(&destination).unwrap();
+
+        let error = atomic_write(&destination, b"test").unwrap_err();
+
+        assert_eq!(error.code, "ioPath");
+        assert_eq!(
+            error.values.get("path"),
+            Some(&destination.display().to_string())
+        );
+        assert!(destination.is_dir());
     }
 }

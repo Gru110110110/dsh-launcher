@@ -285,6 +285,7 @@
   "error.writeFailed": "Application data could not be saved: {{detail}}",
   "error.invalidData": "Stored application data is invalid: {{detail}}",
   "error.io": "A local file operation failed: {{detail}}",
+  "error.ioPath": "Could not access {{path}}: {{detail}}",
   "error.configurationChanged": "Configuration changed during import and was preserved",
   "error.migrationNotAvailable": "There is no pending migration to apply",
   "error.migrationBusy": "Another launcher instance is migrating local data",

@@ -18,6 +18,8 @@ Technical architecture, data-safety guarantees, and release details live in [doc
 
 The home page prepares and verifies the private Node.js/Harness runtime, starts or stops the official service, shows its real address and uptime, and opens the official Web UI in the browser you choose. Harness and desktop updates are surfaced separately so you always know what is changing. If an update leaves an incompatible derived session index or third-party plugin, **Repair and start** rebuilds the index from retained session logs and removes only identified incompatible plugins through recoverable transactions. Finalized repair backups are automatically bounded by age, count, and total size and can be reviewed or cleaned in Settings.
 
+If local file access fails during startup, the error shows the affected path when available so you can identify the blocked location.
+
 ![DSH Launcher home page](screenshots/ScreenShot_en.png)
 
 ### Install plugins from the marketplace

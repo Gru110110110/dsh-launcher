@@ -433,6 +433,11 @@ button:disabled {
   white-space: nowrap;
 }
 
+.row-copy span.runtime-error {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
 .runtime-progress {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

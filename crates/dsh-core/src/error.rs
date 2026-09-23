@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -41,6 +42,10 @@ impl AppError {
 
     pub fn io(code: &'static str, error: &std::io::Error) -> Self {
         Self::new(code).detail(error.to_string())
+    }
+
+    pub fn io_path(path: &Path, error: &std::io::Error) -> Self {
+        Self::io("ioPath", error).value("path", path.display())
     }
 }
 

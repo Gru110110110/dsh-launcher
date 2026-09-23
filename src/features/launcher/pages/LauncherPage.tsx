@@ -192,7 +192,7 @@ export function LauncherPage() {
           <Activity className="row-icon" size={18} aria-hidden />
           <div className="row-copy">
             <strong>{t("dashboard.runtime")}</strong>
-            <span>
+            <span className={failed && snapshot.error ? "runtime-error" : undefined}>
               {running && elapsed
                 ? t("dashboard.runtimeDetail", { time: elapsed })
                 : stopped
