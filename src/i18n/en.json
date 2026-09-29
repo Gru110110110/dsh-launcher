@@ -454,6 +454,7 @@
   "balance.loading": "Loading…",
   "balance.unavailable": "Balance unavailable",
   "balance.refresh": "Refresh",
+  "balance.topUp": "Top up",
   "settings.balanceCard": "Balance card",
   "settings.balanceCardDetail": "Show the official DeepSeek balance on the Harness page",
   "settings.balanceCardShow": "Show",

@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { RefreshCw, Wallet } from "lucide-react";
+import { ExternalLink, RefreshCw, Wallet } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { BalanceSnapshot } from "@/platform/generated/bindings";
 import { launcherApi } from "@/platform/launcherApi";
 import { useLauncherSnapshot } from "@/platform/launcherStore";
 import { showTimedError } from "@/shared/errorToast";
 import { createBalancePoller } from "../balancePoller";
-import { formatBalance, selectNewerBalance } from "../balancePresentation";
+import {
+  balanceNeedsTopUp,
+  formatBalance,
+  selectNewerBalance,
+  selectNewestSnapshot,
+} from "../balancePresentation";
 
 function errorKey(error: unknown): string {
   if (typeof error === "object" && error !== null && "code" in error) {
@@ -21,6 +26,7 @@ export function BalanceCard() {
   const { t } = useTranslation(undefined, { lng: snapshot.language });
   const running = snapshot.phase === "ready";
   const [balance, setBalance] = useState<BalanceSnapshot | null>(null);
+  const [latest, setLatest] = useState<BalanceSnapshot | null>(null);
   const [queried, setQueried] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const mounted = useRef(false);
@@ -49,6 +55,7 @@ export function BalanceCard() {
   const accept = useCallback(
     (next: BalanceSnapshot, forceToast = false) => {
       setQueried(true);
+      setLatest((current) => selectNewestSnapshot(current, next));
       setBalance((current) => selectNewerBalance(current, next));
       if (next.status === "ok") {
         lastAutomaticError.current = null;
@@ -82,6 +89,7 @@ export function BalanceCard() {
   const balanceText = balance
     ? formatBalance(balance.totalBalance, balance.currency)
     : null;
+  const needsTopUp = running && balanceNeedsTopUp(latest);
 
   const refresh = () => {
     if (!running || refreshing) return;
@@ -104,6 +112,19 @@ export function BalanceCard() {
       });
   };
 
+  const openTopUp = () => {
+    if (!running) return;
+    void launcherApi
+      .openExternalLink("deepseekTopUp")
+      .catch((error: unknown) => {
+        if (mounted.current) {
+          showTimedError(error, (translationKey, values) =>
+            t(translationKey, values),
+          );
+        }
+      });
+  };
+
   return (
     <section className="page-section balance-section">
       <h2 className="section-label">{t("dashboard.balanceSection")}</h2>
@@ -120,15 +141,38 @@ export function BalanceCard() {
             </span>
           </div>
           <div className="row-actions">
-            <button
-              type="button"
-              className="inline-action"
-              disabled={!running || refreshing}
-              onClick={refresh}
-            >
-              <RefreshCw size={13} className={refreshing ? "spin" : ""} />
-              {t("balance.refresh")}
-            </button>
+            {needsTopUp ? (
+              <>
+                <button
+                  type="button"
+                  className="icon-button"
+                  disabled={refreshing}
+                  onClick={refresh}
+                  aria-label={t("balance.refresh")}
+                  title={t("balance.refresh")}
+                >
+                  <RefreshCw size={13} className={refreshing ? "spin" : ""} />
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={openTopUp}
+                >
+                  <ExternalLink size={13} />
+                  {t("balance.topUp")}
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="inline-action"
+                disabled={!running || refreshing}
+                onClick={refresh}
+              >
+                <RefreshCw size={13} className={refreshing ? "spin" : ""} />
+                {t("balance.refresh")}
+              </button>
+            )}
           </div>
         </div>
       </div>

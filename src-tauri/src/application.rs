@@ -50,6 +50,7 @@ const WEBSITE: &str = "https://dsdesktop.com/";
 const GITHUB_REPOSITORY: &str = "https://github.com/Gru110110110/deepseek-harness-desktop-launcher";
 const HARNESS_GITHUB_REPOSITORY: &str = "https://github.com/deepseek-ai/deepseek-harness";
 const DEEPSEEK_PLATFORM: &str = "https://platform.deepseek.com/";
+const DEEPSEEK_TOP_UP: &str = "https://platform.deepseek.com/top_up";
 const INSTANCE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 const DESKTOP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -117,6 +118,7 @@ fn external_link_url(target: &str) -> Option<&'static str> {
         "github" => Some(GITHUB_REPOSITORY),
         "harnessGithub" => Some(HARNESS_GITHUB_REPOSITORY),
         "deepseek" => Some(DEEPSEEK_PLATFORM),
+        "deepseekTopUp" => Some(DEEPSEEK_TOP_UP),
         _ => None,
     }
 }
@@ -3034,9 +3036,9 @@ mod tests {
     };
 
     use super::{
-        DEEPSEEK_PLATFORM, DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS, DesktopUpdateCheckFailure,
-        DesktopUpdateDownloadFailure, DownloadProgressThrottle, GITHUB_REPOSITORY,
-        HARNESS_GITHUB_REPOSITORY, LifecycleDecision, MainWindowActivation,
+        DEEPSEEK_PLATFORM, DEEPSEEK_TOP_UP, DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS,
+        DesktopUpdateCheckFailure, DesktopUpdateDownloadFailure, DownloadProgressThrottle,
+        GITHUB_REPOSITORY, HARNESS_GITHUB_REPOSITORY, LifecycleDecision, MainWindowActivation,
         PROGRESS_EVENT_INTERVAL, ProgressEventThrottle, UpdaterProxyPlan, WEBSITE,
         acquire_instance_lock, acquire_instance_lock_with_timeout, apply_updater_system_plan,
         classify_desktop_update_check_error, classify_desktop_update_download_error,
@@ -3259,6 +3261,7 @@ mod tests {
             Some(HARNESS_GITHUB_REPOSITORY)
         );
         assert_eq!(external_link_url("deepseek"), Some(DEEPSEEK_PLATFORM));
+        assert_eq!(external_link_url("deepseekTopUp"), Some(DEEPSEEK_TOP_UP));
         assert_eq!(external_link_url("unknown"), None);
     }
 

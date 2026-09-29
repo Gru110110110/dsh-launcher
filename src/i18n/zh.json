@@ -454,6 +454,7 @@
   "balance.loading": "加载中…",
   "balance.unavailable": "余额不可用",
   "balance.refresh": "刷新",
+  "balance.topUp": "去充值",
   "settings.balanceCard": "余额卡片",
   "settings.balanceCardDetail": "在 Harness 页面显示 DeepSeek 官方余额",
   "settings.balanceCardShow": "显示",

@@ -45,8 +45,9 @@ export const launcherApi = {
     action("launcher_select_browser", { browserId }),
   openWebUi: () => action("launcher_open_web_ui"),
   openWebsite: () => action("application_open_website"),
-  openExternalLink: (target: "github" | "deepseek" | "harnessGithub") =>
-    action("application_open_external_link", { target }),
+  openExternalLink: (
+    target: "github" | "deepseek" | "deepseekTopUp" | "harnessGithub",
+  ) => action("application_open_external_link", { target }),
   copyWebUrl: () => action("application_copy_web_url"),
   setLanguage: (language: Language) =>
     action("preferences_set_language", { language }),

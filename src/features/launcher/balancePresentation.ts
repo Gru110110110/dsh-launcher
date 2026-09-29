@@ -21,12 +21,11 @@ export function formatBalance(
   return currency === null ? totalBalance : `${totalBalance} ${currency}`;
 }
 
-/** Do not let a delayed request replace a more recently fetched balance. */
-export function selectNewerBalance(
+/** Do not let a delayed request replace a more recently fetched snapshot. */
+export function selectNewestSnapshot(
   current: BalanceSnapshot | null,
   next: BalanceSnapshot,
 ): BalanceSnapshot | null {
-  if (next.totalBalance === null) return current;
   if (
     current?.fetchedAtMs !== null &&
     current?.fetchedAtMs !== undefined &&
@@ -36,4 +35,30 @@ export function selectNewerBalance(
     return current;
   }
   return next;
+}
+
+/** Keep the last known amount when a snapshot carries no balance. */
+export function selectNewerBalance(
+  current: BalanceSnapshot | null,
+  next: BalanceSnapshot,
+): BalanceSnapshot | null {
+  if (next.totalBalance === null) return current;
+  return selectNewestSnapshot(current, next);
+}
+
+/**
+ * The account needs funding when the official balance is exhausted, or when no
+ * DeepSeek API key is configured and no amount is known at all. A known amount
+ * decides on its own, so a positive last-known balance is never paired with a
+ * top-up button; `isAvailable` alone cannot decide this because DeepSeek also
+ * reports `false` for a funded account that may not call the API.
+ */
+export function balanceNeedsTopUp(balance: BalanceSnapshot | null): boolean {
+  if (balance === null) return false;
+  const total = balance.totalBalance;
+  if (total !== null) {
+    const value = Number(total);
+    return Number.isFinite(value) && value <= 0;
+  }
+  return balance.detail === "balanceNoCredential";
 }
