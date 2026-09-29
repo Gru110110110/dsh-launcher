@@ -2,18 +2,25 @@
 //! loopback Harness web service. Uses an isolated temporary desktop home and
 //! only issues read-only GETs plus login POSTs to the proxy itself.
 //!
-//! Run: DSH_SMOKE_UPSTREAM=http://127.0.0.1:3080 cargo run -p dsh-core --example remote_smoke
+//! Pass the exact URL `dsh web` printed, launch token included, so the
+//! bootstrap hop is exercised the way a remote browser walks it.
+//!
+//! Run: DSH_SMOKE_UPSTREAM='http://127.0.0.1:3080/?token=...' cargo run -p dsh-core --example remote_smoke
 
 use std::io::Read;
 
 use dsh_core::{ApplicationPaths, remote::RemoteService};
+use url::Url;
 
 fn main() {
     let upstream = env_upstream();
     let temp = tempfile::tempdir().expect("temp home");
     let paths = ApplicationPaths::from_home(temp.path());
     let service = RemoteService::new(paths).expect("remote service");
+    // The master switch is authoritative but does not itself expose a scope,
+    // so the LAN listener needs its own opt-in.
     service.set_master(true).expect("master on");
+    service.set_lan_enabled(true).expect("lan on");
     service.set_upstream(Some(&upstream)).expect("upstream");
     let snapshot = service.snapshot();
     let password = snapshot.lan.password.clone();
@@ -77,10 +84,70 @@ fn main() {
         .to_owned();
     assert!(cookie.starts_with("dsh_remote_lan="), "{cookie}");
 
-    // 4. Authenticated request proxies the real Harness web UI.
+    // 4. A tokenized upstream is exchanged on the loopback hop first: the
+    //    browser is redirected to the proxy root and Harness's own cookie is
+    //    relayed. Relaying Harness's relative `Location: ./` here would send
+    //    a real browser to `/__dsh-remote/`, which the upstream answers with
+    //    an empty 404 — the blank remote page this check guards against.
+    let url = Url::parse(&upstream).expect("upstream URL");
+    let mut request_cookie = cookie.clone();
+    if url.path() != "/" || url.query().is_some() {
+        let response = client
+            .get(&base)
+            .header("cookie", &cookie)
+            .send()
+            .expect("GET / authed");
+        assert_eq!(
+            response.status(),
+            302,
+            "a tokenized upstream needs the bootstrap hop first"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok()),
+            Some("/__dsh-remote/bootstrap")
+        );
+
+        let response = client
+            .get(format!("{base}/__dsh-remote/bootstrap"))
+            .header("cookie", &cookie)
+            .send()
+            .expect("bootstrap");
+        assert_eq!(
+            response.status(),
+            302,
+            "the exchange must hand the browser to the proxy root"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok()),
+            Some("/"),
+            "Harness's relative Location must not reach the browser"
+        );
+        let harness_cookie = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|value| value.split(';').next())
+            .find(|pair| !pair.is_empty())
+            .expect("Harness mints its own session cookie")
+            .to_owned();
+        assert!(
+            !harness_cookie.starts_with("dsh_remote_"),
+            "the relayed cookie must belong to Harness: {harness_cookie}"
+        );
+        request_cookie = format!("{cookie}; {harness_cookie}");
+    }
+
+    // 5. Authenticated request proxies the real Harness web UI.
     let response = client
         .get(&base)
-        .header("cookie", &cookie)
+        .header("cookie", &request_cookie)
         .send()
         .expect("GET / authed");
     assert_eq!(response.status(), 200, "proxied GET must succeed");
@@ -99,7 +166,7 @@ fn main() {
         body
     );
 
-    // 5. Logout revokes the session immediately.
+    // 6. Logout revokes the session immediately.
     let response = client
         .get(format!("{base}/__dsh-remote/logout"))
         .header("cookie", &cookie)

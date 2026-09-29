@@ -5,7 +5,8 @@
 //! on loopback for cloudflared), an 8-digit password login that issues an
 //! opaque session cookie, and rate limiting. Newer Harness versions also
 //! require their own launch-token exchange, which the proxy performs only on
-//! the private loopback hop after its password check.
+//! the private loopback hop after its password check, relaying Harness's own
+//! cookies and redirecting the browser to the proxy root.
 //!
 //! Implementation notes:
 //! - Plain `std` threads and blocking streams; no async runtime or web
@@ -504,7 +505,7 @@ fn handle_connection_inner(
             context
                 .auth
                 .mark_bootstrapped(&session, upstream.generation);
-            let result = proxy_to(client, head, context, upstream, Some(target));
+            let result = bootstrap_upstream(client, &head, &upstream, &target);
             if result.is_err() {
                 // A connection failure must remain retryable on the next
                 // navigation instead of pinning this session to a dead hop.
@@ -1114,6 +1115,104 @@ fn forward_responses(
     }
 }
 
+/// Completes the private launch-token exchange on the loopback hop and lands
+/// the remote browser on the proxy root.
+///
+/// Harness answers the token URL with `303 See Other` and a *relative*
+/// `Location: ./`; the token is only accepted at the root request target, so
+/// the browser-visible bootstrap path can never be that target. Relaying the
+/// head verbatim makes the browser resolve `./` against
+/// `/__dsh-remote/bootstrap`, land on `/__dsh-remote/`, and receive the
+/// static fallback's empty `404` — the blank remote page seen after the
+/// Harness 0.2.0 launch-token redesign. The exchange is therefore finished
+/// here: Harness's own browser cookies are relayed and the browser is sent to
+/// the absolute root, where the ordinary proxy path serves the authenticated
+/// UI and every relative asset, `<base>`, and stream URL resolves correctly.
+fn bootstrap_upstream(
+    client: &mut TcpStream,
+    head: &RequestHead,
+    upstream: &Upstream,
+    target: &str,
+) -> std::io::Result<()> {
+    let authority = upstream.endpoint.authority.clone();
+    let mut upstream_stream = TcpStream::connect_timeout(
+        &authority
+            .parse::<SocketAddr>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+        CONNECT_TIMEOUT,
+    )?;
+    let forwarded = RequestHead {
+        method: head.method.clone(),
+        target: target.to_owned(),
+        headers: head.headers.clone(),
+        // The exchange is a single GET: there is no request body and this
+        // private hop is never pipelined.
+        leftover: Vec::new(),
+    };
+    upstream_stream.write_all(rewritten_head(&forwarded, &authority, false).as_bytes())?;
+    let mut pipe = Pipeline {
+        stream: &mut upstream_stream,
+        buffer: Vec::new(),
+    };
+    let response = loop {
+        let _ = pipe.stream.set_read_timeout(Some(HEAD_TIMEOUT));
+        let Some(raw) = pipe.read_head()? else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "harness closed before answering the launch token",
+            ));
+        };
+        let _ = pipe.stream.set_read_timeout(None);
+        let Some(response) = parse_response_head(raw) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed harness launch-token response",
+            ));
+        };
+        // 1xx interims other than an upgrade precede the real response.
+        if (100..200).contains(&response.status) && response.status != 101 {
+            continue;
+        }
+        break response;
+    };
+    let cookies = response
+        .headers
+        .iter()
+        .filter(|(name, _)| name == "set-cookie")
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    // A token exchange answers with a redirect; a 2xx that already minted a
+    // cookie is the same outcome. Anything else is relayed unchanged, so an
+    // expired token (401 after a Harness restart) or unexpected HTML stays
+    // diagnosable instead of turning into a redirect loop.
+    if (300..400).contains(&response.status) || !cookies.is_empty() {
+        let mut extra = vec![("location", "/")];
+        extra.extend(cookies.iter().map(|cookie| ("set-cookie", *cookie)));
+        return write_response(
+            client,
+            302,
+            "Found",
+            "text/plain; charset=utf-8",
+            b"",
+            &extra,
+        );
+    }
+    client.write_all(&response.raw)?;
+    match framing(&response) {
+        Framing::NoBody => Ok(()),
+        Framing::Length(length) => pipe.forward_into(client, length),
+        Framing::Chunked => forward_chunked(&mut pipe, client),
+        Framing::Close => {
+            if !pipe.buffer.is_empty() {
+                client.write_all(&pipe.buffer)?;
+                pipe.buffer.clear();
+            }
+            let _ = std::io::copy(pipe.stream, client);
+            Ok(())
+        }
+    }
+}
+
 /// Rewrites the head for the upstream: Host, Origin, and Referer point at
 /// the loopback service (the upstream 403s host-sensitive APIs for
 /// non-loopback origins), our session cookie and hop-by-hop proxy headers
@@ -1411,10 +1510,27 @@ mod tests {
         handle: Option<JoinHandle<()>>,
     }
 
+    /// How the fake upstream answers ordinary (non-upgrade) requests.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FakeMode {
+        /// Fixed `200 proxied` body.
+        Plain,
+        /// Mimics a real Harness launch-token exchange: the token request
+        /// target answers `303 See Other` with a relative `Location` plus
+        /// Harness's own browser cookie, exactly as 0.2.0-rc.2 does.
+        HarnessBootstrap,
+        /// Mimics a Harness whose launch token is no longer valid.
+        HarnessUnauthorized,
+    }
+
     impl FakeUpstream {
         /// Records request heads and replies with a fixed body; upgrade
         /// requests get a raw echo channel after a synthetic 101.
         fn spawn(seen: Arc<Mutex<Vec<String>>>) -> Self {
+            Self::spawn_in(FakeMode::Plain, seen)
+        }
+
+        fn spawn_in(mode: FakeMode, seen: Arc<Mutex<Vec<String>>>) -> Self {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let addr = listener.local_addr().unwrap();
             let stop = Arc::new(AtomicBool::new(false));
@@ -1438,7 +1554,24 @@ mod tests {
                         }
                         let head = String::from_utf8_lossy(&buffer).into_owned();
                         let upgrade = head.to_ascii_lowercase().contains("upgrade: websocket");
-                        seen.lock().expect("seen poisoned").push(head);
+                        seen.lock().expect("seen poisoned").push(head.clone());
+                        if !upgrade && head.starts_with("GET /?token=") {
+                            match mode {
+                                FakeMode::HarnessBootstrap => {
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 303 See Other\r\ncache-control: no-store\r\nlocation: ./\r\nset-cookie: dsh-auth-fake=HarnessSession; Path=/; HttpOnly; SameSite=Strict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                    );
+                                    return;
+                                }
+                                FakeMode::HarnessUnauthorized => {
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 13\r\nconnection: close\r\n\r\ntoken expired",
+                                    );
+                                    return;
+                                }
+                                FakeMode::Plain => {}
+                            }
+                        }
                         if upgrade {
                             let _ = stream.write_all(
                                 b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
@@ -1750,6 +1883,119 @@ mod tests {
         let forwarded = seen.lock().expect("seen").pop().expect("ordinary request");
         assert!(forwarded.starts_with("GET / HTTP/1.1"), "{forwarded}");
         assert!(!forwarded.contains("launch-secret"), "{forwarded}");
+    }
+
+    #[test]
+    fn harness_token_redirect_lands_on_the_proxy_root_with_harness_cookies() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let upstream = FakeUpstream::spawn_in(FakeMode::HarnessBootstrap, Arc::clone(&seen));
+        let authority = upstream_config(
+            upstream.authority(),
+            Some("/?token=launch-secret&mode=web"),
+            11,
+        );
+        let auth = AuthState::new(RemoteScope::Lan, "12345678".to_owned());
+        let server = ProxyServer::bind(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Arc::clone(&auth),
+            authority,
+        )
+        .expect("proxy binds");
+        let proxy = TestProxy {
+            server,
+            auth,
+            _upstream: upstream,
+        };
+        let token = session_cookie_from(&login(&proxy, "12345678"));
+
+        let bootstrap = request(
+            &proxy,
+            &format!(
+                "GET /__dsh-remote/bootstrap HTTP/1.1\r\nHost: phone\r\nCookie: dsh_remote_lan={token}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(bootstrap.starts_with("HTTP/1.1 302"), "{bootstrap}");
+        assert!(
+            bootstrap.contains("location: /\r\n"),
+            "the browser must be sent to the proxy root: {bootstrap}"
+        );
+        assert!(
+            !bootstrap.contains("location: ./"),
+            "Harness's relative Location must never reach the browser: {bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("set-cookie: dsh-auth-fake=HarnessSession"),
+            "Harness's own browser cookie must be relayed: {bootstrap}"
+        );
+        assert!(!bootstrap.contains("launch-secret"), "{bootstrap}");
+        let forwarded = seen.lock().expect("seen").pop().expect("bootstrap request");
+        assert!(
+            forwarded.starts_with("GET /?token=launch-secret&mode=web HTTP/1.1"),
+            "{forwarded}"
+        );
+
+        // Following the rewritten redirect reaches the root, where the
+        // ordinary proxy path serves the authenticated UI instead of the
+        // empty 404 that left the remote page blank.
+        let root = request(
+            &proxy,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: phone\r\nCookie: dsh_remote_lan={token}; dsh-auth-fake=HarnessSession\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(root.ends_with("proxied"), "{root}");
+    }
+
+    #[test]
+    fn rejected_launch_token_is_relayed_instead_of_redirecting() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let upstream = FakeUpstream::spawn_in(FakeMode::HarnessUnauthorized, Arc::clone(&seen));
+        let authority = upstream_config(upstream.authority(), Some("/?token=stale"), 3);
+        let auth = AuthState::new(RemoteScope::Lan, "12345678".to_owned());
+        let server = ProxyServer::bind(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Arc::clone(&auth),
+            authority,
+        )
+        .expect("proxy binds");
+        let proxy = TestProxy {
+            server,
+            auth,
+            _upstream: upstream,
+        };
+        let token = session_cookie_from(&login(&proxy, "12345678"));
+
+        let bootstrap = request(
+            &proxy,
+            &format!(
+                "GET /__dsh-remote/bootstrap HTTP/1.1\r\nHost: phone\r\nCookie: dsh_remote_lan={token}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(bootstrap.starts_with("HTTP/1.1 401"), "{bootstrap}");
+        assert!(bootstrap.contains("token expired"), "{bootstrap}");
+        assert!(!bootstrap.contains("location:"), "{bootstrap}");
+    }
+
+    #[test]
+    fn bare_root_upstream_skips_the_bootstrap_hop() {
+        // Harness before 0.1.2-alpha.2 prints a bare root with no launch
+        // token. There is nothing to exchange, so the root must reach the UI
+        // directly: no bootstrap redirect and no cookie relay.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let proxy = start_proxy("12345678", &seen);
+        let token = session_cookie_from(&login(&proxy, "12345678"));
+
+        let root = request(
+            &proxy,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: phone\r\nCookie: dsh_remote_lan={token}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(root.starts_with("HTTP/1.1 200"), "{root}");
+        assert!(root.ends_with("proxied"), "{root}");
+        assert!(!root.contains("location:"), "{root}");
+        let forwarded = seen.lock().expect("seen").pop().expect("root request");
+        assert!(forwarded.starts_with("GET / HTTP/1.1"), "{forwarded}");
     }
 
     #[test]
