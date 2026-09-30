@@ -89,7 +89,7 @@ export function BalanceCard() {
   const balanceText = balance
     ? formatBalance(balance.totalBalance, balance.currency)
     : null;
-  const needsTopUp = running && balanceNeedsTopUp(latest);
+  const needsTopUp = running && balanceNeedsTopUp(latest, balance);
 
   const refresh = () => {
     if (!running || refreshing) return;

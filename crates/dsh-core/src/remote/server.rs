@@ -1185,7 +1185,9 @@ fn bootstrap_upstream(
     // cookie is the same outcome. Anything else is relayed unchanged, so an
     // expired token (401 after a Harness restart) or unexpected HTML stays
     // diagnosable instead of turning into a redirect loop.
-    if (300..400).contains(&response.status) || !cookies.is_empty() {
+    if (300..400).contains(&response.status)
+        || ((200..300).contains(&response.status) && !cookies.is_empty())
+    {
         let mut extra = vec![("location", "/")];
         extra.extend(cookies.iter().map(|cookie| ("set-cookie", *cookie)));
         return write_response(
@@ -1565,7 +1567,7 @@ mod tests {
                                 }
                                 FakeMode::HarnessUnauthorized => {
                                     let _ = stream.write_all(
-                                        b"HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 13\r\nconnection: close\r\n\r\ntoken expired",
+                                        b"HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\nset-cookie: dsh-auth-fake=; Max-Age=0; Path=/; HttpOnly\r\ncontent-length: 13\r\nconnection: close\r\n\r\ntoken expired",
                                     );
                                     return;
                                 }
@@ -1973,6 +1975,10 @@ mod tests {
         );
         assert!(bootstrap.starts_with("HTTP/1.1 401"), "{bootstrap}");
         assert!(bootstrap.contains("token expired"), "{bootstrap}");
+        assert!(
+            bootstrap.contains("set-cookie: dsh-auth-fake=;"),
+            "{bootstrap}"
+        );
         assert!(!bootstrap.contains("location:"), "{bootstrap}");
     }
 

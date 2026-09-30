@@ -26,11 +26,12 @@ export function selectNewestSnapshot(
   current: BalanceSnapshot | null,
   next: BalanceSnapshot,
 ): BalanceSnapshot | null {
+  // A response with no fetch time cannot displace a dated result that may
+  // have arrived from a later, concurrent manual refresh.
   if (
     current?.fetchedAtMs !== null &&
     current?.fetchedAtMs !== undefined &&
-    next.fetchedAtMs !== null &&
-    next.fetchedAtMs < current.fetchedAtMs
+    (next.fetchedAtMs === null || next.fetchedAtMs < current.fetchedAtMs)
   ) {
     return current;
   }
@@ -53,12 +54,17 @@ export function selectNewerBalance(
  * top-up button; `isAvailable` alone cannot decide this because DeepSeek also
  * reports `false` for a funded account that may not call the API.
  */
-export function balanceNeedsTopUp(balance: BalanceSnapshot | null): boolean {
-  if (balance === null) return false;
-  const total = balance.totalBalance;
+export function balanceNeedsTopUp(
+  latest: BalanceSnapshot | null,
+  displayed: BalanceSnapshot | null = null,
+): boolean {
+  if (latest === null) return false;
+  // The card retains its last known amount when a newer response has none.
+  // Classify the amount the user actually sees before the missing-key detail.
+  const total = displayed?.totalBalance ?? latest.totalBalance;
   if (total !== null) {
     const value = Number(total);
     return Number.isFinite(value) && value <= 0;
   }
-  return balance.detail === "balanceNoCredential";
+  return latest.detail === "balanceNoCredential";
 }

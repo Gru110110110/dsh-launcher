@@ -5737,7 +5737,8 @@ fn normalize_registry_candidates(raw: Vec<String>) -> Vec<String> {
             continue;
         }
         if crate::runtime::validate_network_source(trimmed).is_err() {
-            log::warn!("skipping invalid npm registry source: {trimmed}");
+            // A rejected URL may contain credentials or a token in its query.
+            log::warn!("skipping invalid npm registry source");
             continue;
         }
         candidates.push(trimmed.to_owned());

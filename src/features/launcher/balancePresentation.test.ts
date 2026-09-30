@@ -60,14 +60,15 @@ describe("official balance formatting", () => {
     ).toBe(current);
   });
 
-  it("tracks a snapshot without an amount so the card can classify it", () => {
+  it("classifies an initial missing amount without replacing a newer dated snapshot", () => {
     const current = snapshot({ totalBalance: "2.00", fetchedAtMs: 200 });
     const missing = snapshot({
       totalBalance: null,
       fetchedAtMs: null,
       detail: "balanceNoCredential",
     });
-    expect(selectNewestSnapshot(current, missing)).toEqual(missing);
+    expect(selectNewestSnapshot(null, missing)).toEqual(missing);
+    expect(selectNewestSnapshot(current, missing)).toBe(current);
   });
 });
 
@@ -124,6 +125,17 @@ describe("top-up prompt", () => {
     ).toBe(false);
     expect(
       balanceNeedsTopUp(snapshot({ isAvailable: false, totalBalance: "9.99" })),
+    ).toBe(false);
+    expect(
+      balanceNeedsTopUp(
+        snapshot({
+          status: "unavailable",
+          detail: "balanceNoCredential",
+          totalBalance: null,
+          fetchedAtMs: null,
+        }),
+        snapshot({ totalBalance: "88.38", fetchedAtMs: 200 }),
+      ),
     ).toBe(false);
   });
 });
