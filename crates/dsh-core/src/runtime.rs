@@ -38,7 +38,10 @@ const NODE_BASES: [&str; 2] = [
     "https://nodejs.org/dist",
     "https://npmmirror.com/mirrors/node",
 ];
-const NPM_REGISTRIES: [&str; 2] = [
+/// The registry list the runtime installer may use, most authoritative first.
+/// Shared with the marketplace, which must resolve package metadata from a
+/// registry that is actually reachable where pnpm will install from.
+pub(crate) const NPM_REGISTRIES: [&str; 2] = [
     "https://registry.npmjs.org",
     "https://registry.npmmirror.com",
 ];
@@ -3015,13 +3018,17 @@ fn node_bases() -> Vec<String> {
         })
         .unwrap_or_else(|| NODE_BASES.iter().map(ToString::to_string).collect())
 }
+/// An explicit registry override from the environment, if any. Tests and
+/// operators use this to pin one registry; production leaves it unset.
+pub(crate) fn npm_registry_override() -> Option<Vec<String>> {
+    env_list("DSH_DESKTOP_NPM_REGISTRIES").or_else(|| {
+        std::env::var("DSH_DESKTOP_NPM_REGISTRY")
+            .ok()
+            .map(|item| vec![item])
+    })
+}
 fn npm_registries() -> Vec<String> {
-    env_list("DSH_DESKTOP_NPM_REGISTRIES")
-        .or_else(|| {
-            std::env::var("DSH_DESKTOP_NPM_REGISTRY")
-                .ok()
-                .map(|item| vec![item])
-        })
+    npm_registry_override()
         .unwrap_or_else(|| NPM_REGISTRIES.iter().map(ToString::to_string).collect())
 }
 fn env_list(name: &str) -> Option<Vec<String>> {
@@ -3052,7 +3059,11 @@ fn display_source(raw: &str) -> String {
         })
         .unwrap_or_else(|_| "<invalid source>".into())
 }
-fn validate_network_source(raw: &str) -> AppResult<url::Url> {
+/// Rejects any download source that is not plain HTTPS (or loopback HTTP),
+/// carries userinfo, a query, or a fragment. Shared with the marketplace so a
+/// registry used for metadata resolution is validated exactly like an
+/// installer source.
+pub(crate) fn validate_network_source(raw: &str) -> AppResult<url::Url> {
     let value = url::Url::parse(raw).map_err(|_| AppError::new("downloadSourceInvalid"))?;
     let local = matches!(value.host_str(), Some("127.0.0.1" | "localhost"));
     let transport_allowed = value.scheme() == "https" || (value.scheme() == "http" && local);

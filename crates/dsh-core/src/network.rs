@@ -451,6 +451,26 @@ pub fn sanitize_detail(raw: &str) -> String {
     detail
 }
 
+/// Renders an error together with its full source chain, then sanitizes it.
+///
+/// `reqwest::Error`'s own `Display` names only the category — a body failure
+/// prints as the bare "request or response body error" — while the actionable
+/// cause (a peer that closed the connection mid-body, a truncated response, a
+/// TLS or proxy rejection) lives in the source chain. Diagnostics must walk
+/// that chain explicitly, or every transport failure reads the same.
+pub fn error_chain_detail(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !parts.iter().any(|part| part.as_str() == text.as_str()) {
+            parts.push(text);
+        }
+        source = cause.source();
+    }
+    sanitize_detail(&parts.join(": "))
+}
+
 /// The classified, sanitized outcome of a failed reqwest operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifiedNetworkError {
@@ -1108,6 +1128,38 @@ mod tests {
         let sanitized = sanitize_detail(&long);
         assert!(sanitized.chars().count() <= MAX_DETAIL_LEN + 1);
         assert!(sanitized.ends_with('…'));
+    }
+
+    #[test]
+    fn error_chain_detail_exposes_the_transport_cause() {
+        // A body that ends before its declared length is exactly the failure
+        // mode reqwest reports as the bare category "request or response body
+        // error": the useful cause is only in the source chain.
+        let server = TestServer::spawn(|mut stream, _stop| {
+            let _ = read_request_head(&mut stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\nshort",
+            );
+        });
+        let direct = settings(ProxyMode::Direct, "", "");
+        let client = blocking_client("dsh-test", &direct).unwrap();
+        let error = client
+            .get(server.url())
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .unwrap_err();
+        let bare = error.to_string();
+        let detail = error_chain_detail(&error);
+        assert!(detail.starts_with(&bare), "{detail}");
+        assert!(
+            detail.contains("end of file before message length reached"),
+            "the transport cause must survive: {detail}"
+        );
+        assert!(detail.len() > bare.len(), "{detail}");
+        assert!(!detail.contains(" for url ("), "{detail}");
     }
 
     #[test]

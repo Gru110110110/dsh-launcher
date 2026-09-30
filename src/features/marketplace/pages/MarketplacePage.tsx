@@ -248,6 +248,7 @@ export function MarketplacePage() {
     detail?: string;
     force: boolean;
   } | null>(null);
+  const [rechecking, setRechecking] = useState(false);
   const [skillSetup, setSkillSetup] = useState<{
     plugin: PluginSummary;
     steps: SkillSetupStep[];
@@ -261,6 +262,7 @@ export function MarketplacePage() {
   const observedCatalogRevision = useRef(launcher.marketCatalogRevision);
   const catalogToken = useRef(0);
   const pendingToken = useRef(0);
+  const recheckToken = useRef(0);
   const pageMounted = useRef(true);
 
   const translate = useCallback<Translate>(
@@ -624,6 +626,40 @@ export function MarketplacePage() {
       detail: marketConflictDetail(error),
       force: true,
     });
+  }
+
+  // Re-resolve the review inside the open dialog. A metadata lookup can fail
+  // on a flaky connection; without this the disabled confirm button is a dead
+  // end and the only way forward is closing and reopening the dialog. The
+  // token drops a late result so a cancelled dialog never reopens itself.
+  function recheckInstall(plugin: PluginSummary) {
+    const token = ++recheckToken.current;
+    setRechecking(true);
+    setBusyPlugin(plugin.id);
+    marketApi
+      .inspect(plugin.id)
+      .then((inspected) => {
+        if (token !== recheckToken.current) return;
+        setConflict({
+          plugin: inspected,
+          force: installReviewState(inspected) === "warning",
+        });
+        setRechecking(false);
+        setBusyPlugin(null);
+      })
+      .catch((error: unknown) => {
+        if (token !== recheckToken.current) return;
+        showTimedError(error, translate);
+        setRechecking(false);
+        setBusyPlugin(null);
+      });
+  }
+
+  function closeConflict() {
+    recheckToken.current += 1;
+    setRechecking(false);
+    setBusyPlugin(null);
+    setConflict(null);
   }
 
   function install(plugin: PluginSummary, force = false) {
@@ -1061,8 +1097,10 @@ export function MarketplacePage() {
           detail={conflict.detail}
           risky={conflict.force}
           disabled={launcher.marketBusy || busyPlugin !== null}
-          onCancel={() => {
-            setConflict(null);
+          retrying={rechecking}
+          onCancel={closeConflict}
+          onRetry={() => {
+            recheckInstall(conflict.plugin);
           }}
           onConfirm={() => {
             const { plugin, force } = conflict;

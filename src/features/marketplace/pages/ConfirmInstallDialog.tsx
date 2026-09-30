@@ -26,14 +26,18 @@ export function ConfirmInstallDialog({
   detail,
   risky = false,
   disabled = false,
+  retrying = false,
   onCancel,
+  onRetry,
   onConfirm,
 }: {
   plugin: PluginSummary;
   detail?: string;
   risky?: boolean;
   disabled?: boolean;
+  retrying?: boolean;
   onCancel: () => void;
+  onRetry?: () => void;
   onConfirm: () => void;
 }) {
   const language = useLauncherSelector((snapshot) => snapshot.language);
@@ -161,6 +165,20 @@ export function ConfirmInstallDialog({
           <SkillSetupGuidance plugin={plugin} context="beforeInstall" />
         )}
         <footer className="market-dialog-actions">
+          {onRetry !== undefined && (
+            <button
+              className="outline-button"
+              type="button"
+              disabled={retrying || submitting}
+              onClick={onRetry}
+            >
+              {t(
+                retrying
+                  ? "market.install.rechecking"
+                  : "market.install.recheck",
+              )}
+            </button>
+          )}
           <button
             ref={cancelButton}
             className="outline-button"

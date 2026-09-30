@@ -339,6 +339,8 @@
   "market.compat.notChecked": "Not checked",
   "market.confirm.compatibility": "This plugin has not been confirmed compatible or is known to be incompatible. It may prevent Harness from starting; unverified plugin changes can be rolled back if startup fails.",
   "market.install.unresolved": "Safe, complete installation details could not be confirmed. Check the source details below; retry later only if this is a temporary network problem.",
+  "market.install.recheck": "Check again",
+  "market.install.rechecking": "Checking…",
   "market.confirm.detail": "The plugin has source or compatibility warnings. Review the details below and continue only if you accept the risks.",
   "market.confirm.installAnyway": "I understand the risks, install anyway",
   "market.install.title": "Install {{plugin}}?",

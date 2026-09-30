@@ -339,6 +339,8 @@
   "market.compat.notChecked": "未检测",
   "market.confirm.compatibility": "该插件的兼容性尚未确认或已知不兼容，可能导致 Harness 无法正常启动；失败时可回滚未验证的插件变更。",
   "market.install.unresolved": "无法确认安全、完整的安装信息。请检查下方来源详情；若为临时网络问题，可稍后重试。",
+  "market.install.recheck": "重新校验",
+  "market.install.rechecking": "校验中…",
   "market.confirm.detail": "该插件存在来源或兼容性提醒。请核对下方具体信息，接受风险后可继续安装。",
   "market.confirm.installAnyway": "我了解风险，仍然安装",
   "market.install.title": "安装插件 {{plugin}}？",

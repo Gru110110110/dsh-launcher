@@ -61,7 +61,17 @@ const MARKET_TRUST_ANCHOR: &str = "298e815d77412ea57eeb0ecc56fa2b4e4683d194";
 const MARKET_PUBLIC_BASE: &str = "https://market.dsdesktop.com/v1";
 const MARKET_PUBLIC_REPOSITORY: &str = MARKET_REPOSITORY;
 const MARKET_MANIFEST_MAX_BYTES: usize = 64 * 1024;
-const NPM_REGISTRY: &str = "https://registry.npmjs.org";
+/// Packuments are large (hundreds of KiB) and slower than a manifest, so a
+/// metadata lookup gets a wider per-registry budget than a plain fetch. A
+/// single attempt against a single hardcoded registry used to turn one flaky
+/// body read into "this plugin cannot be installed".
+const PACKUMENT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Overall budget for one package's metadata across every registry. Without a
+/// ceiling, a blackholed network would multiply the per-source timeout by the
+/// registry count and stall the page's compatibility pass and the confirmation
+/// dialog for minutes. Each attempt gets the smaller of the two.
+const PACKUMENT_LOOKUP_BUDGET: Duration = Duration::from_secs(30);
+const PACKUMENT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const GITHUB_API: &str = "https://api.github.com";
 const DEFAULT_PROFILE: &str = "web";
 const PNPM_VERSION: &str = "10.12.3";
@@ -79,8 +89,13 @@ const MAX_COMPATIBILITY_BATCH: usize = 100;
 /// compatibility requests and rapid filter changes must not re-walk the
 /// filesystem on every call. Mutations invalidate the cache immediately.
 const INSTALLED_CACHE_TTL: Duration = Duration::from_secs(2);
-const COMPAT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-const COMPAT_UNKNOWN_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// How long a live metadata check is trusted for a package that resolved to an
+/// exact version: `pnpm` installs `name@version`, so the review stays valid.
+/// A resolution that failed to produce a version is retried sooner, and the
+/// same window lets the last verified resolution stand in for one failed
+/// lookup instead of turning a flaky network into a permanent dead end.
+const COMPAT_RESOLVED_TTL: Duration = Duration::from_secs(10 * 60);
+const COMPAT_UNRESOLVED_TTL: Duration = Duration::from_secs(5 * 60);
 /// Uninstalled skills stay recoverable in the trash for 30 days.
 const TRASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CORRUPT_PENDING_RETENTION: usize = 5;
@@ -653,15 +668,68 @@ fn cached_compatibility_is_valid(
     cordis_version: Option<&str>,
     now_ms: u64,
 ) -> bool {
-    let ttl = if cached.info.status == CompatibilityStatus::Unknown {
-        COMPAT_UNKNOWN_CACHE_TTL
+    let ttl = if cached_compatibility_is_resolved(cached) {
+        COMPAT_RESOLVED_TTL
     } else {
-        COMPAT_CACHE_TTL
+        COMPAT_UNRESOLVED_TTL
     };
     cached.package_name == package_name
         && package_version.is_none_or(|version| cached.package_version.as_deref() == Some(version))
         && cached.cordis_version.as_deref() == cordis_version
         && now_ms.saturating_sub(cached.checked_at_ms) < ttl.as_millis() as u64
+}
+
+/// Whether an entry resolved an exact, installable package set. Only such an
+/// entry may stand in for a failed live lookup: it carries the version and the
+/// source binding the user reviewed, while an unresolved entry carries none.
+fn cached_compatibility_is_resolved(cached: &CachedCompatibility) -> bool {
+    cached.package_version.is_some() && !cached.resolved_packages.is_empty()
+}
+
+/// Whether a recently verified entry may replace a failed lookup result.
+///
+/// The failed lookup must be unresolved, describe the same installation plan
+/// and runtime, and have a complete predecessor inside the freshness window.
+/// Anything else keeps the failure, so the UI can tell the user to retry.
+fn last_good_can_cover(
+    existing: &CachedCompatibility,
+    incoming: &CachedCompatibility,
+    now_ms: u64,
+) -> bool {
+    incoming.package_version.is_none()
+        && cached_compatibility_is_resolved(existing)
+        && existing.package_name == incoming.package_name
+        && existing.cordis_version == incoming.cordis_version
+        && now_ms.saturating_sub(existing.checked_at_ms) < COMPAT_RESOLVED_TTL.as_millis() as u64
+}
+
+/// Applies a batch of concurrently fetched entries under one lock, returning
+/// whether the cache changed.
+///
+/// The batch is planned from a snapshot taken before its fetches start, so a
+/// live resolution can land while they are in flight. Overwriting it with the
+/// batch's own failure would recreate the exact symptom this cache protects
+/// against: the user reviews live metadata and then cannot install.
+fn merge_fetched_compatibility(
+    cache: &mut HashMap<String, CachedCompatibility>,
+    fetched: Vec<(String, CachedCompatibility)>,
+    now_ms: u64,
+) -> bool {
+    let mut changed = false;
+    for (plugin_id, entry) in fetched {
+        if cache
+            .get(&plugin_id)
+            .is_some_and(|existing| last_good_can_cover(existing, &entry, now_ms))
+        {
+            log::info!(
+                "marketplace: keeping the last verified metadata for {plugin_id} after a failed batch lookup"
+            );
+            continue;
+        }
+        cache.insert(plugin_id, entry);
+        changed = true;
+    }
+    changed
 }
 
 impl Marketplace {
@@ -1737,15 +1805,12 @@ impl Marketplace {
             }
         }
         let entry = fetch_compatibility_entry_with(plugin, &self.paths, None);
-        let info = entry.info.clone();
-        self.store_compatibility(&plugin.id, entry);
-        info
+        self.store_compatibility(&plugin.id, entry).info
     }
 
     fn refresh_compatibility(&self, plugin: &MarketPlugin) -> CachedCompatibility {
         let entry = fetch_compatibility_entry_with(plugin, &self.paths, None);
-        self.store_compatibility(&plugin.id, entry.clone());
-        entry
+        self.store_compatibility(&plugin.id, entry)
     }
 
     /// Fill compatibility entries for one result page without serial network
@@ -1783,26 +1848,49 @@ impl Marketplace {
             return;
         }
         let mut cache = self.compat_cache.lock().expect("compat poisoned");
-        cache.extend(fetched);
-        let snapshot = cache.clone();
+        let changed = merge_fetched_compatibility(&mut cache, fetched, now_ms());
+        let snapshot = changed.then(|| cache.clone());
         drop(cache);
-        if let Ok(bytes) = serde_json::to_vec(&snapshot)
+        if let Some(snapshot) = snapshot
+            && let Ok(bytes) = serde_json::to_vec(&snapshot)
             && fs::create_dir_all(self.catalog_dir()).is_ok()
         {
             let _ = crate::paths::atomic_write(&self.compat_file(), &bytes);
         }
     }
 
-    fn store_compatibility(&self, plugin_id: &str, info: CachedCompatibility) {
+    /// Records a live lookup result and returns the entry that is authoritative
+    /// from now on. A failed lookup must not evict a resolution verified within
+    /// the freshness window: the plugin card already showed that version and
+    /// source binding as installable, so discarding it would leave the badge
+    /// claiming compatibility while the confirmation dialog blocks installation.
+    fn store_compatibility(
+        &self,
+        plugin_id: &str,
+        info: CachedCompatibility,
+    ) -> CachedCompatibility {
         let mut cache = self.compat_cache.lock().expect("compat poisoned");
-        cache.insert(plugin_id.into(), info);
-        let snapshot = cache.clone();
+        let (effective, changed) = match cache.get(plugin_id) {
+            Some(existing) if last_good_can_cover(existing, &info, now_ms()) => {
+                log::info!(
+                    "marketplace: keeping the last verified metadata for {plugin_id} after a failed lookup"
+                );
+                (existing.clone(), false)
+            }
+            _ => {
+                cache.insert(plugin_id.into(), info.clone());
+                (info, true)
+            }
+        };
+        let snapshot = changed.then(|| cache.clone());
         drop(cache);
-        if let Ok(bytes) = serde_json::to_vec(&snapshot)
+        if let Some(snapshot) = snapshot
+            && let Ok(bytes) = serde_json::to_vec(&snapshot)
             && fs::create_dir_all(self.catalog_dir()).is_ok()
         {
             let _ = crate::paths::atomic_write(&self.compat_file(), &bytes);
         }
+        effective
     }
 
     // -- installation -------------------------------------------------------
@@ -4815,8 +4903,7 @@ fn fetch_bytes_with(
         .timeout(timeout)
         .send()
         .map_err(|error| {
-            AppError::new("marketNetworkFailed")
-                .detail(crate::network::sanitize_detail(&error.to_string()))
+            AppError::new("marketNetworkFailed").detail(crate::network::error_chain_detail(&error))
         })?
         .error_for_status()
         .map_err(|error| {
@@ -4825,7 +4912,7 @@ fn fetch_bytes_with(
             } else {
                 "marketNetworkFailed"
             };
-            AppError::new(status_code).detail(crate::network::sanitize_detail(&error.to_string()))
+            AppError::new(status_code).detail(crate::network::error_chain_detail(&error))
         })?;
     if let Some(length) = response.content_length()
         && usize::try_from(length).unwrap_or(usize::MAX) > max_bytes
@@ -4834,13 +4921,14 @@ fn fetch_bytes_with(
     }
     // Stream with a hard cap: buffering the whole body first (`bytes()`)
     // would let a chunked response balloon memory before the limit check.
+    // A body that ends early (reset tunnel, truncated proxy response) fails
+    // here rather than at `send`, so this is where the cause chain matters.
     let mut bytes = Vec::new();
     response
         .take((max_bytes + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| {
-            AppError::new("marketNetworkFailed")
-                .detail(crate::network::sanitize_detail(&error.to_string()))
+            AppError::new("marketNetworkFailed").detail(crate::network::error_chain_detail(&error))
         })?;
     if bytes.len() > max_bytes {
         return Err(AppError::new(code).detail(format!("{subject} exceeds the size limit")));
@@ -5209,7 +5297,7 @@ fn fetch_package_compatibility(
             client,
         );
     }
-    let registry = fetch_registry_package_info_with(package_name, client);
+    let registry = fetch_registry_package_info_with(package_name, paths, client);
     let expected_repository = if matches!(
         package_name,
         "@deepseek-ai/dsh-base" | "@deepseek-ai/dsh-web-app"
@@ -5459,18 +5547,31 @@ fn validate_install_metadata(
     }
 }
 
+/// A confirmed review may only be reused when the live resolution either
+/// matches it exactly or fails to resolve anything at all.
+///
+/// "Nothing resolved" is a network/retry condition, not a change: reporting
+/// `marketPackageChanged` there would tell the user their confirmed details
+/// changed when no version was even read, and the confirmation dialog cannot
+/// resolve a change it cannot see.
 fn validate_expected_package_version(
     plugin_name: &str,
     expected: Option<&str>,
     resolved: Option<&str>,
 ) -> AppResult<()> {
-    if let Some(expected) = expected
-        && resolved != Some(expected)
-    {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let Some(resolved) = resolved else {
+        return Err(AppError::new("marketInstallMetadataUnavailable")
+            .value("plugin", plugin_name)
+            .detail("package versions could not be resolved; retry before installing"));
+    };
+    if resolved != expected {
         return Err(AppError::new("marketPackageChanged")
             .value("plugin", plugin_name)
             .value("expected", expected)
-            .value("actual", resolved.unwrap_or("unavailable"))
+            .value("actual", resolved)
             .detail("installation details changed after confirmation"));
     }
     Ok(())
@@ -5523,23 +5624,134 @@ fn installed_cordis_version(paths: &ApplicationPaths) -> Option<String> {
     None
 }
 
+/// Resolve a package's registry metadata, trying every configured registry in
+/// order until one answers with usable metadata.
+///
+/// The marketplace used to query one hardcoded registry. That made the whole
+/// install path depend on a single host and a single attempt: one truncated
+/// body ("request or response body error") left the plugin permanently
+/// uninstallable even though `pnpm` could reach the package. The registry list
+/// mirrors the runtime installer's — the app's own last verified registry
+/// first, then the documented sources — so metadata resolution degrades the
+/// same way a Harness install does.
 fn fetch_registry_package_info_with(
     pkg: &str,
+    paths: &ApplicationPaths,
     client: Option<&reqwest::blocking::Client>,
 ) -> AppResult<RegistryPackageInfo> {
     let encoded = pkg.replace('/', "%2F");
-    let url = format!("{NPM_REGISTRY}/{encoded}");
-    let bytes = fetch_bytes_with(
-        client,
-        &url,
-        REGISTRY_TIMEOUT,
-        8 * 1024 * 1024,
-        "marketSourceUnavailable",
-        "registry response",
-    )?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|error| AppError::new("marketSourceMetadataInvalid").detail(error.to_string()))?;
-    registry_package_info(&value)
+    let registries = marketplace_registries(paths);
+    let mut failures = Vec::new();
+    let started = Instant::now();
+    for registry in registries {
+        let remaining = PACKUMENT_LOOKUP_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            failures.push("registry lookup budget exhausted".to_owned());
+            break;
+        }
+        let url = format!("{registry}/{encoded}");
+        let bytes = match fetch_bytes_with(
+            client,
+            &url,
+            remaining.min(PACKUMENT_TIMEOUT),
+            PACKUMENT_MAX_BYTES,
+            "marketSourceUnavailable",
+            "registry response",
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                failures.push(format!(
+                    "{}: {}",
+                    registry_label(&registry),
+                    error.safe_detail.unwrap_or(error.code)
+                ));
+                continue;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                failures.push(format!(
+                    "{}: invalid registry response: {error}",
+                    registry_label(&registry)
+                ));
+                continue;
+            }
+        };
+        match registry_package_info(&value) {
+            Ok(info) => return Ok(info),
+            Err(error) => failures.push(format!(
+                "{}: {}",
+                registry_label(&registry),
+                error.safe_detail.unwrap_or(error.code)
+            )),
+        }
+    }
+    Err(
+        AppError::new("marketSourceUnavailable").detail(if failures.is_empty() {
+            "no npm registry is configured".to_owned()
+        } else {
+            failures.join("; ")
+        }),
+    )
+}
+
+/// Registries the marketplace may query, most preferred first: an explicit
+/// environment override, then the registry that already served this
+/// installation's Harness runtime, then the documented sources. Candidates are
+/// normalized and validated so nothing but a plain HTTPS (or loopback) origin
+/// can be contacted.
+fn marketplace_registries(paths: &ApplicationPaths) -> Vec<String> {
+    let preferred = fs::read_to_string(paths.cache_dir.join("npm.registry")).ok();
+    marketplace_registry_sources(
+        crate::runtime::npm_registry_override().unwrap_or_default(),
+        preferred.as_deref(),
+    )
+}
+
+/// Assembles the candidate list from its two inputs so ordering, de-duplication
+/// and validation stay testable without touching the process environment.
+fn marketplace_registry_sources(
+    override_list: Vec<String>,
+    preferred: Option<&str>,
+) -> Vec<String> {
+    let mut raw = override_list;
+    if let Some(preferred) = preferred {
+        raw.push(preferred.trim().to_owned());
+    }
+    raw.extend(
+        crate::runtime::NPM_REGISTRIES
+            .iter()
+            .map(ToString::to_string),
+    );
+    normalize_registry_candidates(raw)
+}
+
+/// Drops empty, duplicate, and non-HTTPS candidates while preserving order, so
+/// a hostile or mistyped entry can neither be contacted nor reorder the list.
+fn normalize_registry_candidates(raw: Vec<String>) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for item in raw {
+        let trimmed = item.trim().trim_end_matches('/');
+        if trimmed.is_empty() || candidates.iter().any(|kept| kept == trimmed) {
+            continue;
+        }
+        if crate::runtime::validate_network_source(trimmed).is_err() {
+            log::warn!("skipping invalid npm registry source: {trimmed}");
+            continue;
+        }
+        candidates.push(trimmed.to_owned());
+    }
+    candidates
+}
+
+/// Host-only label for a registry, so failure details name the source without
+/// repeating a full URL in a bounded diagnostic.
+fn registry_label(registry: &str) -> String {
+    url::Url::parse(registry)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| registry.to_owned())
 }
 
 fn fetch_github_package_info_with(
@@ -8160,7 +8372,7 @@ if (root / 'fail').exists(): sys.exit(7)
     #[test]
     fn compatibility_cache_expires_and_is_bound_to_runtime_and_package() {
         let cached = CachedCompatibility {
-            resolved_packages: Vec::new(),
+            resolved_packages: vec!["alpha@1.0.0".into()],
             package_name: "alpha".into(),
             package_version: Some("1.0.0".into()),
             install_spec: Some("alpha@1.0.0".into()),
@@ -8199,7 +8411,26 @@ if (root / 'fail').exists(): sys.exit(7)
             "alpha",
             Some("1.0.0"),
             Some("1.2.3"),
-            1_000 + COMPAT_CACHE_TTL.as_millis() as u64
+            1_000 + COMPAT_RESOLVED_TTL.as_millis() as u64
+        ));
+        let unresolved = CachedCompatibility {
+            resolved_packages: Vec::new(),
+            package_version: None,
+            ..cached.clone()
+        };
+        assert!(cached_compatibility_is_valid(
+            &unresolved,
+            "alpha",
+            None,
+            Some("1.2.3"),
+            1_000 + COMPAT_UNRESOLVED_TTL.as_millis() as u64 - 1
+        ));
+        assert!(!cached_compatibility_is_valid(
+            &unresolved,
+            "alpha",
+            None,
+            Some("1.2.3"),
+            1_000 + COMPAT_UNRESOLVED_TTL.as_millis() as u64
         ));
         assert!(!cached_compatibility_is_valid(
             &cached,
@@ -8211,6 +8442,51 @@ if (root / 'fail').exists(): sys.exit(7)
     }
 
     #[test]
+    #[ignore = "requires live npm registry access"]
+    fn live_registry_lookup_falls_back_when_the_preferred_source_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        fs::create_dir_all(&paths.cache_dir).expect("cache dir");
+        // The registry recorded for this installation is unreachable here, and
+        // no environment override is set: resolution must move on to the
+        // documented sources instead of failing the whole install review.
+        fs::write(
+            paths.cache_dir.join("npm.registry"),
+            "https://127.0.0.1:9/\n",
+        )
+        .expect("preferred registry");
+        let info = fetch_registry_package_info_with("dsh-better-sidebar", &paths, None)
+            .expect("a dead preferred registry must not block resolution");
+        assert!(
+            semver::Version::parse(&info.latest_version).is_ok(),
+            "{}",
+            info.latest_version
+        );
+        assert!(info.repository_declared);
+
+        // The registry recorded after a verified Harness deployment is
+        // preferred: the metadata then comes from that mirror and still binds
+        // the catalog repository, so the card and the dialog agree.
+        fs::write(
+            paths.cache_dir.join("npm.registry"),
+            "https://registry.npmmirror.com/\n",
+        )
+        .expect("preferred registry");
+        let info = fetch_registry_package_info_with("dsh-better-sidebar", &paths, None)
+            .expect("the preferred registry answers");
+        // Only the stable identity is asserted: upstream may republish the
+        // package with a different peer range at any time.
+        assert_eq!(
+            info.repository_id.as_deref().map(str::to_ascii_lowercase),
+            Some("omdsh-dev/dsh-better-sidebar".to_owned())
+        );
+        assert!(semver::Version::parse(&info.latest_version).is_ok());
+        if let Some(range) = info.cordis_range.as_deref() {
+            assert!(semver::VersionReq::parse(range).is_ok(), "{range}");
+        }
+    }
+
+    #[test]
     fn confirmed_package_version_must_match_the_install_resolution() {
         validate_expected_package_version("alpha", Some("1.0.0"), Some("1.0.0"))
             .expect("same version");
@@ -8218,6 +8494,229 @@ if (root / 'fail').exists(): sys.exit(7)
             .expect_err("changed dist tag must require a new confirmation");
         assert_eq!(changed.code, "marketPackageChanged");
         assert!(validate_expected_package_version("alpha", None, Some("1.1.0")).is_ok());
+        // A live lookup that resolved nothing did not change the details; the
+        // user must be told to retry, not that their review went stale.
+        let unresolved = validate_expected_package_version("alpha", Some("1.0.0"), None)
+            .expect_err("an unresolved lookup must not install");
+        assert_eq!(unresolved.code, "marketInstallMetadataUnavailable");
+    }
+
+    fn resolved_compat_entry(name: &str, checked_at_ms: u64) -> CachedCompatibility {
+        CachedCompatibility {
+            package_name: format!("v2:web:{name}"),
+            // Distinct per plugin so a cross-entry contamination cannot pass.
+            package_version: Some(format!("plan-v2:{name}")),
+            cordis_version: Some("4.0.4".into()),
+            checked_at_ms,
+            info: CompatibilityInfo {
+                status: CompatibilityStatus::Compatible,
+                detail: None,
+            },
+            source_binding: SourceBindingStatus::Verified,
+            source_binding_detail: None,
+            install_spec: None,
+            resolved_packages: vec![format!("{name}@1.2.3")],
+        }
+    }
+
+    fn unresolved_compat_entry(name: &str, checked_at_ms: u64) -> CachedCompatibility {
+        CachedCompatibility {
+            package_name: format!("v2:web:{name}"),
+            package_version: None,
+            cordis_version: Some("4.0.4".into()),
+            checked_at_ms,
+            info: CompatibilityInfo {
+                status: CompatibilityStatus::Unknown,
+                detail: Some("registry metadata unavailable".into()),
+            },
+            source_binding: SourceBindingStatus::Unknown,
+            source_binding_detail: Some("alpha: request or response body error".into()),
+            install_spec: None,
+            resolved_packages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failed_metadata_lookup_keeps_the_last_verified_resolution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        let marketplace = Marketplace::new(paths);
+        let verified = resolved_compat_entry("alpha", now_ms() - 60_000);
+        let stored = marketplace.store_compatibility("owner/alpha", verified.clone());
+        assert_eq!(stored.package_version, verified.package_version);
+
+        // One flaky body read must not turn a plugin that was installable a
+        // minute ago into "safe installation details could not be confirmed".
+        let effective = marketplace
+            .store_compatibility("owner/alpha", unresolved_compat_entry("alpha", now_ms()));
+        assert_eq!(effective.package_version, verified.package_version);
+        assert!(cached_compatibility_is_resolved(&effective));
+        // The specs pnpm is handed come from the preserved entry, not from the
+        // failure that arrived after it.
+        assert_eq!(effective.resolved_packages, vec!["alpha@1.2.3".to_owned()]);
+        assert_eq!(
+            marketplace
+                .compat_cache
+                .lock()
+                .expect("compat")
+                .get("owner/alpha")
+                .and_then(|entry| entry.package_version.clone()),
+            verified.package_version
+        );
+
+        // A different installation plan, a different runtime, an unresolved
+        // predecessor, or a resolution outside the trust window all give up the
+        // fallback and keep the failure so the UI can ask for a retry.
+        let replaced = marketplace.store_compatibility(
+            "owner/alpha",
+            CachedCompatibility {
+                package_name: "v2:web:renamed".into(),
+                ..unresolved_compat_entry("alpha", now_ms())
+            },
+        );
+        assert!(replaced.package_version.is_none());
+
+        marketplace.store_compatibility(
+            "owner/beta",
+            resolved_compat_entry("beta", now_ms() - 1_000),
+        );
+        let other_runtime = marketplace.store_compatibility(
+            "owner/beta",
+            CachedCompatibility {
+                cordis_version: Some("5.0.0".into()),
+                ..unresolved_compat_entry("beta", now_ms())
+            },
+        );
+        assert!(other_runtime.package_version.is_none());
+
+        let expired = now_ms() - COMPAT_RESOLVED_TTL.as_millis() as u64 - 1;
+        marketplace.store_compatibility("owner/gamma", resolved_compat_entry("gamma", expired));
+        let stale = marketplace
+            .store_compatibility("owner/gamma", unresolved_compat_entry("gamma", now_ms()));
+        assert!(stale.package_version.is_none());
+
+        marketplace.store_compatibility(
+            "owner/delta",
+            unresolved_compat_entry("delta", now_ms() - 1_000),
+        );
+        let still_unresolved = marketplace
+            .store_compatibility("owner/delta", unresolved_compat_entry("delta", now_ms()));
+        assert!(still_unresolved.package_version.is_none());
+    }
+
+    #[test]
+    fn batch_merge_keeps_a_resolution_that_landed_during_the_fetch() {
+        // The compatibility batch plans its work from a snapshot and fetches
+        // concurrently, so a live `inspect` resolution can land while those
+        // fetches are still in flight. Applying the batch must not discard it.
+        let mut cache = HashMap::new();
+        let expected = resolved_compat_entry("alpha", now_ms() - 500);
+        cache.insert("owner/alpha".to_owned(), expected.clone());
+
+        let changed = merge_fetched_compatibility(
+            &mut cache,
+            vec![(
+                "owner/alpha".to_owned(),
+                unresolved_compat_entry("alpha", now_ms()),
+            )],
+            now_ms(),
+        );
+        assert!(!changed, "a covered failure must not rewrite the cache");
+        assert_eq!(
+            cache.get("owner/alpha").map(|entry| &entry.package_version),
+            Some(&expected.package_version)
+        );
+
+        // Unrelated plugins from the same batch still land, and a genuinely
+        // newer resolution replaces the old one.
+        let changed = merge_fetched_compatibility(
+            &mut cache,
+            vec![
+                (
+                    "owner/beta".to_owned(),
+                    unresolved_compat_entry("beta", now_ms()),
+                ),
+                (
+                    "owner/alpha".to_owned(),
+                    CachedCompatibility {
+                        package_version: Some("plan-v2:newer".into()),
+                        checked_at_ms: now_ms(),
+                        ..resolved_compat_entry("alpha", now_ms())
+                    },
+                ),
+            ],
+            now_ms(),
+        );
+        assert!(changed);
+        assert!(cache.contains_key("owner/beta"));
+        assert_eq!(
+            cache
+                .get("owner/alpha")
+                .and_then(|entry| entry.package_version.as_deref()),
+            Some("plan-v2:newer")
+        );
+    }
+
+    #[test]
+    fn marketplace_registries_prefer_configured_sources_and_reject_invalid_ones() {
+        // Assembled from explicit inputs: reading the process environment here
+        // would make the expectation depend on how the test run was launched.
+        let candidates =
+            marketplace_registry_sources(Vec::new(), Some("https://registry.example.com/\n"));
+        // The registry that already served this installation leads, followed by
+        // the documented sources.
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("https://registry.example.com")
+        );
+        assert_eq!(
+            candidates.get(1).map(String::as_str),
+            Some("https://registry.npmjs.org")
+        );
+        let unique: HashSet<&String> = candidates.iter().collect();
+        assert_eq!(unique.len(), candidates.len(), "{candidates:?}");
+
+        // An explicit override leads the recorded registry but still leaves the
+        // documented sources available as a fallback.
+        let overridden = marketplace_registry_sources(
+            vec!["https://override.example.com".into()],
+            Some("https://registry.example.com"),
+        );
+        assert_eq!(
+            overridden.first().map(String::as_str),
+            Some("https://override.example.com")
+        );
+        assert_eq!(
+            overridden.get(1).map(String::as_str),
+            Some("https://registry.example.com")
+        );
+
+        assert_eq!(
+            normalize_registry_candidates(vec![
+                " https://registry.example.com/ ".into(),
+                "https://registry.example.com".into(),
+                String::new(),
+                "http://insecure.example.com".into(),
+                "https://user:pw@registry.example.com".into(),
+                "https://registry.npmmirror.com".into(),
+            ]),
+            vec![
+                "https://registry.example.com".to_owned(),
+                "https://registry.npmmirror.com".to_owned(),
+            ]
+        );
+
+        // The file-backed entry point still resolves the recorded registry.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = ApplicationPaths::from_home(temp.path().join("home"));
+        fs::create_dir_all(&paths.cache_dir).expect("cache dir");
+        fs::write(
+            paths.cache_dir.join("npm.registry"),
+            "https://registry.example.com/\n",
+        )
+        .expect("preferred registry");
+        let recorded = marketplace_registries(&paths);
+        assert!(recorded.contains(&"https://registry.example.com".to_owned()));
     }
 
     #[test]
