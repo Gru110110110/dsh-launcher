@@ -56,7 +56,7 @@ Settings keeps language, light/dark/system theme, the optional balance card, pro
 - Exact `@deepseek-ai/dsh` installation through the configured npm registries
 - A stable terminal `dsh` command backed by the launcher's private runtime
 - Browser selection, system tray lifecycle, English/Simplified Chinese, and light/dark/system themes
-- Plugin marketplace backed by the validated [dsh-market](https://github.com/2BingLing/dsh-market) snapshot
+- Plugin marketplace backed by the validated [dsh-market](https://github.com/2BingLing/dsh-market) snapshot; failed refreshes preserve the last verified catalog
 - Separate Harness updates and cryptographically signed desktop updates, with Default and Alpha Harness update channels and an explicit rollback action when the retained previous runtime is available
 - Remote access with QR codes, rotatable passwords, and an optional Cloudflare quick tunnel
 - A bilingual, catalog-driven desktop pet with five live Harness states and a transparent draggable window

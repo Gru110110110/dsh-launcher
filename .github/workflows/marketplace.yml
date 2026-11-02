@@ -67,6 +67,8 @@ jobs:
             echo "Unable to read the current publication; use the bootstrap input only for an empty bucket" >&2
             exit 1
           fi
+      - name: Test catalog history verification
+        run: cargo test --locked -p dsh-core --lib catalog_lineage
       - name: Prepare trusted publication
         id: prepare
         env:

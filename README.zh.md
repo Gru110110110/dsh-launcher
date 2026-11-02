@@ -56,7 +56,7 @@
 - 通过配置的 npm registry 精确安装 `@deepseek-ai/dsh`
 - 由启动器私有运行环境提供的稳定终端 `dsh` 命令
 - 浏览器选择、系统托盘生命周期、中英双语、浅色/深色/跟随系统主题
-- 基于校验过的 [dsh-market](https://github.com/2BingLing/dsh-market) 快照的插件市场
+- 基于校验过的 [dsh-market](https://github.com/2BingLing/dsh-market) 快照的插件市场，刷新失败时保留最后一次验证成功的目录
 - Harness 更新与带密码学签名的桌面应用更新相互独立，可选择默认或 Alpha 更新通道；保留上一版运行时时会提供明确的回滚操作
 - 带二维码、可轮换密码和可选 Cloudflare 快速隧道的远程访问
 - 目录配置驱动、中英双语、可跟随 Harness 五态变化的桌面宠物

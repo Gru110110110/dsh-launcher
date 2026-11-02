@@ -43,6 +43,7 @@ use crate::{
 
 mod activation;
 pub use activation::MarketService;
+mod lineage;
 mod receipts;
 #[cfg(test)]
 mod review_tests;
@@ -4955,21 +4956,7 @@ fn fetch_trusted_catalog_with(
         .filter(|sha| valid_commit_sha(sha))
         .ok_or_else(|| AppError::new("marketCatalogInvalid").detail("catalog commit is invalid"))?;
 
-    if head != MARKET_TRUST_ANCHOR {
-        let compare_url = format!(
-            "{GITHUB_API}/repos/{MARKET_REPOSITORY}/compare/{MARKET_TRUST_ANCHOR}...{head}"
-        );
-        let compare_bytes = fetch_bytes_with(
-            Some(client),
-            &compare_url,
-            REGISTRY_TIMEOUT,
-            16 * 1024 * 1024,
-            "marketCatalogInvalid",
-            "catalog history verification",
-        )?;
-        let compare: serde_json::Value = serde_json::from_slice(&compare_bytes)?;
-        validate_catalog_lineage(head, &compare)?;
-    }
+    lineage::verify_catalog_lineage(head)?;
 
     let catalog_url =
         format!("https://raw.githubusercontent.com/{MARKET_REPOSITORY}/{head}/data/plugins.json");
@@ -5047,26 +5034,6 @@ fn build_marketplace_publication(
         },
         catalog: published_catalog,
     }))
-}
-
-fn validate_catalog_lineage(_head: &str, compare: &serde_json::Value) -> AppResult<()> {
-    let status = compare.get("status").and_then(|value| value.as_str());
-    let base = compare
-        .get("base_commit")
-        .and_then(|value| value.get("sha"))
-        .and_then(|value| value.as_str());
-    let merge_base = compare
-        .get("merge_base_commit")
-        .and_then(|value| value.get("sha"))
-        .and_then(|value| value.as_str());
-    if status != Some("ahead")
-        || base != Some(MARKET_TRUST_ANCHOR)
-        || merge_base != Some(MARKET_TRUST_ANCHOR)
-    {
-        return Err(AppError::new("marketCatalogInvalid")
-            .detail("catalog branch no longer descends from the trusted release anchor"));
-    }
-    Ok(())
 }
 
 fn valid_commit_sha(value: &str) -> bool {
@@ -9402,25 +9369,6 @@ if (root / 'fail').exists(): sys.exit(7)
             registry_package_info(&invalid).unwrap_err().code,
             "marketSourceMetadataInvalid"
         );
-    }
-
-    #[test]
-    fn catalog_lineage_requires_the_embedded_anchor_as_merge_base() {
-        let head = "1111111111111111111111111111111111111111";
-        let valid = serde_json::json!({
-            "status": "ahead",
-            "base_commit": { "sha": MARKET_TRUST_ANCHOR },
-            "merge_base_commit": { "sha": MARKET_TRUST_ANCHOR },
-            "total_commits": 500
-        });
-        validate_catalog_lineage(head, &valid).expect("trusted descendant");
-        let diverged = serde_json::json!({
-            "status": "diverged",
-            "base_commit": { "sha": MARKET_TRUST_ANCHOR },
-            "merge_base_commit": { "sha": MARKET_TRUST_ANCHOR },
-            "total_commits": 1
-        });
-        assert!(validate_catalog_lineage(head, &diverged).is_err());
     }
 
     #[test]
