@@ -608,7 +608,7 @@ impl AppState {
             {
                 let plugins = self.marketplace.pending_web_change_summary();
                 log::error!(
-                    "Harness did not publish an address with an unverified marketplace batch; rolling back: {error}"
+                    "Harness did not serve a working Web page with an unverified marketplace batch; rolling back: {error}"
                 );
                 if let Err(stop_error) = self.server.lock().expect("server poisoned").stop() {
                     self.fail(stop_error.clone());
@@ -1209,7 +1209,7 @@ impl AppState {
             {
                 let plugins = self.marketplace.pending_web_change_summary();
                 log::error!(
-                    "Harness did not publish an address with an unverified marketplace batch; rolling back: {error}"
+                    "Harness did not serve a working Web page with an unverified marketplace batch; rolling back: {error}"
                 );
                 if let Err(rollback_error) = self.marketplace.rollback_web_pending_while_guarded() {
                     self.fail_unless_quitting(rollback_error);
@@ -1262,7 +1262,7 @@ impl AppState {
     /// If startup output names an installed third-party profile package as
     /// incompatible, uninstall it through the marketplace transaction and
     /// retry exactly once. The uninstall is committed only after the retry
-    /// publishes a Web UI address; otherwise the original profile is restored.
+    /// serves a working Web document; otherwise the original profile is restored.
     fn try_recover_incompatible_plugins(
         &self,
         startup_error: &AppError,
@@ -1332,6 +1332,33 @@ impl AppState {
         if !self.quitting.load(Ordering::SeqCst) {
             self.fail(error);
         }
+    }
+
+    fn check_service_exit(&self) {
+        if self.quitting.load(Ordering::SeqCst) || self.snapshot().phase != LauncherPhase::Ready {
+            return;
+        }
+        // Startup/restart owns this lock. A monitor must never queue behind it
+        // and later mistake an intentional stop for an unexpected exit.
+        let Ok(mut server) = self.server.try_lock() else {
+            return;
+        };
+        if server.is_running() {
+            return;
+        }
+        // Acquire the mutation gate only after observing an exit, so healthy
+        // checks do not toggle marketplace busy state or interrupt operations.
+        let Ok(_guard) = self.marketplace.begin_operation() else {
+            return;
+        };
+        if self.quitting.load(Ordering::SeqCst) || self.snapshot().phase != LauncherPhase::Ready {
+            return;
+        }
+        let error = server
+            .stop()
+            .err()
+            .unwrap_or_else(|| AppError::new("serviceExited"));
+        self.mutate_if(|snapshot| mark_service_exited(snapshot, error));
     }
 
     fn fail(&self, error: AppError) {
@@ -2671,6 +2698,37 @@ async fn check_desktop_update_after_startup(state: Arc<AppState>) {
     let _ = state.check_desktop_update(false).await;
 }
 
+async fn monitor_service_exit(state: std::sync::Weak<AppState>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        if state.quitting.load(Ordering::SeqCst) {
+            return;
+        }
+        // Process cleanup can block; keep it off the async executor.
+        if tauri::async_runtime::spawn_blocking(move || state.check_service_exit())
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn mark_service_exited(snapshot: &mut LauncherSnapshot, error: AppError) -> bool {
+    if snapshot.phase != LauncherPhase::Ready {
+        return false;
+    }
+    snapshot.phase = LauncherPhase::Failed;
+    snapshot.web_url = None;
+    snapshot.service_started_at_ms = None;
+    snapshot.activity = None;
+    snapshot.error = Some(error);
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleDecision {
     KeepRunning,
@@ -2742,6 +2800,7 @@ fn setup_application(app: &mut tauri::App) -> Result<(), String> {
         }
         log::error!("automatic Harness startup could not begin: {error:?}");
     }
+    tauri::async_runtime::spawn(monitor_service_exit(Arc::downgrade(&state)));
     tauri::async_runtime::spawn(check_desktop_update_after_startup(state));
     Ok(())
 }
@@ -2973,7 +3032,7 @@ impl MarketService for MarketActivationService<'_> {
 }
 
 /// A marketplace rollback is justified only when the managed process ran but
-/// never published its Web UI address. Infrastructure failures (port
+/// never served a working Web document. Infrastructure failures (port
 /// allocation, guard spawn/ownership, output capture, shutdown) leave the
 /// unverified batch intact for diagnosis instead of blaming and deleting an
 /// unrelated plugin change. Runtime replacement is also excluded because the
@@ -3045,16 +3104,56 @@ mod tests {
         clear_startup_repair_notice, complete_harness_deployment, desktop_update_check_error,
         desktop_update_download_error, desktop_update_start_state, external_link_url,
         fail_start_worker_spawn, harness_update_after_check, incompatible_plugin_packages,
-        lifecycle_decision, mark_harness_update_checking, replace_harness_update_if_checking,
-        retain_incompatible_plugin_context, retryable_download_http_status,
-        should_retry_desktop_update_download, should_rollback_marketplace_after_start_failure,
-        update_market_operation_state, updater_error_log, updater_manual_proxy, updater_proxy_plan,
+        lifecycle_decision, mark_harness_update_checking, mark_service_exited,
+        replace_harness_update_if_checking, retain_incompatible_plugin_context,
+        retryable_download_http_status, should_retry_desktop_update_download,
+        should_rollback_marketplace_after_start_failure, update_market_operation_state,
+        updater_error_log, updater_manual_proxy, updater_proxy_plan,
     };
     use dsh_core::{
         AppError, ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherPhase,
         LauncherSnapshot, ProxyMode, ProxySettings,
     };
     use semver::Version;
+
+    #[test]
+    fn unexpected_service_exit_clears_the_address_and_preserves_rollback() {
+        let mut snapshot = LauncherSnapshot::initial("test");
+        snapshot.phase = LauncherPhase::Ready;
+        snapshot.web_url = Some("http://127.0.0.1:3080/?token=fixture".into());
+        snapshot.service_started_at_ms = Some(123);
+        snapshot.previous_harness_version = Some("0.2.1-rc.2".into());
+        assert!(mark_service_exited(
+            &mut snapshot,
+            AppError::new("serviceExited")
+        ));
+        assert_eq!(snapshot.phase, LauncherPhase::Failed);
+        assert!(snapshot.web_url.is_none());
+        assert!(snapshot.service_started_at_ms.is_none());
+        assert_eq!(snapshot.error.unwrap().code, "serviceExited");
+        assert_eq!(
+            snapshot.previous_harness_version.as_deref(),
+            Some("0.2.1-rc.2")
+        );
+    }
+
+    #[test]
+    fn exit_monitor_does_not_replace_an_intentional_stop_or_restart() {
+        for phase in [
+            LauncherPhase::Stopped,
+            LauncherPhase::Stopping,
+            LauncherPhase::Starting,
+        ] {
+            let mut snapshot = LauncherSnapshot::initial("test");
+            snapshot.phase = phase;
+            assert!(!mark_service_exited(
+                &mut snapshot,
+                AppError::new("serviceExited")
+            ));
+            assert_eq!(snapshot.phase, phase);
+            assert!(snapshot.error.is_none());
+        }
+    }
 
     #[test]
     fn main_window_activation_remembers_early_second_launch() {

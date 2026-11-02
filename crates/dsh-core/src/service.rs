@@ -113,10 +113,19 @@ impl ServerManager {
         self.start_cancellable(|| false)
     }
 
-    /// Marketplace publication needs a responding Web document, not merely
+    /// Service readiness needs a responding Web document, not merely
     /// a printed address. Only follow same-origin bootstrap redirects and never
     /// send this loopback probe through a configured system proxy.
     pub fn verify_web_ready(&mut self, url: &str, cancelled: impl Fn() -> bool) -> AppResult<()> {
+        self.verify_web_ready_until(url, cancelled, Instant::now() + Duration::from_secs(15))
+    }
+
+    fn verify_web_ready_until(
+        &mut self,
+        url: &str,
+        cancelled: impl Fn() -> bool,
+        deadline: Instant,
+    ) -> AppResult<()> {
         if parse_web_url(&format!("dsh web: {url}")).is_none() {
             return Err(AppError::new("serviceNoAddress"));
         }
@@ -126,7 +135,6 @@ impl ServerManager {
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|_| AppError::new("serviceNoAddress"))?;
-        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             if cancelled() {
                 return Err(AppError::new("deploymentCancelled"));
@@ -343,7 +351,14 @@ impl ServerManager {
                         if let Some(url) = parse_web_url(&line) {
                             if self.is_running() {
                                 self.web_url = Some(url.clone());
-                                return Ok(url);
+                                match self.verify_web_ready(&url, &cancelled) {
+                                    Ok(()) => return Ok(url),
+                                    Err(error) if error.code == "deploymentCancelled" => {
+                                        self.stop()?;
+                                        return Err(error);
+                                    }
+                                    Err(_) => {}
+                                }
                             }
                             break;
                         }
@@ -351,6 +366,15 @@ impl ServerManager {
                     Err(mpsc::RecvTimeoutError::Timeout) if self.is_running() => continue,
                     Err(_) => break,
                 }
+            }
+            // The document probe can outlive later loader errors. Retain their
+            // sanitized recovery hints before stopping the failed service.
+            for line in receiver.try_iter() {
+                address_in_use |= line.contains("EADDRINUSE");
+                if let Some(package) = incompatible_loader_package(&line) {
+                    incompatible_plugins.insert(package);
+                }
+                repairable_projection_cache |= projection_cache_schema_failure(&line);
             }
             self.stop()?;
             if !use_free_port {
@@ -1178,6 +1202,89 @@ mod tests {
         assert!(!wait_for_port_release(&url, Duration::from_millis(20)));
         drop(listener);
         assert!(wait_for_port_release(&url, Duration::from_secs(1)));
+    }
+
+    #[cfg(any(unix, windows))]
+    fn manager_with_waiting_child(paths: ApplicationPaths) -> ServerManager {
+        let mut command = new_command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "service::tests::readiness_child_waits",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut manager = ServerManager::new(paths);
+        manager.guard_stdin = child.stdin.take();
+        manager.child = Some(child);
+        manager
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    #[ignore]
+    fn readiness_child_waits() {
+        let _ = std::io::stdin().read_to_end(&mut Vec::new());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn live_process_and_announced_address_do_not_make_a_refused_page_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = manager_with_waiting_child(ApplicationPaths::from_home(temp.path()));
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        assert_eq!(parse_web_url(&format!("dsh web: {url}")), Some(url.clone()));
+        let error = manager
+            .verify_web_ready_until(&url, || false, Instant::now() + Duration::from_millis(300))
+            .unwrap_err();
+        assert_eq!(error.code, "serviceNoAddress");
+        assert!(manager.is_running());
+        assert_eq!(
+            manager.verify_web_ready(&url, || true).unwrap_err().code,
+            "deploymentCancelled"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn service_readiness_waits_for_a_successful_document() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = manager_with_waiting_child(ApplicationPaths::from_home(temp.path()));
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for status in ["500 Internal Server Error", "200 OK"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0; 2048];
+                assert!(socket.read(&mut request).unwrap() > 0);
+                let body = "<html>fixture</html>";
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        manager.verify_web_ready(&url, || false).unwrap();
+        server.join().unwrap();
+        drop(manager.guard_stdin.take());
+        manager.child.as_mut().unwrap().wait().unwrap();
+        // A previously healthy page cannot make a dead managed process ready.
+        assert_eq!(
+            manager.verify_web_ready(&url, || false).unwrap_err().code,
+            "serviceNoAddress"
+        );
     }
 
     #[test]

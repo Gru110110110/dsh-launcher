@@ -275,7 +275,7 @@ export function LauncherPage() {
                     {t("action.repairAndStart")}
                   </button>
                 )}
-                {failed && snapshot.previousHarnessVersion && (
+                {(failed || stopped) && snapshot.previousHarnessVersion && (
                   <button
                     className="outline-button"
                     disabled={marketplaceBusy}
