@@ -9,6 +9,7 @@ use crate::{AppError, AppResult, paths::atomic_write};
 pub(crate) const INSTALL_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const SERVER_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
+#[derive(Debug)]
 pub(crate) struct BoundedLog {
     file: File,
     length: u64,

@@ -1,13 +1,13 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     path::PathBuf,
-    process::{Child, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    process::{Child, ExitStatus, Stdio},
+    sync::{Arc, Mutex, TryLockError, mpsc},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use std::{io::Read, process::ChildStdin};
@@ -42,14 +42,114 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const PORT_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const GUARD_LOG_MAX_BYTES: u64 = 256 * 1024;
 #[cfg(any(unix, windows))]
 const SERVICE_GUARD_KILL_DELAY: Duration = Duration::from_secs(3);
+
+/// The guard runs before Tauri installs logging. Its pipe can already be
+/// disconnected during shutdown, so neither diagnostics nor the panic hook
+/// may use the panicking stderr print macros.
+struct GuardDiagnostics {
+    log: Mutex<Option<BoundedLog>>,
+}
+
+impl GuardDiagnostics {
+    fn new(paths: &ApplicationPaths) -> Self {
+        Self {
+            log: Mutex::new(
+                BoundedLog::open(
+                    &paths.app_home.join("service-guard.log"),
+                    GUARD_LOG_MAX_BYTES,
+                )
+                .ok(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn without_file() -> Self {
+        Self {
+            log: Mutex::new(None),
+        }
+    }
+
+    fn report(&self, message: &str) {
+        let line = self.record(message);
+        write_guard_message(std::io::stderr().lock(), &line);
+    }
+
+    #[cfg(test)]
+    fn report_to(&self, writer: impl Write, message: &str) {
+        let line = self.record(message);
+        write_guard_message(writer, &line);
+    }
+
+    fn record(&self, message: &str) -> String {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let line = format!(
+            "[DSH guard][unix_ms={timestamp}][pid={}] {message}",
+            std::process::id()
+        );
+        // Write the private log first, without waiting on another reporter or
+        // recursively taking its lock if a panic happened during logging.
+        let log = match self.log.try_lock() {
+            Ok(log) => Some(log),
+            Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(mut log) = log
+            && let Some(log) = log.as_mut()
+        {
+            let _ = log.write_line(&line);
+        }
+        line
+    }
+
+    fn install_panic_hook(self: &Arc<Self>) {
+        let diagnostics = Arc::clone(self);
+        std::panic::set_hook(Box::new(move |info| {
+            // Payloads may contain user values. Record only known categories
+            // and the source location, never arbitrary panic text.
+            let text = info
+                .payload()
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| info.payload().downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            let category = if text.contains("failed printing to stderr") {
+                "stderr-write-failed"
+            } else if text.contains("Windows process guard poisoned") {
+                "process-guard-lock-poisoned"
+            } else {
+                "other"
+            };
+            if let Some(location) = info.location() {
+                diagnostics.report(&format!(
+                    "panic: category={category}; location={}:{}",
+                    location.file(),
+                    location.line()
+                ));
+            } else {
+                diagnostics.report(&format!("panic: category={category}"));
+            }
+        }));
+    }
+}
+
+fn write_guard_message(mut writer: impl Write, message: &str) {
+    let _ = writeln!(writer, "{message}");
+}
 
 #[derive(Debug)]
 pub struct ServerManager {
     paths: ApplicationPaths,
     child: Option<Child>,
     output_thread: Option<JoinHandle<()>>,
+    diagnostic_log: Option<Arc<Mutex<BoundedLog>>>,
+    exit_recorded: bool,
     web_url: Option<String>,
     guard_stdin: Option<ChildStdin>,
     balance_endpoint: Option<BalanceBridgeEndpoint>,
@@ -67,6 +167,8 @@ impl ServerManager {
             paths,
             child: None,
             output_thread: None,
+            diagnostic_log: None,
+            exit_recorded: false,
             web_url: None,
             guard_stdin: None,
             balance_endpoint: None,
@@ -104,9 +206,38 @@ impl ServerManager {
     }
 
     pub fn is_running(&mut self) -> bool {
-        self.child
-            .as_mut()
-            .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(None) => true,
+            result => {
+                if !self.exit_recorded {
+                    let summary = match result {
+                        Ok(Some(status)) => {
+                            format!("guard exited: {}", process_exit_summary(status))
+                        }
+                        Err(error) => format!(
+                            "guard wait failed: kind={:?}, os_code={:?}",
+                            error.kind(),
+                            error.raw_os_error()
+                        ),
+                        Ok(None) => unreachable!(),
+                    };
+                    self.record_event(&summary);
+                    self.exit_recorded = true;
+                }
+                false
+            }
+        }
+    }
+
+    fn record_event(&self, message: &str) {
+        if let Some(log) = &self.diagnostic_log
+            && let Ok(mut log) = log.lock()
+        {
+            let _ = log.write_line(&format!("[DSH launcher] {message}"));
+        }
     }
 
     pub fn start(&mut self) -> AppResult<String> {
@@ -135,18 +266,33 @@ impl ServerManager {
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|_| AppError::new("serviceNoAddress"))?;
+        let mut failure = WebReadinessFailure::ProcessUnavailable;
         while Instant::now() < deadline {
             if cancelled() {
+                self.record_event("Web readiness cancelled");
                 return Err(AppError::new("deploymentCancelled"));
             }
             if !self.is_running() {
+                failure = WebReadinessFailure::ProcessUnavailable;
                 break;
             }
-            if web_document_ready(&client, url) && self.is_running() {
-                return Ok(());
+            match check_web_document(&client, url) {
+                Ok(()) if self.is_running() => {
+                    self.record_event("Web readiness verified: successful HTML response");
+                    return Ok(());
+                }
+                Ok(()) => {
+                    failure = WebReadinessFailure::ProcessUnavailable;
+                    break;
+                }
+                Err(error) => failure = error,
             }
             thread::sleep(Duration::from_millis(200));
         }
+        let guard_running = self.is_running();
+        self.record_event(&format!(
+            "Web readiness failed: {failure:?}; guard_running={guard_running}"
+        ));
         Err(AppError::new("serviceNoAddress"))
     }
 
@@ -253,6 +399,9 @@ impl ServerManager {
                 &self.paths.server_log,
                 SERVER_LOG_MAX_BYTES,
             )?));
+            self.diagnostic_log = Some(Arc::clone(&log));
+            self.exit_recorded = false;
+            self.record_event(&format!("starting Harness: free_port={use_free_port}"));
             let mut command = {
                 let executable = std::env::current_exe()
                     .map_err(|error| AppError::io("serviceGuardFailed", &error))?;
@@ -402,6 +551,9 @@ impl ServerManager {
     }
 
     pub fn stop(&mut self) -> AppResult<()> {
+        if self.child.is_some() {
+            self.record_event("stop requested; cleaning up owned service processes");
+        }
         self.pet.stop();
         let web_url = self.web_url.clone();
         #[cfg(unix)]
@@ -417,7 +569,11 @@ impl ServerManager {
             if process_tree_alive(pid) {
                 terminate_tree(pid, true);
             }
-            child.wait()?;
+            let status = child.wait()?;
+            self.record_event(&format!(
+                "guard reaped during stop: {}",
+                process_exit_summary(status)
+            ));
             self.guard_stdin = None;
         }
         #[cfg(unix)]
@@ -467,7 +623,11 @@ impl ServerManager {
             if child.try_wait()?.is_none() {
                 return Err(AppError::new("serviceProcessTreeStillRunning").value("processId", pid));
             }
-            child.wait()?;
+            let status = child.wait()?;
+            self.record_event(&format!(
+                "guard reaped during stop: {}",
+                process_exit_summary(status)
+            ));
         }
         #[cfg(windows)]
         if let Some(job) = self.job.as_ref()
@@ -548,7 +708,10 @@ pub fn handle_service_guard_cli() -> bool {
     let options = match parse_service_guard_arguments(std::env::args_os().skip(1)) {
         Ok(options) => options,
         Err(()) => {
-            eprintln!("DSH service guard received invalid arguments");
+            write_guard_message(
+                std::io::stderr().lock(),
+                "DSH service guard received invalid arguments",
+            );
             std::process::exit(2);
         }
     };
@@ -566,7 +729,10 @@ pub fn handle_service_guard_cli() -> bool {
         run_service_guard(&paths, use_free_port)
     });
     if let Err(error) = result {
-        eprintln!("DSH service guard failed: {error}");
+        write_guard_message(
+            std::io::stderr().lock(),
+            &format!("DSH service guard failed: {error}"),
+        );
         std::process::exit(1);
     }
     true
@@ -599,8 +765,27 @@ pub fn handle_service_guard_cli() -> bool {
     false
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult<()> {
+    let diagnostics = Arc::new(GuardDiagnostics::new(paths));
+    diagnostics.install_panic_hook();
+    diagnostics.report(&format!(
+        "starting service; desktop_version={}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let result = run_service_guard_inner(paths, use_free_port, Arc::clone(&diagnostics));
+    if let Err(error) = &result {
+        diagnostics.report(&format!("DSH service guard failed: {error}"));
+    }
+    result
+}
+
+#[cfg(unix)]
+fn run_service_guard_inner(
+    paths: &ApplicationPaths,
+    use_free_port: bool,
+    diagnostics: Arc<GuardDiagnostics>,
+) -> AppResult<()> {
     let group = std::process::id();
     if unsafe { libc::getpgrp() } != i32::try_from(group).unwrap_or_default() {
         return Err(AppError::new("serviceGuardInvalidGroup"));
@@ -625,6 +810,7 @@ fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_IGN);
     }
+    let monitor_diagnostics = Arc::clone(&diagnostics);
     let _monitor = match thread::Builder::new()
         .name("dsh-parent-monitor".into())
         .spawn(move || {
@@ -636,6 +822,7 @@ fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult
                     Ok(_) => {}
                 }
             }
+            monitor_diagnostics.report("parent control pipe closed; stopping Harness");
             let _ = signal_guard_group(group, libc::SIGTERM);
             thread::sleep(SERVICE_GUARD_KILL_DELAY);
             let _ = signal_guard_group(group, libc::SIGKILL);
@@ -648,7 +835,9 @@ fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult
     };
 
     match service.wait() {
-        Ok(_) => {}
+        Ok(status) => {
+            diagnostics.report(&format!("Harness exited: {}", process_exit_summary(status)))
+        }
         Err(error) => {
             stop_guard_service(&mut service, group);
             return Err(error.into());
@@ -663,7 +852,11 @@ fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult
 }
 
 #[cfg(windows)]
-fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult<()> {
+fn run_service_guard_inner(
+    paths: &ApplicationPaths,
+    use_free_port: bool,
+    diagnostics: Arc<GuardDiagnostics>,
+) -> AppResult<()> {
     let mut command = new_command(&paths.node_bin);
     command
         .arg(&paths.dsh_bin)
@@ -675,11 +868,14 @@ fn run_service_guard(paths: &ApplicationPaths, use_free_port: bool) -> AppResult
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     configure_process_group(&mut command);
-    run_windows_guarded_service(command)
+    run_windows_guarded_service(command, diagnostics)
 }
 
 #[cfg(windows)]
-fn run_windows_guarded_service(mut command: Command) -> AppResult<()> {
+fn run_windows_guarded_service(
+    mut command: Command,
+    diagnostics: Arc<GuardDiagnostics>,
+) -> AppResult<()> {
     let mut service = command
         .spawn()
         .map_err(|error| AppError::io("serviceStartFailed", &error))?;
@@ -695,6 +891,7 @@ fn run_windows_guarded_service(mut command: Command) -> AppResult<()> {
     let parent_gone = Arc::new(AtomicBool::new(false));
     let monitor_state = Arc::clone(&parent_gone);
     let monitor_guard = Arc::clone(&process_guard);
+    let monitor_diagnostics = Arc::clone(&diagnostics);
     let monitor = match thread::Builder::new()
         .name("dsh-parent-monitor".into())
         .spawn(move || {
@@ -702,7 +899,14 @@ fn run_windows_guarded_service(mut command: Command) -> AppResult<()> {
             let mut byte = [0_u8; 1];
             loop {
                 match input.read(&mut byte) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => {
+                        monitor_diagnostics.report("parent control pipe closed; stopping Harness");
+                        break;
+                    }
+                    Err(error) => {
+                        monitor_diagnostics.report(&format!("parent control pipe read failed: kind={:?}, os_code={:?}; stopping Harness", error.kind(), error.raw_os_error()));
+                        break;
+                    }
                     Ok(_) => {}
                 }
             }
@@ -731,6 +935,7 @@ fn run_windows_guarded_service(mut command: Command) -> AppResult<()> {
             return Err(error.into());
         }
     };
+    diagnostics.report(&format!("Harness exited: {}", process_exit_summary(status)));
     if parent_gone.load(Ordering::SeqCst) {
         let _ = monitor.join();
         return Ok(());
@@ -807,6 +1012,20 @@ fn guard_web_args(
     args
 }
 
+fn process_exit_summary(status: ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit_code={code}, hex=0x{:08X}", code as u32);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("signal={signal}");
+        }
+    }
+    "exit status unavailable".into()
+}
+
 /// The overlay path the parent staged for this launch, if any. Delivered
 /// through the guard's environment so the guard CLI grammar stays unchanged.
 fn balance_overlay_from_environment() -> Option<std::ffi::OsString> {
@@ -838,7 +1057,34 @@ fn capture(
     log: &Arc<Mutex<BoundedLog>>,
     sender: &mpsc::Sender<String>,
 ) {
-    for line in BufReader::new(stream).lines().map_while(Result::ok) {
+    let mut reader = BufReader::new(stream);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                if let Ok(mut log) = log.lock() {
+                    let _ = log.write_line(&format!(
+                        "[DSH launcher] output read failed: kind={:?}, os_code={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    ));
+                }
+                break;
+            }
+        }
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        // Windows subprocesses can emit legacy codepage bytes. A bad UTF-8
+        // line must not close the pipe before the guard finishes shutdown.
+        let line = String::from_utf8_lossy(&bytes).into_owned();
         if let Ok(mut log) = log.lock() {
             let _ = log.write_line(&line);
         }
@@ -846,10 +1092,31 @@ fn capture(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WebReadinessFailure {
+    InvalidAddress,
+    RequestTimeout,
+    ConnectionFailed,
+    RequestFailed,
+    HttpStatus(u16),
+    InvalidRedirect,
+    CrossOriginRedirect,
+    BodyUnreadable,
+    NotHtml,
+    RedirectLimit,
+    ProcessUnavailable,
+}
+
+#[cfg(test)]
 fn web_document_ready(client: &reqwest::blocking::Client, url: &str) -> bool {
-    let Ok(mut current) = url::Url::parse(url) else {
-        return false;
-    };
+    check_web_document(client, url).is_ok()
+}
+
+fn check_web_document(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<(), WebReadinessFailure> {
+    let mut current = url::Url::parse(url).map_err(|_| WebReadinessFailure::InvalidAddress)?;
     let origin = current.origin();
     let mut cookies = std::collections::BTreeMap::new();
     // Harness exchanges the printed ?token URL for a session cookie and a
@@ -866,9 +1133,16 @@ fn web_document_ready(client: &reqwest::blocking::Client, url: &str) -> bool {
         if !cookie.is_empty() {
             request = request.header(reqwest::header::COOKIE, cookie);
         }
-        let Ok(response) = request.send() else {
-            return false;
-        };
+        let response = request.send().map_err(|error| {
+            // Raw reqwest errors can include the private launch-token URL.
+            if error.is_timeout() {
+                WebReadinessFailure::RequestTimeout
+            } else if error.is_connect() {
+                WebReadinessFailure::ConnectionFailed
+            } else {
+                WebReadinessFailure::RequestFailed
+            }
+        })?;
         if response.status().is_redirection() {
             let Some(next) = response
                 .headers()
@@ -876,10 +1150,10 @@ fn web_document_ready(client: &reqwest::blocking::Client, url: &str) -> bool {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| current.join(value).ok())
             else {
-                return false;
+                return Err(WebReadinessFailure::InvalidRedirect);
             };
             if next.origin() != origin {
-                return false;
+                return Err(WebReadinessFailure::CrossOriginRedirect);
             }
             for header in response.headers().get_all(reqwest::header::SET_COOKIE) {
                 if let Ok(value) = header.to_str()
@@ -893,16 +1167,20 @@ fn web_document_ready(client: &reqwest::blocking::Client, url: &str) -> bool {
             continue;
         }
         if !response.status().is_success() {
-            return false;
+            return Err(WebReadinessFailure::HttpStatus(response.status().as_u16()));
         }
         let mut body = String::new();
-        return response
+        response
             .take(2 * 1024 * 1024)
             .read_to_string(&mut body)
-            .is_ok()
-            && body.to_ascii_lowercase().contains("<html");
+            .map_err(|_| WebReadinessFailure::BodyUnreadable)?;
+        return if body.to_ascii_lowercase().contains("<html") {
+            Ok(())
+        } else {
+            Err(WebReadinessFailure::NotHtml)
+        };
     }
-    false
+    Err(WebReadinessFailure::RedirectLimit)
 }
 
 fn parse_web_url(line: &str) -> Option<String> {
@@ -1059,6 +1337,15 @@ mod tests {
         assert_eq!(args, ["web", "--port", "0"]);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_exit_diagnostics_preserve_native_crash_codes() {
+        use std::os::windows::process::ExitStatusExt;
+        let summary = process_exit_summary(ExitStatus::from_raw(0xC0000409));
+        assert!(summary.contains("exit_code=-1073740791, hex=0xC0000409"));
+        assert!(process_exit_summary(ExitStatus::from_raw(0)).contains("exit_code=0"));
+    }
+
     #[test]
     fn start_retries_without_the_overlay_unless_cancelled() {
         let plan = BalanceLaunchPlan {
@@ -1158,6 +1445,200 @@ mod tests {
         assert!(fs::metadata(path).unwrap().len() <= 16);
     }
 
+    struct DisconnectedWriter;
+
+    impl Write for DisconnectedWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn windows_guard_reports_to_a_private_bounded_log_when_stderr_is_disconnected() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path());
+        let diagnostics = GuardDiagnostics::new(&paths);
+        diagnostics.report_to(DisconnectedWriter, "stop failed: fixture");
+        let path = temp.path().join("service-guard.log");
+        let log = fs::read_to_string(&path).unwrap();
+        assert!(log.contains("stop failed: fixture"));
+        assert!(log.contains("unix_ms="));
+        GuardDiagnostics::without_file().report_to(DisconnectedWriter, "fixture");
+        diagnostics.report_to(
+            DisconnectedWriter,
+            &"x".repeat(GUARD_LOG_MAX_BYTES as usize),
+        );
+        assert!(fs::metadata(path).unwrap().len() <= GUARD_LOG_MAX_BYTES);
+    }
+
+    #[test]
+    fn windows_capture_drains_invalid_utf8_and_keeps_later_output_after_the_listener_leaves() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.log");
+        let log = Arc::new(Mutex::new(
+            BoundedLog::open(&path, SERVER_LOG_MAX_BYTES).unwrap(),
+        ));
+        let (sender, receiver) = mpsc::channel();
+        let bytes = b"legacy \xff\r\ndsh web: http://127.0.0.1:3080\r\nlast \xfe";
+        capture(std::io::Cursor::new(bytes), &log, &sender);
+        drop(sender);
+        let lines: Vec<_> = receiver.into_iter().collect();
+        assert_eq!(
+            lines,
+            [
+                "legacy \u{fffd}",
+                "dsh web: http://127.0.0.1:3080",
+                "last \u{fffd}"
+            ]
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("last \u{fffd}"));
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let mut reader = std::io::Cursor::new(bytes);
+        capture(&mut reader, &log, &sender);
+        assert_eq!(reader.position(), bytes.len() as u64);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn windows_guard_reporting_survives_a_closed_real_stderr_pipe() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = new_command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "service::tests::guard_closed_stderr_helper",
+            ])
+            .env("DSH_DESKTOP_HOME", temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        configure_process_group(&mut command);
+        let mut child = GuardTestProcess(command.spawn().unwrap());
+        drop(child.0.stderr.take());
+        child.0.stdin.as_mut().unwrap().write_all(b"g").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            child
+                .0
+                .try_wait()
+                .unwrap()
+                .is_some_and(|status| status.success())
+        );
+        assert!(
+            fs::read_to_string(temp.path().join("service-guard.log"))
+                .unwrap()
+                .contains("closed pipe fixture")
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    #[ignore]
+    fn guard_closed_stderr_helper() {
+        std::io::stdin().read_exact(&mut [0_u8; 1]).unwrap();
+        let paths = ApplicationPaths::from_environment().unwrap();
+        let diagnostics = Arc::new(GuardDiagnostics::new(&paths));
+        diagnostics.install_panic_hook();
+        diagnostics.report("closed pipe fixture");
+        write_guard_message(
+            std::io::stderr().lock(),
+            "DSH service guard failed: fixture",
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn windows_capture_keeps_a_child_stderr_pipe_open_after_a_legacy_codepage_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.log");
+        let log = Arc::new(Mutex::new(
+            BoundedLog::open(&path, SERVER_LOG_MAX_BYTES).unwrap(),
+        ));
+        let mut command = new_command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "service::tests::legacy_codepage_output_helper",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        configure_process_group(&mut command);
+        let mut child = GuardTestProcess(command.spawn().unwrap());
+        let stderr = child.0.stderr.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || capture(stderr, &log, &sender));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "legacy \u{fffd}"
+        );
+        child.0.stdin.as_mut().unwrap().write_all(b"g").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "guard diagnostic after legacy output"
+        );
+        assert!(child.0.wait().unwrap().success());
+        reader.join().unwrap();
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("guard diagnostic after legacy output")
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    #[ignore]
+    fn legacy_codepage_output_helper() {
+        std::io::stderr().write_all(b"legacy \xff\r\n").unwrap();
+        std::io::stdin().read_exact(&mut [0_u8; 1]).unwrap();
+        write_guard_message(
+            std::io::stderr().lock(),
+            "guard diagnostic after legacy output",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_snapshot_guard_cleanup_survives_a_poisoned_process_map() {
+        let mut command = new_command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "service::tests::readiness_child_waits",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let child = GuardTestProcess(command.spawn().unwrap());
+        let guard = Arc::new(WindowsProcessGuard::attach_snapshot(&child.0).unwrap());
+        let poison_guard = Arc::clone(&guard);
+        assert!(
+            thread::spawn(move || {
+                if let WindowsProcessGuard::Snapshot { processes } = &*poison_guard {
+                    let _lock = processes.lock().unwrap();
+                    panic!("synthetic process-map poison");
+                }
+            })
+            .join()
+            .is_err()
+        );
+        guard.terminate().unwrap();
+        assert!(guard.wait_until_empty(Duration::from_secs(5)).unwrap());
+        drop(guard);
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn service_guard_arguments_require_an_owner_home() {
@@ -1236,8 +1717,15 @@ mod tests {
     fn live_process_and_announced_address_do_not_make_a_refused_page_ready() {
         let temp = tempfile::tempdir().unwrap();
         let mut manager = manager_with_waiting_child(ApplicationPaths::from_home(temp.path()));
+        let log_path = temp.path().join("server.log");
+        manager.diagnostic_log = Some(Arc::new(Mutex::new(
+            BoundedLog::open(&log_path, SERVER_LOG_MAX_BYTES).unwrap(),
+        )));
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!(
+            "http://{}/?token=do-not-log-fixture",
+            listener.local_addr().unwrap()
+        );
         drop(listener);
         assert_eq!(parse_web_url(&format!("dsh web: {url}")), Some(url.clone()));
         let error = manager
@@ -1245,6 +1733,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "serviceNoAddress");
         assert!(manager.is_running());
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("ConnectionFailed; guard_running=true"));
+        assert!(!log.contains("do-not-log-fixture"));
         assert_eq!(
             manager.verify_web_ready(&url, || true).unwrap_err().code,
             "deploymentCancelled"
@@ -1257,6 +1748,10 @@ mod tests {
         use std::io::Write;
         let temp = tempfile::tempdir().unwrap();
         let mut manager = manager_with_waiting_child(ApplicationPaths::from_home(temp.path()));
+        let log_path = temp.path().join("server.log");
+        manager.diagnostic_log = Some(Arc::new(Mutex::new(
+            BoundedLog::open(&log_path, SERVER_LOG_MAX_BYTES).unwrap(),
+        )));
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -1285,6 +1780,15 @@ mod tests {
             manager.verify_web_ready(&url, || false).unwrap_err().code,
             "serviceNoAddress"
         );
+        assert!(!manager.is_running());
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("Web readiness verified"));
+        assert_eq!(
+            log.matches("guard exited: exit_code=0, hex=0x00000000")
+                .count(),
+            1
+        );
+        assert!(log.contains("ProcessUnavailable; guard_running=false"));
     }
 
     #[test]
@@ -1315,9 +1819,18 @@ mod tests {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        assert!(!web_document_ready(&client, &url));
-        assert!(!web_document_ready(&client, &url));
-        assert!(!web_document_ready(&client, &url));
+        assert_eq!(
+            check_web_document(&client, &url),
+            Err(WebReadinessFailure::HttpStatus(500))
+        );
+        assert_eq!(
+            check_web_document(&client, &url),
+            Err(WebReadinessFailure::NotHtml)
+        );
+        assert_eq!(
+            check_web_document(&client, &url),
+            Err(WebReadinessFailure::CrossOriginRedirect)
+        );
         assert!(web_document_ready(&client, &url));
         server.join().unwrap();
     }
@@ -1790,7 +2303,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_process_group(&mut command);
-        run_windows_guarded_service(command).unwrap();
+        run_windows_guarded_service(command, Arc::new(GuardDiagnostics::without_file())).unwrap();
     }
 
     #[cfg(windows)]
@@ -1834,7 +2347,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_process_group(&mut command);
-        run_windows_guarded_service(command).unwrap();
+        run_windows_guarded_service(command, Arc::new(GuardDiagnostics::without_file())).unwrap();
     }
 
     #[cfg(windows)]

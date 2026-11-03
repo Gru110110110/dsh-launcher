@@ -20,7 +20,7 @@ The home page prepares and verifies the private Node.js/Harness runtime, starts 
 
 The launcher verifies that the Web page responds before reporting a successful start and reports unexpected service exits. If an update leaves the page unreachable, stop the service and roll back to the retained previous Harness version from the home page.
 
-If local file access fails during startup, the error shows the affected path when available so you can identify the blocked location.
+If local file access fails during startup, the error shows the affected path when available so you can identify the blocked location. Windows stop and restart diagnostics remain available even when the service output connection closes.
 
 ![DSH Launcher home page](screenshots/ScreenShot_en.png)
 

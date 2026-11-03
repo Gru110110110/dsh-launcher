@@ -2567,7 +2567,11 @@ impl WindowsProcessGuard {
         };
         let entries = windows_process_entries()
             .map_err(|error| AppError::io("serviceProcessGuardFailed", &error))?;
-        let mut processes = processes.lock().expect("Windows process guard poisoned");
+        // Only verified owned handles enter this map. After a reporter/thread
+        // panic, cleanup must retain those handles rather than panic again.
+        let mut processes = processes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             let mut changed = false;
             for &(pid, parent_pid) in &entries {
@@ -2622,7 +2626,7 @@ impl WindowsProcessGuard {
                 self.observe()?;
                 for handle in processes
                     .lock()
-                    .expect("Windows process guard poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .values()
                 {
                     if process_handle_running(*handle)
@@ -2677,7 +2681,7 @@ impl WindowsProcessGuard {
                     self.terminate()?;
                     if processes
                         .lock()
-                        .expect("Windows process guard poisoned")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .values()
                         .try_fold(true, |all_stopped, handle| {
                             process_handle_running(*handle).map(|running| all_stopped && !running)
@@ -2708,7 +2712,7 @@ impl Drop for WindowsProcessGuard {
             Self::Snapshot { processes } => {
                 for handle in processes
                     .get_mut()
-                    .expect("Windows process guard poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .values()
                 {
                     unsafe {
